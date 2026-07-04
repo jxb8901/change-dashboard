@@ -3,12 +3,51 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_CONFIG="$ROOT_DIR/config/sample.conf"
+TERMINAL_ACTIVE=0
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
   printf '\n'
   printf 'Starts the V1 local change dashboard skeleton.\n'
   printf 'Default config: %s\n' "$DEFAULT_CONFIG"
+}
+
+setup_terminal() {
+  TERMINAL_ACTIVE=1
+  # Clear the screen and move the cursor to the top-left corner.
+  printf '\033[2J\033[H'
+  # Hide the cursor while the dashboard owns the terminal.
+  printf '\033[?25l'
+}
+
+cleanup_terminal() {
+  if [[ "$TERMINAL_ACTIVE" -eq 1 ]]; then
+    # Show the cursor again before returning control to the shell.
+    printf '\033[?25h'
+    # Reset terminal text attributes such as color or bold.
+    printf '\033[0m'
+    printf '\n'
+    TERMINAL_ACTIVE=0
+  fi
+}
+
+handle_interrupt() {
+  cleanup_terminal
+  exit 130
+}
+
+wait_for_quit() {
+  local key
+
+  while true; do
+    if ! IFS= read -rsn1 key; then
+      return 0
+    fi
+
+    if [[ "$key" == "q" ]]; then
+      return 0
+    fi
+  done
 }
 
 main() {
@@ -24,9 +63,16 @@ main() {
     return 1
   fi
 
+  trap cleanup_terminal EXIT
+  trap handle_interrupt INT
+
+  setup_terminal
   printf 'Change Dashboard skeleton started.\n'
   printf 'Config: %s\n' "$config_file"
-  printf 'Next task: implement terminal lifecycle.\n'
+  printf 'Task 2 terminal lifecycle is active.\n'
+  printf 'Press q to exit.\n'
+
+  wait_for_quit
 }
 
 main "$@"
