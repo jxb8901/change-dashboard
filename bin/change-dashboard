@@ -23,7 +23,7 @@ declare -a PANEL_OUTPUTS=()
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
   printf '\n'
-  printf 'Starts the V1 local change dashboard skeleton.\n'
+  printf 'Starts the V1 local change dashboard.\n'
   printf 'Default config: %s\n' "$DEFAULT_CONFIG"
 }
 
@@ -370,18 +370,42 @@ render_dashboard() {
   done
 
   move_cursor "$((REQUIRED_ROWS + 1))" 1
-  printf 'Press q to exit.'
+  printf 'Refresh: %ss | Press q to exit.' "$REFRESH_INTERVAL"
 }
 
-wait_for_quit() {
+run_panel_commands() {
+  local index
+  local output
+
+  PANEL_OUTPUTS=()
+
+  for index in "${PANEL_ORDER[@]}"; do
+    if output="$(bash -c "${PANEL_COMMANDS[$index]}" 2>/dev/null)"; then
+      PANEL_OUTPUTS[$index]="$output"
+    else
+      PANEL_OUTPUTS[$index]="Command failed"
+    fi
+  done
+}
+
+wait_for_quit_or_timeout() {
+  local timeout="$1"
   local key
 
-  while true; do
-    if ! IFS= read -rsn1 key; then
-      return 0
-    fi
+  if IFS= read -rsn1 -t "$timeout" key; then
+    [[ "$key" == "q" ]]
+    return
+  fi
 
-    if [[ "$key" == "q" ]]; then
+  return 1
+}
+
+run_dashboard_loop() {
+  while true; do
+    run_panel_commands
+    render_dashboard
+
+    if wait_for_quit_or_timeout "$REFRESH_INTERVAL"; then
       return 0
     fi
   done
@@ -407,9 +431,7 @@ main() {
   trap handle_interrupt INT
 
   setup_terminal
-  render_dashboard
-
-  wait_for_quit
+  run_dashboard_loop
 }
 
 main "$@"

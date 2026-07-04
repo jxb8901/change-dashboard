@@ -16,6 +16,6 @@ Use a custom config:
 
 ## Current Status
 
-Task 1 project skeleton is implemented.
+V1 local dashboard is implemented.
 
-The dashboard entrypoint starts from the repo and accepts a Bash source config file. Terminal lifecycle, config validation, rendering, command execution, and refresh behavior are implemented in later tasks.
+The dashboard entrypoint starts from the repo, accepts a Bash source config file, validates panel layout, renders panels in the terminal, runs configured commands, and refreshes on a global interval.
