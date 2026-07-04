@@ -5,17 +5,25 @@ Lightweight Bash-first terminal dashboard for local production change verificati
 ## Start
 
 ```bash
-./bin/change-dashboard
+./bin/lhc.sh
 ```
 
 Use a custom config:
 
 ```bash
-./bin/change-dashboard config/sample.conf
+./bin/lhc.sh config/sample.conf
+```
+
+Run the V2 threshold example:
+
+```bash
+./bin/lhc.sh config/v2-threshold.conf
 ```
 
 ## Current Status
 
-V1 local dashboard is implemented.
+V2 table parsing and configurable warning/error coloring are implemented.
 
-The dashboard entrypoint starts from the repo, accepts a Bash source config file, validates panel layout, renders panels in the terminal, runs configured commands, and refreshes on a global interval.
+The dashboard remains compatible with V1 raw-output configs. It accepts a Bash
+source config file, validates panel layout and optional table rules, runs local
+commands synchronously, renders panels in the terminal, and refreshes globally.
