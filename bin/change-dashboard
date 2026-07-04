@@ -4,6 +4,16 @@ set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_CONFIG="$ROOT_DIR/config/sample.conf"
 TERMINAL_ACTIVE=0
+REFRESH_INTERVAL=2
+PANEL_COUNT=0
+
+declare -a PANEL_TITLES=()
+declare -a PANEL_COMMANDS=()
+declare -a PANEL_X=()
+declare -a PANEL_Y=()
+declare -a PANEL_WIDTHS=()
+declare -a PANEL_HEIGHTS=()
+declare -a PANEL_ORDER=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
@@ -36,6 +46,154 @@ handle_interrupt() {
   exit 130
 }
 
+error() {
+  printf 'Error: %s\n' "$*" >&2
+}
+
+has_array_index() {
+  local array_name="$1"
+  local index="$2"
+
+  eval '[[ ${'"$array_name"'['"$index"']+set} ]]'
+}
+
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_non_negative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+load_config() {
+  local config_file="$1"
+
+  if [[ ! -f "$config_file" ]]; then
+    error "config file not found: $config_file"
+    return 1
+  fi
+
+  REFRESH_INTERVAL=2
+  PANEL_COUNT=0
+  PANEL_TITLES=()
+  PANEL_COMMANDS=()
+  PANEL_X=()
+  PANEL_Y=()
+  PANEL_WIDTHS=()
+  PANEL_HEIGHTS=()
+  PANEL_ORDER=()
+
+  # Config is trusted deployment input and may contain shell commands.
+  # shellcheck source=/dev/null
+  source "$config_file"
+
+  if ! is_positive_integer "$REFRESH_INTERVAL"; then
+    error "REFRESH_INTERVAL must be a positive integer"
+    return 1
+  fi
+
+  validate_config
+}
+
+validate_config() {
+  local index
+
+  if [[ "${#PANEL_TITLES[@]}" -eq 0 ]]; then
+    error "at least one panel must be configured"
+    return 1
+  fi
+
+  for index in "${!PANEL_TITLES[@]}"; do
+    validate_panel "$index" || return 1
+  done
+
+  validate_no_extra_panel_indexes PANEL_COMMANDS || return 1
+  validate_no_extra_panel_indexes PANEL_X || return 1
+  validate_no_extra_panel_indexes PANEL_Y || return 1
+  validate_no_extra_panel_indexes PANEL_WIDTHS || return 1
+  validate_no_extra_panel_indexes PANEL_HEIGHTS || return 1
+
+  build_panel_model
+}
+
+validate_no_extra_panel_indexes() {
+  local array_name="$1"
+  local index
+
+  eval 'for index in "${!'"$array_name"'[@]}"; do
+    if ! has_array_index PANEL_TITLES "$index"; then
+      error "'"$array_name"'[$index] has no matching PANEL_TITLES[$index]"
+      return 1
+    fi
+  done'
+}
+
+validate_panel() {
+  local index="$1"
+
+  require_panel_field PANEL_TITLES "$index" || return 1
+  require_panel_field PANEL_COMMANDS "$index" || return 1
+  require_panel_field PANEL_X "$index" || return 1
+  require_panel_field PANEL_Y "$index" || return 1
+  require_panel_field PANEL_WIDTHS "$index" || return 1
+  require_panel_field PANEL_HEIGHTS "$index" || return 1
+
+  if [[ -z "${PANEL_TITLES[$index]}" ]]; then
+    error "PANEL_TITLES[$index] must not be empty"
+    return 1
+  fi
+
+  if [[ -z "${PANEL_COMMANDS[$index]}" ]]; then
+    error "PANEL_COMMANDS[$index] must not be empty"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_X[$index]}"; then
+    error "PANEL_X[$index] must be a positive integer"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_Y[$index]}"; then
+    error "PANEL_Y[$index] must be a positive integer"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_WIDTHS[$index]}"; then
+    error "PANEL_WIDTHS[$index] must be a positive integer"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_HEIGHTS[$index]}"; then
+    error "PANEL_HEIGHTS[$index] must be a positive integer"
+    return 1
+  fi
+}
+
+require_panel_field() {
+  local array_name="$1"
+  local index="$2"
+
+  if ! has_array_index "$array_name" "$index"; then
+    error "$array_name[$index] is required"
+    return 1
+  fi
+}
+
+build_panel_model() {
+  local index
+
+  PANEL_ORDER=()
+  for index in "${!PANEL_TITLES[@]}"; do
+    if ! is_non_negative_integer "$index"; then
+      error "panel index must be a non-negative integer: $index"
+      return 1
+    fi
+    PANEL_ORDER+=("$index")
+  done
+
+  PANEL_COUNT="${#PANEL_ORDER[@]}"
+}
+
 wait_for_quit() {
   local key
 
@@ -58,8 +216,7 @@ main() {
 
   local config_file="${1:-$DEFAULT_CONFIG}"
 
-  if [[ ! -f "$config_file" ]]; then
-    printf 'Error: config file not found: %s\n' "$config_file" >&2
+  if ! load_config "$config_file"; then
     return 1
   fi
 
@@ -69,7 +226,9 @@ main() {
   setup_terminal
   printf 'Change Dashboard skeleton started.\n'
   printf 'Config: %s\n' "$config_file"
-  printf 'Task 2 terminal lifecycle is active.\n'
+  printf 'Refresh interval: %s seconds\n' "$REFRESH_INTERVAL"
+  printf 'Loaded panels: %s\n' "$PANEL_COUNT"
+  printf 'Tasks 3 and 4 config loading and panel model are active.\n'
   printf 'Press q to exit.\n'
 
   wait_for_quit
