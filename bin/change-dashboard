@@ -6,6 +6,10 @@ DEFAULT_CONFIG="$ROOT_DIR/config/sample.conf"
 TERMINAL_ACTIVE=0
 REFRESH_INTERVAL=2
 PANEL_COUNT=0
+TERMINAL_ROWS=0
+TERMINAL_COLS=0
+REQUIRED_ROWS=0
+REQUIRED_COLS=0
 
 declare -a PANEL_TITLES=()
 declare -a PANEL_COMMANDS=()
@@ -14,6 +18,7 @@ declare -a PANEL_Y=()
 declare -a PANEL_WIDTHS=()
 declare -a PANEL_HEIGHTS=()
 declare -a PANEL_ORDER=()
+declare -a PANEL_OUTPUTS=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
@@ -82,6 +87,7 @@ load_config() {
   PANEL_WIDTHS=()
   PANEL_HEIGHTS=()
   PANEL_ORDER=()
+  PANEL_OUTPUTS=()
 
   # Config is trusted deployment input and may contain shell commands.
   # shellcheck source=/dev/null
@@ -163,8 +169,18 @@ validate_panel() {
     return 1
   fi
 
+  if (( PANEL_WIDTHS[index] < 4 )); then
+    error "PANEL_WIDTHS[$index] must be at least 4"
+    return 1
+  fi
+
   if ! is_positive_integer "${PANEL_HEIGHTS[$index]}"; then
     error "PANEL_HEIGHTS[$index] must be a positive integer"
+    return 1
+  fi
+
+  if (( PANEL_HEIGHTS[index] < 3 )); then
+    error "PANEL_HEIGHTS[$index] must be at least 3"
     return 1
   fi
 }
@@ -194,6 +210,169 @@ build_panel_model() {
   PANEL_COUNT="${#PANEL_ORDER[@]}"
 }
 
+calculate_required_terminal_size() {
+  local index
+  local panel_right
+  local panel_bottom
+
+  REQUIRED_COLS=0
+  REQUIRED_ROWS=0
+
+  for index in "${PANEL_ORDER[@]}"; do
+    panel_right=$((PANEL_X[index] + PANEL_WIDTHS[index] - 1))
+    panel_bottom=$((PANEL_Y[index] + PANEL_HEIGHTS[index] - 1))
+
+    if (( panel_right > REQUIRED_COLS )); then
+      REQUIRED_COLS="$panel_right"
+    fi
+
+    if (( panel_bottom > REQUIRED_ROWS )); then
+      REQUIRED_ROWS="$panel_bottom"
+    fi
+  done
+}
+
+read_terminal_size() {
+  local size
+
+  size="$(stty size 2>/dev/null || true)"
+  if [[ -n "$size" ]]; then
+    TERMINAL_ROWS="${size%% *}"
+    TERMINAL_COLS="${size##* }"
+  else
+    TERMINAL_ROWS="${LINES:-0}"
+    TERMINAL_COLS="${COLUMNS:-0}"
+  fi
+
+  if ! is_positive_integer "$TERMINAL_ROWS" || ! is_positive_integer "$TERMINAL_COLS"; then
+    error "unable to determine terminal size"
+    return 1
+  fi
+}
+
+validate_terminal_size() {
+  calculate_required_terminal_size
+  read_terminal_size || return 1
+
+  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_ROWS )); then
+    error "terminal too small: need ${REQUIRED_COLS}x${REQUIRED_ROWS}, have ${TERMINAL_COLS}x${TERMINAL_ROWS}"
+    return 1
+  fi
+}
+
+move_cursor() {
+  local row="$1"
+  local col="$2"
+
+  printf '\033[%s;%sH' "$row" "$col"
+}
+
+repeat_char() {
+  local char="$1"
+  local count="$2"
+  local output=""
+
+  while (( count > 0 )); do
+    output="${output}${char}"
+    count=$((count - 1))
+  done
+
+  printf '%s' "$output"
+}
+
+clip_text() {
+  local text="$1"
+  local width="$2"
+
+  printf '%s' "${text:0:width}"
+}
+
+draw_text_at() {
+  local row="$1"
+  local col="$2"
+  local width="$3"
+  local text="$4"
+
+  move_cursor "$row" "$col"
+  clip_text "$text" "$width"
+}
+
+draw_panel_border() {
+  local x="$1"
+  local y="$2"
+  local width="$3"
+  local height="$4"
+  local row
+  local inner_width=$((width - 2))
+
+  move_cursor "$y" "$x"
+  printf '+'
+  repeat_char '-' "$inner_width"
+  printf '+'
+
+  row=$((y + 1))
+  while (( row < y + height - 1 )); do
+    move_cursor "$row" "$x"
+    printf '|'
+    move_cursor "$row" "$((x + width - 1))"
+    printf '|'
+    row=$((row + 1))
+  done
+
+  move_cursor "$((y + height - 1))" "$x"
+  printf '+'
+  repeat_char '-' "$inner_width"
+  printf '+'
+}
+
+render_panel_content() {
+  local index="$1"
+  local x="${PANEL_X[$index]}"
+  local y="${PANEL_Y[$index]}"
+  local width="${PANEL_WIDTHS[$index]}"
+  local height="${PANEL_HEIGHTS[$index]}"
+  local content="${PANEL_OUTPUTS[$index]:-Task 7 will run this panel command.}"
+  local row=0
+  local line
+  local content_width=$((width - 2))
+  local content_height=$((height - 2))
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( row >= content_height )); then
+      break
+    fi
+
+    draw_text_at "$((y + 1 + row))" "$((x + 1))" "$content_width" "$line"
+    row=$((row + 1))
+  done <<< "$content"
+}
+
+render_panel() {
+  local index="$1"
+  local x="${PANEL_X[$index]}"
+  local y="${PANEL_Y[$index]}"
+  local width="${PANEL_WIDTHS[$index]}"
+  local height="${PANEL_HEIGHTS[$index]}"
+  local title=" ${PANEL_TITLES[$index]} "
+
+  draw_panel_border "$x" "$y" "$width" "$height"
+  draw_text_at "$y" "$((x + 2))" "$((width - 4))" "$title"
+  render_panel_content "$index"
+}
+
+render_dashboard() {
+  local index
+
+  printf '\033[2J\033[H'
+
+  for index in "${PANEL_ORDER[@]}"; do
+    render_panel "$index"
+  done
+
+  move_cursor "$((REQUIRED_ROWS + 1))" 1
+  printf 'Press q to exit.'
+}
+
 wait_for_quit() {
   local key
 
@@ -220,16 +399,15 @@ main() {
     return 1
   fi
 
+  if ! validate_terminal_size; then
+    return 1
+  fi
+
   trap cleanup_terminal EXIT
   trap handle_interrupt INT
 
   setup_terminal
-  printf 'Change Dashboard skeleton started.\n'
-  printf 'Config: %s\n' "$config_file"
-  printf 'Refresh interval: %s seconds\n' "$REFRESH_INTERVAL"
-  printf 'Loaded panels: %s\n' "$PANEL_COUNT"
-  printf 'Tasks 3 and 4 config loading and panel model are active.\n'
-  printf 'Press q to exit.\n'
+  render_dashboard
 
   wait_for_quit
 }
