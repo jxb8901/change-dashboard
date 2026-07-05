@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Author: Jeffrey + ChatGPT
+# Changelog:
+# - 2026-07-05 V3: Add partial refresh, background highlighting, fixed column
+#   widths, transpose layout, empty-state rendering, and resize recovery.
+# - 2026-07-04 V2: Add table parsing and configurable warning/error rules.
+# - 2026-07-04 V1: Add the local synchronous terminal dashboard.
+
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,6 +19,10 @@ REQUIRED_ROWS=0
 REQUIRED_COLS=0
 CONDITION_OPERATOR=""
 CONDITION_VALUE=""
+RESIZE_PENDING=0
+DASHBOARD_PAUSED=0
+FORCE_FULL_REDRAW=1
+RESOLVED_WIDTHS=""
 
 declare -a PANEL_TITLES=()
 declare -a PANEL_COMMANDS=()
@@ -24,11 +35,19 @@ declare -a PANEL_OUTPUTS=()
 declare -a PANEL_TABLE_COLUMNS=()
 declare -a PANEL_WARN_RULES=()
 declare -a PANEL_ERROR_RULES=()
+declare -a PANEL_TABLE_LAYOUT=()
+declare -a PANEL_TABLE_WIDTHS=()
 declare -a PANEL_RENDER_MODES=()
 declare -a PANEL_STATUSES=()
 declare -a PANEL_TABLE_HEADERS=()
 declare -a PANEL_TABLE_ROWS=()
 declare -a PANEL_TABLE_CELL_STATUSES=()
+declare -a CURRENT_FRAME_KEYS=()
+declare -a CURRENT_FRAME_TEXT=()
+declare -a CURRENT_FRAME_STYLES=()
+declare -a PREVIOUS_FRAME_KEYS=()
+declare -a PREVIOUS_FRAME_TEXT=()
+declare -a PREVIOUS_FRAME_STYLES=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
@@ -39,8 +58,6 @@ usage() {
 
 setup_terminal() {
   TERMINAL_ACTIVE=1
-  # Clear the screen and move the cursor to the top-left corner.
-  printf '\033[2J\033[H'
   # Hide the cursor while the dashboard owns the terminal.
   printf '\033[?25l'
 }
@@ -59,6 +76,10 @@ cleanup_terminal() {
 handle_interrupt() {
   cleanup_terminal
   exit 130
+}
+
+handle_resize() {
+  RESIZE_PENDING=1
 }
 
 error() {
@@ -101,11 +122,19 @@ load_config() {
   PANEL_TABLE_COLUMNS=()
   PANEL_WARN_RULES=()
   PANEL_ERROR_RULES=()
+  PANEL_TABLE_LAYOUT=()
+  PANEL_TABLE_WIDTHS=()
   PANEL_RENDER_MODES=()
   PANEL_STATUSES=()
   PANEL_TABLE_HEADERS=()
   PANEL_TABLE_ROWS=()
   PANEL_TABLE_CELL_STATUSES=()
+  CURRENT_FRAME_KEYS=()
+  CURRENT_FRAME_TEXT=()
+  CURRENT_FRAME_STYLES=()
+  PREVIOUS_FRAME_KEYS=()
+  PREVIOUS_FRAME_TEXT=()
+  PREVIOUS_FRAME_STYLES=()
 
   # Config is trusted deployment input and may contain shell commands.
   # shellcheck source=/dev/null
@@ -139,6 +168,8 @@ validate_config() {
   validate_optional_panel_indexes PANEL_TABLE_COLUMNS || return 1
   validate_optional_panel_indexes PANEL_WARN_RULES || return 1
   validate_optional_panel_indexes PANEL_ERROR_RULES || return 1
+  validate_optional_panel_indexes PANEL_TABLE_LAYOUT || return 1
+  validate_optional_panel_indexes PANEL_TABLE_WIDTHS || return 1
 
   validate_table_configs || return 1
 
@@ -227,6 +258,7 @@ validate_table_configs() {
     validate_table_columns "$index" || return 1
     validate_rule_list "$index" "WARN" "${PANEL_WARN_RULES[$index]:-}" || return 1
     validate_rule_list "$index" "ERROR" "${PANEL_ERROR_RULES[$index]:-}" || return 1
+    validate_table_layout "$index" || return 1
   done
 
   for index in "${!PANEL_WARN_RULES[@]}"; do
@@ -242,6 +274,73 @@ validate_table_configs() {
       return 1
     fi
   done
+
+
+  for index in "${!PANEL_TABLE_LAYOUT[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_TABLE_LAYOUT[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+
+  for index in "${!PANEL_TABLE_WIDTHS[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_TABLE_WIDTHS[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+}
+
+validate_table_layout() {
+  local index="$1"
+  local layout="${PANEL_TABLE_LAYOUT[$index]:-table}"
+  local widths="${PANEL_TABLE_WIDTHS[$index]:-}"
+  local expected=0
+  local count=0
+  local total=0
+  local width
+  local column
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+
+  if [[ "$layout" != "table" && "$layout" != "transpose" ]]; then
+    error "PANEL_TABLE_LAYOUT[$index] must be table or transpose"
+    return 1
+  fi
+
+  if [[ "$layout" == "transpose" ]]; then
+    expected=2
+  else
+    for column in ${PANEL_TABLE_COLUMNS[$index]}; do
+      expected=$((expected + 1))
+    done
+  fi
+
+  if [[ -z "$widths" ]]; then
+    if (( content_width / expected < 1 )); then
+      error "panel $index is too narrow for $expected table columns"
+      return 1
+    fi
+    return 0
+  fi
+
+  for width in $widths; do
+    if ! is_positive_integer "$width"; then
+      error "PANEL_TABLE_WIDTHS[$index] values must be positive integers"
+      return 1
+    fi
+    count=$((count + 1))
+    total=$((total + width))
+  done
+
+  if (( count != expected )); then
+    error "PANEL_TABLE_WIDTHS[$index] requires $expected widths for $layout layout"
+    return 1
+  fi
+
+  if (( total > content_width )); then
+    error "PANEL_TABLE_WIDTHS[$index] total $total exceeds panel content width $content_width"
+    return 1
+  fi
 }
 
 validate_table_columns() {
@@ -428,6 +527,7 @@ move_cursor() {
   local row="$1"
   local col="$2"
 
+  # Move the cursor to the requested one-based terminal row and column.
   printf '\033[%s;%sH' "$row" "$col"
 }
 
@@ -451,187 +551,306 @@ clip_text() {
   printf '%s' "${text:0:width}"
 }
 
-status_color() {
-  case "$1" in
-    ERROR|FAILED) printf '\033[31m' ;;
-    WARN) printf '\033[33m' ;;
-    *) printf '' ;;
-  esac
-}
-
-reset_color() {
-  printf '\033[0m'
-}
-
-print_colored() {
-  local status="$1"
-  local text="$2"
-  local color
-
-  color="$(status_color "$status")"
-  if [[ -n "$color" ]]; then
-    printf '%s%s' "$color" "$text"
-    reset_color
-  else
-    printf '%s' "$text"
-  fi
-}
-
-draw_text_at() {
-  local row="$1"
-  local col="$2"
-  local width="$3"
-  local text="$4"
-
-  move_cursor "$row" "$col"
-  clip_text "$text" "$width"
-}
-
-draw_colored_text_at() {
-  local row="$1"
-  local col="$2"
-  local width="$3"
-  local text="$4"
-  local status="$5"
-
-  move_cursor "$row" "$col"
-  print_colored "$status" "$(clip_text "$text" "$width")"
-}
-
 draw_panel_border() {
   local x="$1"
   local y="$2"
   local width="$3"
   local height="$4"
-  local status="${5:-OK}"
   local row
   local inner_width=$((width - 2))
 
+  # Move to the panel's top-left corner before drawing its top border.
   move_cursor "$y" "$x"
-  print_colored "$status" "+"
-  print_colored "$status" "$(repeat_char '-' "$inner_width")"
-  print_colored "$status" "+"
+  printf '+%s+' "$(repeat_char '-' "$inner_width")"
 
   row=$((y + 1))
   while (( row < y + height - 1 )); do
+    # Move to the left edge of this panel row.
     move_cursor "$row" "$x"
-    print_colored "$status" "|"
+    printf '|'
+    # Move to the right edge of this panel row.
     move_cursor "$row" "$((x + width - 1))"
-    print_colored "$status" "|"
+    printf '|'
     row=$((row + 1))
   done
 
+  # Move to the panel's bottom-left corner before drawing its bottom border.
   move_cursor "$((y + height - 1))" "$x"
-  print_colored "$status" "+"
-  print_colored "$status" "$(repeat_char '-' "$inner_width")"
-  print_colored "$status" "+"
+  printf '+%s+' "$(repeat_char '-' "$inner_width")"
 }
 
-render_panel_content() {
-  local index="$1"
-  local x="${PANEL_X[$index]}"
-  local y="${PANEL_Y[$index]}"
-  local width="${PANEL_WIDTHS[$index]}"
-  local height="${PANEL_HEIGHTS[$index]}"
-  local content="${PANEL_OUTPUTS[$index]:-}"
-  local row=0
-  local line
-  local content_width=$((width - 2))
-  local content_height=$((height - 2))
+status_sequence() {
+  [[ -n "${NO_COLOR:-}" ]] && return 0
+  case "$1" in
+    # Set white foreground text on a red background for errors and failures.
+    ERROR|FAILED) printf '\033[37;41m' ;;
+    # Set black foreground text on a yellow background for warnings.
+    WARN) printf '\033[30;43m' ;;
+  esac
+}
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if (( row >= content_height )); then
-      break
+format_cell() {
+  local text="$1"
+  local width="$2"
+  local alignment="${3:-left}"
+  local clipped="${text:0:width}"
+
+  if [[ "$alignment" == "right" ]]; then
+    printf '%*s' "$width" "$clipped"
+  else
+    printf '%-*s' "$width" "$clipped"
+  fi
+}
+
+frame_add() {
+  local row="$1" col="$2" width="$3" text="$4"
+  local style="${5:-OK}" alignment="${6:-left}"
+  local position="${#CURRENT_FRAME_KEYS[@]}"
+
+  CURRENT_FRAME_KEYS[$position]="$row:$col:$width"
+  CURRENT_FRAME_TEXT[$position]="$(format_cell "$text" "$width" "$alignment")"
+  CURRENT_FRAME_STYLES[$position]="$style"
+}
+
+frame_find_key() {
+  local array_name="$1" target="$2" i value
+
+  eval 'for i in "${!'"$array_name"'[@]}"; do
+    value="${'"$array_name"'[$i]}"
+    if [[ "$value" == "$target" ]]; then
+      printf "%s" "$i"
+      return 0
     fi
+  done'
+  return 1
+}
 
-    draw_text_at "$((y + 1 + row))" "$((x + 1))" "$content_width" "$line"
-    row=$((row + 1))
+draw_frame_value() {
+  local key="$1" text="$2" style="$3"
+  local row="${key%%:*}" remainder="${key#*:}" sequence
+  local col="${remainder%%:*}"
+
+  # Move directly to the changed frame cell before repainting it.
+  move_cursor "$row" "$col"
+  sequence="$(status_sequence "$style")"
+  if [[ -n "$sequence" ]]; then
+    # Apply the status style, print the cell, then reset all ANSI attributes.
+    printf '%s%s\033[0m' "$sequence" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+render_frame_diff() {
+  local i previous key
+
+  for i in "${!PREVIOUS_FRAME_KEYS[@]}"; do
+    key="${PREVIOUS_FRAME_KEYS[$i]}"
+    if ! frame_find_key CURRENT_FRAME_KEYS "$key" >/dev/null; then
+      draw_frame_value "$key" "$(repeat_char ' ' "${key##*:}")" OK
+    fi
+  done
+
+  for i in "${!CURRENT_FRAME_KEYS[@]}"; do
+    key="${CURRENT_FRAME_KEYS[$i]}"
+    previous="$(frame_find_key PREVIOUS_FRAME_KEYS "$key" || true)"
+    if (( FORCE_FULL_REDRAW == 1 )) || [[ -z "$previous" ]] ||
+       [[ "${CURRENT_FRAME_TEXT[$i]}" != "${PREVIOUS_FRAME_TEXT[$previous]}" ]] ||
+       [[ "${CURRENT_FRAME_STYLES[$i]}" != "${PREVIOUS_FRAME_STYLES[$previous]}" ]]; then
+      draw_frame_value "$key" "${CURRENT_FRAME_TEXT[$i]}" "${CURRENT_FRAME_STYLES[$i]}"
+    fi
+  done
+
+  PREVIOUS_FRAME_KEYS=("${CURRENT_FRAME_KEYS[@]}")
+  PREVIOUS_FRAME_TEXT=("${CURRENT_FRAME_TEXT[@]}")
+  PREVIOUS_FRAME_STYLES=("${CURRENT_FRAME_STYLES[@]}")
+  FORCE_FULL_REDRAW=0
+}
+
+get_word_at_position() {
+  local words="$1" target="$2" position=0 word
+  for word in $words; do
+    if (( position == target )); then printf '%s' "$word"; return; fi
+    position=$((position + 1))
+  done
+}
+
+get_line_at_position() {
+  local content="$1" target="$2" position=0 line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( position == target )); then printf '%s' "$line"; return; fi
+    position=$((position + 1))
   done <<< "$content"
 }
 
-render_table_content() {
-  local index="$1"
-  local x="${PANEL_X[$index]}"
-  local y="${PANEL_Y[$index]}"
-  local width="${PANEL_WIDTHS[$index]}"
-  local height="${PANEL_HEIGHTS[$index]}"
-  local content_width=$((width - 2))
-  local content_height=$((height - 2))
-  local row=0
-  local line
-  local status_line
-  local col=0
-  local cell
-  local cell_status
-  local cell_width=0
-  local column_count=0
+resolve_table_widths() {
+  local index="$1" layout="${PANEL_TABLE_LAYOUT[$1]:-table}"
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local count=0 width column result=""
 
-  for cell in ${PANEL_TABLE_HEADERS[$index]}; do
-    column_count=$((column_count + 1))
-  done
-
-  if (( column_count > 0 )); then
-    cell_width=$((content_width / column_count))
-  fi
-
-  if (( cell_width < 1 )); then
-    render_panel_content "$index"
+  if [[ -n "${PANEL_TABLE_WIDTHS[$index]:-}" ]]; then
+    RESOLVED_WIDTHS="${PANEL_TABLE_WIDTHS[$index]}"
     return
   fi
-
-  for cell in ${PANEL_TABLE_HEADERS[$index]}; do
-    draw_colored_text_at "$((y + 1))" "$((x + 1 + col * cell_width))" "$cell_width" "$cell" OK
-    col=$((col + 1))
+  if [[ "$layout" == "transpose" ]]; then
+    count=2
+  else
+    for column in ${PANEL_TABLE_COLUMNS[$index]}; do count=$((count + 1)); done
+  fi
+  width=$((content_width / count))
+  while (( count > 0 )); do
+    result="${result}${width} "
+    count=$((count - 1))
   done
-
-  row=1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if (( row >= content_height )); then
-      break
-    fi
-
-    status_line="$(get_table_status_line "$index" "$row")"
-    col=0
-    for cell in $line; do
-      cell_status="$(get_status_at_position "$status_line" "$col")"
-      draw_colored_text_at "$((y + 1 + row))" "$((x + 1 + col * cell_width))" "$cell_width" "$cell" "$cell_status"
-      col=$((col + 1))
-    done
-
-    row=$((row + 1))
-  done <<< "${PANEL_TABLE_ROWS[$index]}"
+  RESOLVED_WIDTHS="${result% }"
 }
 
-render_panel() {
-  local index="$1"
-  local x="${PANEL_X[$index]}"
-  local y="${PANEL_Y[$index]}"
-  local width="${PANEL_WIDTHS[$index]}"
-  local height="${PANEL_HEIGHTS[$index]}"
-  local title=" ${PANEL_TITLES[$index]} "
-  local status="${PANEL_STATUSES[$index]:-OK}"
+build_raw_frame() {
+  local index="$1" row=0 line style=OK
+  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
+  local width=$((PANEL_WIDTHS[index] - 2)) height=$((PANEL_HEIGHTS[index] - 2))
+  local content="${PANEL_OUTPUTS[$index]:-No data}"
 
-  draw_panel_border "$x" "$y" "$width" "$height" "$status"
-  draw_colored_text_at "$y" "$((x + 2))" "$((width - 4))" "$title" "$status"
+  [[ "${PANEL_RENDER_MODES[$index]:-raw}" == "failed" ]] && style=ERROR
+  while (( row < height )); do
+    line="$(get_line_at_position "$content" "$row")"
+    frame_add "$((y + row))" "$x" "$width" "$line" "$style"
+    row=$((row + 1))
+  done
+}
 
-  if [[ "${PANEL_RENDER_MODES[$index]:-raw}" == "table" ]]; then
-    render_table_content "$index"
+build_table_frame() {
+  local index="$1" row=0 col width offset cell line status_line status alignment
+  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local content_height=$((PANEL_HEIGHTS[index] - 2))
+
+  resolve_table_widths "$index"
+  while (( row < content_height )); do
+    if (( row > 0 )) && [[ -z "${PANEL_TABLE_ROWS[$index]:-}" ]]; then
+      if (( row == 1 )); then
+        frame_add "$((y + row))" "$x" "$content_width" "No data" OK
+      else
+        frame_add "$((y + row))" "$x" "$content_width" "" OK
+      fi
+      row=$((row + 1))
+      continue
+    fi
+    offset=0
+    line=""
+    status_line=""
+    if (( row > 0 )); then
+      line="$(get_line_at_position "${PANEL_TABLE_ROWS[$index]:-}" "$((row - 1))")"
+      status_line="$(get_table_status_line "$index" "$row")"
+    fi
+    col=0
+    for width in $RESOLVED_WIDTHS; do
+      if (( row == 0 )); then
+        cell="$(get_word_at_position "${PANEL_TABLE_HEADERS[$index]}" "$col")"
+        status=OK
+        alignment=left
+      else
+        cell="$(get_word_at_position "$line" "$col")"
+        status="$(get_status_at_position "$status_line" "$col")"
+        alignment=left
+        is_number "$cell" && alignment=right
+      fi
+      frame_add "$((y + row))" "$((x + offset))" "$width" "$cell" "$status" "$alignment"
+      offset=$((offset + width))
+      col=$((col + 1))
+    done
+    if (( offset < content_width )); then
+      frame_add "$((y + row))" "$((x + offset))" "$((content_width - offset))" "" OK
+    fi
+    row=$((row + 1))
+  done
+}
+
+build_transpose_frame() {
+  local index="$1" row=0 column value status alignment
+  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local content_height=$((PANEL_HEIGHTS[index] - 2))
+  local source="${PANEL_TABLE_ROWS[$index]:-}"
+  local statuses="$(get_table_status_line "$index" 1)"
+  local key_width value_width
+
+  if [[ -z "$source" ]]; then
+    while (( row < content_height )); do
+      if (( row == 0 )); then
+        frame_add "$y" "$x" "$content_width" "No data" OK
+      else
+        frame_add "$((y + row))" "$x" "$content_width" "" OK
+      fi
+      row=$((row + 1))
+    done
+    return
   else
-    render_panel_content "$index"
+    resolve_table_widths "$index"
+    key_width="$(get_word_at_position "$RESOLVED_WIDTHS" 0)"
+    value_width="$(get_word_at_position "$RESOLVED_WIDTHS" 1)"
   fi
+  while (( row < content_height )); do
+    column="$(get_word_at_position "${PANEL_TABLE_HEADERS[$index]}" "$row")"
+    value="$(get_word_at_position "$source" "$row")"
+    status="$(get_status_at_position "$statuses" "$row")"
+    alignment=left
+    is_number "$value" && alignment=right
+    frame_add "$((y + row))" "$x" "$key_width" "$column" OK
+    frame_add "$((y + row))" "$((x + key_width))" "$value_width" "$value" "$status" "$alignment"
+    if (( key_width + value_width < content_width )); then
+      frame_add "$((y + row))" "$((x + key_width + value_width))" "$((content_width - key_width - value_width))" "" OK
+    fi
+    row=$((row + 1))
+  done
+}
+
+build_current_frame() {
+  local index
+  CURRENT_FRAME_KEYS=()
+  CURRENT_FRAME_TEXT=()
+  CURRENT_FRAME_STYLES=()
+  for index in "${PANEL_ORDER[@]}"; do
+    case "${PANEL_RENDER_MODES[$index]:-raw}" in
+      table) build_table_frame "$index" ;;
+      transpose) build_transpose_frame "$index" ;;
+      *) build_raw_frame "$index" ;;
+    esac
+  done
+}
+
+draw_static_dashboard() {
+  local index title title_text title_width inner_width left_fill
+  # Clear the terminal and return the cursor home for a forced full redraw.
+  printf '\033[2J\033[H'
+  for index in "${PANEL_ORDER[@]}"; do
+    draw_panel_border "${PANEL_X[$index]}" "${PANEL_Y[$index]}" "${PANEL_WIDTHS[$index]}" "${PANEL_HEIGHTS[$index]}"
+    inner_width=$((PANEL_WIDTHS[index] - 2))
+    title_width=$((inner_width - 2))
+    (( title_width < 0 )) && title_width=0
+    title_text="$(clip_text "${PANEL_TITLES[$index]}" "$title_width")"
+    title=" ${title_text} "
+    left_fill=$(((inner_width - ${#title}) / 2))
+    # Move to the centered title position, leaving the remaining border dashes intact.
+    move_cursor "${PANEL_Y[$index]}" "$((PANEL_X[index] + 1 + left_fill))"
+    printf '%s' "$title"
+  done
+  # Move below the configured layout before drawing the static footer.
+  move_cursor "$((REQUIRED_ROWS + 1))" 1
+  printf 'Refresh: %ss | Press q to exit.' "$REFRESH_INTERVAL"
 }
 
 render_dashboard() {
-  local index
-
-  printf '\033[2J\033[H'
-
-  for index in "${PANEL_ORDER[@]}"; do
-    render_panel "$index"
-  done
-
+  if (( FORCE_FULL_REDRAW == 1 )); then
+    PREVIOUS_FRAME_KEYS=()
+    PREVIOUS_FRAME_TEXT=()
+    PREVIOUS_FRAME_STYLES=()
+    draw_static_dashboard
+  fi
+  build_current_frame
+  render_frame_diff
+  # Return the cursor to the footer after all changed cells are painted.
   move_cursor "$((REQUIRED_ROWS + 1))" 1
-  printf 'Refresh: %ss | Press q to exit.' "$REFRESH_INTERVAL"
 }
 
 run_panel_commands() {
@@ -651,7 +870,7 @@ run_panel_commands() {
       prepare_panel_output "$index"
     else
       PANEL_OUTPUTS[$index]="Command failed"
-      PANEL_RENDER_MODES[$index]="raw"
+      PANEL_RENDER_MODES[$index]="failed"
       PANEL_STATUSES[$index]="FAILED"
     fi
   done
@@ -666,6 +885,8 @@ prepare_panel_output() {
   if has_array_index PANEL_TABLE_COLUMNS "$index"; then
     parse_table_output "$index" || return 0
     evaluate_table_output "$index"
+  elif [[ -z "${PANEL_OUTPUTS[$index]}" ]]; then
+    PANEL_OUTPUTS[$index]="No data"
   fi
 }
 
@@ -678,6 +899,7 @@ parse_table_output() {
   local line
   local field
   local table_rows=""
+  local row_count=0
 
   for line in $columns; do
     column_count=$((column_count + 1))
@@ -697,9 +919,16 @@ parse_table_output() {
     fi
 
     table_rows="${table_rows}${line}"$'\n'
+    row_count=$((row_count + 1))
   done <<< "$output"
 
-  PANEL_RENDER_MODES[$index]="table"
+  if [[ "${PANEL_TABLE_LAYOUT[$index]:-table}" == "transpose" && "$row_count" -gt 1 ]]; then
+    PANEL_RENDER_MODES[$index]="raw"
+    PANEL_STATUSES[$index]="OK"
+    return 1
+  fi
+
+  PANEL_RENDER_MODES[$index]="${PANEL_TABLE_LAYOUT[$index]:-table}"
   PANEL_TABLE_HEADERS[$index]="$columns"
   PANEL_TABLE_ROWS[$index]="${table_rows%$'\n'}"
 }
@@ -891,8 +1120,45 @@ wait_for_quit_or_timeout() {
   return 1
 }
 
+show_resize_pause() {
+  # Clear the dashboard and return the cursor home for the resize message.
+  printf '\033[2J\033[H'
+  printf 'Terminal too small: need %sx%s, have %sx%s. Resize or press q to exit.' \
+    "$REQUIRED_COLS" "$REQUIRED_ROWS" "$TERMINAL_COLS" "$TERMINAL_ROWS"
+}
+
+process_terminal_resize() {
+  read_terminal_size || return 1
+  RESIZE_PENDING=0
+
+  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_ROWS )); then
+    if (( DASHBOARD_PAUSED == 0 )); then
+      show_resize_pause
+    fi
+    DASHBOARD_PAUSED=1
+    return 1
+  fi
+
+  if (( DASHBOARD_PAUSED == 1 )); then
+    DASHBOARD_PAUSED=0
+  fi
+  FORCE_FULL_REDRAW=1
+  return 0
+}
+
 run_dashboard_loop() {
   while true; do
+    if (( RESIZE_PENDING == 1 || DASHBOARD_PAUSED == 1 )); then
+      process_terminal_resize || true
+    fi
+
+    if (( DASHBOARD_PAUSED == 1 )); then
+      if wait_for_quit_or_timeout 1; then
+        return 0
+      fi
+      continue
+    fi
+
     run_panel_commands
     render_dashboard
 
@@ -920,6 +1186,7 @@ main() {
 
   trap cleanup_terminal EXIT
   trap handle_interrupt INT
+  trap handle_resize WINCH
 
   setup_terminal
   run_dashboard_loop

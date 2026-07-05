@@ -12,3 +12,8 @@ dashboard.
 The `v2/` directory contains the V2 requirements, functional specification,
 architecture, task list, test plan, and changelog for configurable table
 parsing and warning/error coloring.
+
+## V3
+
+The `v3/` directory defines partial refresh, background highlighting,
+configurable column widths, transpose layout, and terminal resize recovery.
