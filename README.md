@@ -11,19 +11,19 @@ Lightweight Bash-first terminal dashboard for local production change verificati
 Use a custom config:
 
 ```bash
-./bin/lhc config/sample.conf
+./bin/lhc example/sample.conf
 ```
 
 Run the V2 threshold example:
 
 ```bash
-./bin/lhc config/v2-threshold.conf
+./bin/lhc example/v2-threshold.conf
 ```
 
 Run the V3 UX example:
 
 ```bash
-./bin/lhc config/v3-ux.conf
+./bin/lhc example/v3-ux.conf
 ```
 
 ## Current Status

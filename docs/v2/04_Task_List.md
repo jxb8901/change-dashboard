@@ -27,7 +27,7 @@
 
 ## Task 6: V1 Compatibility
 - Confirm raw panels still render.
-- Confirm `config/sample.conf` and `config/fpp.conf` still run.
+- Confirm `example/sample.conf` and `example/fpp.conf` still run.
 
 ## Task 7: V2 Sample Config
 - Add a sample config with multi-column table data.

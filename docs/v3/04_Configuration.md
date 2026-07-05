@@ -9,7 +9,9 @@ PANEL_TABLE_COLUMNS[0]="name depth state"
 PANEL_TABLE_WIDTHS[0]="12 8 10"
 ```
 
-Widths are exact terminal character widths. The count must match the configured columns and the total must fit the panel content area.
+Widths are exact terminal character widths. The count must match the configured
+columns. LHC adds a one-character gap between columns, so the configured widths
+plus all gaps must fit the panel content area.
 
 ## Transpose
 
@@ -24,7 +26,7 @@ Transpose widths represent the rendered key and value columns. The command must 
 ## Color Control
 
 ```bash
-NO_COLOR=1 ./bin/lhc config/v3-ux.conf
+NO_COLOR=1 ./bin/lhc example/v3-ux.conf
 ```
 
 Any non-empty `NO_COLOR` value disables ANSI warning and error colors.

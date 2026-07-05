@@ -18,6 +18,7 @@
 - In transpose layout, exactly two widths define key and value cells.
 - Width totals must fit within `PANEL_WIDTHS[index] - 2`.
 - Text is truncated and padded to its exact cell width.
+- A fixed one-character gap separates adjacent columns.
 - Numeric values are right-aligned; headers and text values are left-aligned.
 
 ## Transpose

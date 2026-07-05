@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-07-05 V4: Add a fixed one-character gap between table columns.
 # - 2026-07-05 V3: Add partial refresh, background highlighting, fixed column
 #   widths, transpose layout, empty-state rendering, and resize recovery.
 # - 2026-07-04 V2: Add table parsing and configurable warning/error rules.
@@ -9,14 +10,16 @@
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEFAULT_CONFIG="$ROOT_DIR/config/sample.conf"
+DEFAULT_CONFIG="$ROOT_DIR/example/sample.conf"
 TERMINAL_ACTIVE=0
 REFRESH_INTERVAL=2
+TABLE_COLUMN_GAP=1
 PANEL_COUNT=0
 TERMINAL_ROWS=0
 TERMINAL_COLS=0
 REQUIRED_ROWS=0
 REQUIRED_COLS=0
+REQUIRED_TERMINAL_ROWS=0
 CONDITION_OPERATOR=""
 CONDITION_VALUE=""
 RESIZE_PENDING=0
@@ -301,6 +304,8 @@ validate_table_layout() {
   local width
   local column
   local content_width=$((PANEL_WIDTHS[index] - 2))
+  local gap_total=0
+  local required_width=0
 
   if [[ "$layout" != "table" && "$layout" != "transpose" ]]; then
     error "PANEL_TABLE_LAYOUT[$index] must be table or transpose"
@@ -314,9 +319,10 @@ validate_table_layout() {
       expected=$((expected + 1))
     done
   fi
+  gap_total=$(((expected - 1) * TABLE_COLUMN_GAP))
 
   if [[ -z "$widths" ]]; then
-    if (( content_width / expected < 1 )); then
+    if (( (content_width - gap_total) / expected < 1 )); then
       error "panel $index is too narrow for $expected table columns"
       return 1
     fi
@@ -337,8 +343,9 @@ validate_table_layout() {
     return 1
   fi
 
-  if (( total > content_width )); then
-    error "PANEL_TABLE_WIDTHS[$index] total $total exceeds panel content width $content_width"
+  required_width=$((total + gap_total))
+  if (( required_width > content_width )); then
+    error "PANEL_TABLE_WIDTHS[$index] requires $required_width columns including gaps, but panel content width is $content_width"
     return 1
   fi
 }
@@ -493,6 +500,9 @@ calculate_required_terminal_size() {
       REQUIRED_ROWS="$panel_bottom"
     fi
   done
+
+  # Reserve one row below the panels for the refresh and exit footer.
+  REQUIRED_TERMINAL_ROWS=$((REQUIRED_ROWS + 1))
 }
 
 read_terminal_size() {
@@ -517,8 +527,8 @@ validate_terminal_size() {
   calculate_required_terminal_size
   read_terminal_size || return 1
 
-  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_ROWS )); then
-    error "terminal too small: need ${REQUIRED_COLS}x${REQUIRED_ROWS}, have ${TERMINAL_COLS}x${TERMINAL_ROWS}"
+  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
+    error "terminal too small: need ${REQUIRED_COLS}x${REQUIRED_TERMINAL_ROWS}, have ${TERMINAL_COLS}x${TERMINAL_ROWS}"
     return 1
   fi
 }
@@ -686,7 +696,7 @@ get_line_at_position() {
 resolve_table_widths() {
   local index="$1" layout="${PANEL_TABLE_LAYOUT[$1]:-table}"
   local content_width=$((PANEL_WIDTHS[index] - 2))
-  local count=0 width column result=""
+  local count=0 width column result="" available_width
 
   if [[ -n "${PANEL_TABLE_WIDTHS[$index]:-}" ]]; then
     RESOLVED_WIDTHS="${PANEL_TABLE_WIDTHS[$index]}"
@@ -697,7 +707,8 @@ resolve_table_widths() {
   else
     for column in ${PANEL_TABLE_COLUMNS[$index]}; do count=$((count + 1)); done
   fi
-  width=$((content_width / count))
+  available_width=$((content_width - (count - 1) * TABLE_COLUMN_GAP))
+  width=$((available_width / count))
   while (( count > 0 )); do
     result="${result}${width} "
     count=$((count - 1))
@@ -720,12 +731,13 @@ build_raw_frame() {
 }
 
 build_table_frame() {
-  local index="$1" row=0 col width offset cell line status_line status alignment
+  local index="$1" row=0 col width offset cell line status_line status alignment column_count=0
   local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
   local content_width=$((PANEL_WIDTHS[index] - 2))
   local content_height=$((PANEL_HEIGHTS[index] - 2))
 
   resolve_table_widths "$index"
+  for width in $RESOLVED_WIDTHS; do column_count=$((column_count + 1)); done
   while (( row < content_height )); do
     if (( row > 0 )) && [[ -z "${PANEL_TABLE_ROWS[$index]:-}" ]]; then
       if (( row == 1 )); then
@@ -757,6 +769,10 @@ build_table_frame() {
       fi
       frame_add "$((y + row))" "$((x + offset))" "$width" "$cell" "$status" "$alignment"
       offset=$((offset + width))
+      if (( col < column_count - 1 )); then
+        frame_add "$((y + row))" "$((x + offset))" "$TABLE_COLUMN_GAP" "" OK
+        offset=$((offset + TABLE_COLUMN_GAP))
+      fi
       col=$((col + 1))
     done
     if (( offset < content_width )); then
@@ -797,9 +813,10 @@ build_transpose_frame() {
     alignment=left
     is_number "$value" && alignment=right
     frame_add "$((y + row))" "$x" "$key_width" "$column" OK
-    frame_add "$((y + row))" "$((x + key_width))" "$value_width" "$value" "$status" "$alignment"
-    if (( key_width + value_width < content_width )); then
-      frame_add "$((y + row))" "$((x + key_width + value_width))" "$((content_width - key_width - value_width))" "" OK
+    frame_add "$((y + row))" "$((x + key_width))" "$TABLE_COLUMN_GAP" "" OK
+    frame_add "$((y + row))" "$((x + key_width + TABLE_COLUMN_GAP))" "$value_width" "$value" "$status" "$alignment"
+    if (( key_width + TABLE_COLUMN_GAP + value_width < content_width )); then
+      frame_add "$((y + row))" "$((x + key_width + TABLE_COLUMN_GAP + value_width))" "$((content_width - key_width - TABLE_COLUMN_GAP - value_width))" "" OK
     fi
     row=$((row + 1))
   done
@@ -1124,14 +1141,14 @@ show_resize_pause() {
   # Clear the dashboard and return the cursor home for the resize message.
   printf '\033[2J\033[H'
   printf 'Terminal too small: need %sx%s, have %sx%s. Resize or press q to exit.' \
-    "$REQUIRED_COLS" "$REQUIRED_ROWS" "$TERMINAL_COLS" "$TERMINAL_ROWS"
+    "$REQUIRED_COLS" "$REQUIRED_TERMINAL_ROWS" "$TERMINAL_COLS" "$TERMINAL_ROWS"
 }
 
 process_terminal_resize() {
   read_terminal_size || return 1
   RESIZE_PENDING=0
 
-  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_ROWS )); then
+  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
     if (( DASHBOARD_PAUSED == 0 )); then
       show_resize_pause
     fi
