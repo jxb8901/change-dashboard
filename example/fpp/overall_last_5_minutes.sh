@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -u
 
-printf '%s\n' \
-  '03 0 0 0 1234 1' \
-  '04 0 0 0 889 10' \
-  '05 3 0 5 900 15' \
-  '06 0 1 0 987 11' \
-  '09 0 0 0 1023 5' \
-  '10 0 0 0 1145 12' \
-  '21 2 2 4 1078 10' \
-  '22 0 0 0 999 10' \
-  '23 0 0 0 888 13' \
-  '24 5 0 5 893 15'
+random_between() {
+  local minimum="$1" maximum="$2"
+  printf '%s' "$((minimum + RANDOM % (maximum - minimum + 1)))"
+}
+
+for app in 03 04 05 06 09 10 21 22 23 24; do
+  printf '%s %s %s %s %s %s\n' \
+    "$app" \
+    "$(random_between 0 5)" \
+    "$(random_between 0 5)" \
+    "$(random_between 0 5)" \
+    "$(random_between 900 1500)" \
+    "$(random_between 5 50)"
+done
