@@ -12,6 +12,7 @@ set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_CONFIG="$ROOT_DIR/example/sample.conf"
 TERMINAL_ACTIVE=0
+TERMINAL_SETTINGS=""
 REFRESH_INTERVAL=2
 TABLE_COLUMN_GAP=1
 PANEL_COUNT=0
@@ -22,6 +23,8 @@ REQUIRED_COLS=0
 REQUIRED_TERMINAL_ROWS=0
 CONDITION_OPERATOR=""
 CONDITION_VALUE=""
+NUMERIC_COMPARE=0
+FRAME_KEY_INDEX=0
 RESIZE_PENDING=0
 DASHBOARD_PAUSED=0
 FORCE_FULL_REDRAW=1
@@ -51,6 +54,8 @@ declare -a CURRENT_FRAME_STYLES=()
 declare -a PREVIOUS_FRAME_KEYS=()
 declare -a PREVIOUS_FRAME_TEXT=()
 declare -a PREVIOUS_FRAME_STYLES=()
+declare -a CURRENT_FRAME_INDEX=()
+declare -a PREVIOUS_FRAME_INDEX=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
@@ -60,6 +65,8 @@ usage() {
 }
 
 setup_terminal() {
+  TERMINAL_SETTINGS="$(stty -g)"
+  stty -echo -icanon min 0 time 0
   TERMINAL_ACTIVE=1
   # Hide the cursor while the dashboard owns the terminal.
   printf '\033[?25l'
@@ -72,6 +79,7 @@ cleanup_terminal() {
     # Reset terminal text attributes such as color or bold.
     printf '\033[0m'
     printf '\n'
+    stty "$TERMINAL_SETTINGS"
     TERMINAL_ACTIVE=0
   fi
 }
@@ -138,6 +146,8 @@ load_config() {
   PREVIOUS_FRAME_KEYS=()
   PREVIOUS_FRAME_TEXT=()
   PREVIOUS_FRAME_STYLES=()
+  CURRENT_FRAME_INDEX=()
+  PREVIOUS_FRAME_INDEX=()
 
   # Config is trusted deployment input and may contain shell commands.
   # shellcheck source=/dev/null
@@ -620,19 +630,18 @@ frame_add() {
   CURRENT_FRAME_KEYS[$position]="$row:$col:$width"
   CURRENT_FRAME_TEXT[$position]="$(format_cell "$text" "$width" "$alignment")"
   CURRENT_FRAME_STYLES[$position]="$style"
+  frame_key_index "${CURRENT_FRAME_KEYS[$position]}"
+  CURRENT_FRAME_INDEX[$FRAME_KEY_INDEX]=$position
 }
 
-frame_find_key() {
-  local array_name="$1" target="$2" i value
-
-  eval 'for i in "${!'"$array_name"'[@]}"; do
-    value="${'"$array_name"'[$i]}"
-    if [[ "$value" == "$target" ]]; then
-      printf "%s" "$i"
-      return 0
-    fi
-  done'
-  return 1
+frame_key_index() {
+  local key="$1" row remainder col width base
+  row="${key%%:*}"
+  remainder="${key#*:}"
+  col="${remainder%%:*}"
+  width="${key##*:}"
+  base=$((REQUIRED_COLS + 1))
+  FRAME_KEY_INDEX=$((((row * base) + col) * base + width))
 }
 
 draw_frame_value() {
@@ -652,19 +661,23 @@ draw_frame_value() {
 }
 
 render_frame_diff() {
-  local i previous key
+  local i previous key lookup
 
   for i in "${!PREVIOUS_FRAME_KEYS[@]}"; do
     key="${PREVIOUS_FRAME_KEYS[$i]}"
-    if ! frame_find_key CURRENT_FRAME_KEYS "$key" >/dev/null; then
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    if [[ -z "${CURRENT_FRAME_INDEX[$lookup]+set}" ]]; then
       draw_frame_value "$key" "$(repeat_char ' ' "${key##*:}")" OK
     fi
   done
 
   for i in "${!CURRENT_FRAME_KEYS[@]}"; do
     key="${CURRENT_FRAME_KEYS[$i]}"
-    previous="$(frame_find_key PREVIOUS_FRAME_KEYS "$key" || true)"
-    if (( FORCE_FULL_REDRAW == 1 )) || [[ -z "$previous" ]] ||
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    previous="${PREVIOUS_FRAME_INDEX[$lookup]:-}"
+    if (( FORCE_FULL_REDRAW == 1 )) || [[ -z "${PREVIOUS_FRAME_INDEX[$lookup]+set}" ]] ||
        [[ "${CURRENT_FRAME_TEXT[$i]}" != "${PREVIOUS_FRAME_TEXT[$previous]}" ]] ||
        [[ "${CURRENT_FRAME_STYLES[$i]}" != "${PREVIOUS_FRAME_STYLES[$previous]}" ]]; then
       draw_frame_value "$key" "${CURRENT_FRAME_TEXT[$i]}" "${CURRENT_FRAME_STYLES[$i]}"
@@ -674,6 +687,11 @@ render_frame_diff() {
   PREVIOUS_FRAME_KEYS=("${CURRENT_FRAME_KEYS[@]}")
   PREVIOUS_FRAME_TEXT=("${CURRENT_FRAME_TEXT[@]}")
   PREVIOUS_FRAME_STYLES=("${CURRENT_FRAME_STYLES[@]}")
+  PREVIOUS_FRAME_INDEX=()
+  for i in "${!PREVIOUS_FRAME_KEYS[@]}"; do
+    frame_key_index "${PREVIOUS_FRAME_KEYS[$i]}"
+    PREVIOUS_FRAME_INDEX[$FRAME_KEY_INDEX]=$i
+  done
   FORCE_FULL_REDRAW=0
 }
 
@@ -827,6 +845,7 @@ build_current_frame() {
   CURRENT_FRAME_KEYS=()
   CURRENT_FRAME_TEXT=()
   CURRENT_FRAME_STYLES=()
+  CURRENT_FRAME_INDEX=()
   for index in "${PANEL_ORDER[@]}"; do
     case "${PANEL_RENDER_MODES[$index]:-raw}" in
       table) build_table_frame "$index" ;;
@@ -862,6 +881,7 @@ render_dashboard() {
     PREVIOUS_FRAME_KEYS=()
     PREVIOUS_FRAME_TEXT=()
     PREVIOUS_FRAME_STYLES=()
+    PREVIOUS_FRAME_INDEX=()
     draw_static_dashboard
   fi
   build_current_frame
@@ -1101,15 +1121,60 @@ compare_numbers() {
   local operator="$2"
   local right="$3"
 
-  awk -v l="$left" -v r="$right" 'BEGIN {
-    if ("'"$operator"'" == ">") exit !(l > r)
-    if ("'"$operator"'" == ">=") exit !(l >= r)
-    if ("'"$operator"'" == "<") exit !(l < r)
-    if ("'"$operator"'" == "<=") exit !(l <= r)
-    if ("'"$operator"'" == "==") exit !(l == r)
-    if ("'"$operator"'" == "!=") exit !(l != r)
-    exit 1
-  }'
+  compare_decimal_values "$left" "$right"
+  case "$operator" in
+    '>')  (( NUMERIC_COMPARE > 0 )) ;;
+    '>=') (( NUMERIC_COMPARE >= 0 )) ;;
+    '<')  (( NUMERIC_COMPARE < 0 )) ;;
+    '<=') (( NUMERIC_COMPARE <= 0 )) ;;
+    '==') (( NUMERIC_COMPARE == 0 )) ;;
+    '!=') (( NUMERIC_COMPARE != 0 )) ;;
+    *) return 1 ;;
+  esac
+}
+
+compare_decimal_values() {
+  local left="$1" right="$2" left_sign=1 right_sign=1
+  local left_integer left_fraction right_integer right_fraction length
+  local LC_ALL=C
+
+  [[ "$left" == -* ]] && left_sign=-1 && left="${left#-}"
+  [[ "$right" == -* ]] && right_sign=-1 && right="${right#-}"
+  left_integer="${left%%.*}"
+  right_integer="${right%%.*}"
+  [[ "$left" == *.* ]] && left_fraction="${left#*.}" || left_fraction=""
+  [[ "$right" == *.* ]] && right_fraction="${right#*.}" || right_fraction=""
+  while [[ "${left_integer#0}" != "$left_integer" ]]; do left_integer="${left_integer#0}"; done
+  while [[ "${right_integer#0}" != "$right_integer" ]]; do right_integer="${right_integer#0}"; done
+  [[ -n "$left_integer" ]] || left_integer=0
+  [[ -n "$right_integer" ]] || right_integer=0
+  [[ "$left_integer$left_fraction" =~ ^0+$ ]] && left_sign=1
+  [[ "$right_integer$right_fraction" =~ ^0+$ ]] && right_sign=1
+
+  if (( left_sign != right_sign )); then
+    NUMERIC_COMPARE=$left_sign
+    return
+  fi
+  if (( ${#left_integer} != ${#right_integer} )); then
+    (( ${#left_integer} > ${#right_integer} )) && NUMERIC_COMPARE=1 || NUMERIC_COMPARE=-1
+  elif [[ "$left_integer" == "$right_integer" ]]; then
+    length=${#left_fraction}
+    (( ${#right_fraction} > length )) && length=${#right_fraction}
+    while (( ${#left_fraction} < length )); do left_fraction="${left_fraction}0"; done
+    while (( ${#right_fraction} < length )); do right_fraction="${right_fraction}0"; done
+    if [[ "$left_fraction" == "$right_fraction" ]]; then
+      NUMERIC_COMPARE=0
+    elif [[ "$left_fraction" > "$right_fraction" ]]; then
+      NUMERIC_COMPARE=1
+    else
+      NUMERIC_COMPARE=-1
+    fi
+  elif [[ "$left_integer" > "$right_integer" ]]; then
+    NUMERIC_COMPARE=1
+  else
+    NUMERIC_COMPARE=-1
+  fi
+  (( left_sign < 0 )) && NUMERIC_COMPARE=$((-NUMERIC_COMPARE))
 }
 
 worst_status() {
@@ -1128,6 +1193,14 @@ worst_status() {
 wait_for_quit_or_timeout() {
   local timeout="$1"
   local key
+
+  if (( timeout == 0 )); then
+    # With min/time both zero, this consumes one available byte or returns
+    # immediately when no input is pending.
+    IFS= read -rsn1 key || return 1
+    [[ "$key" == "q" ]]
+    return
+  fi
 
   if IFS= read -rsn1 -t "$timeout" key; then
     [[ "$key" == "q" ]]
@@ -1164,6 +1237,7 @@ process_terminal_resize() {
 }
 
 run_dashboard_loop() {
+  local cycle_started remaining
   while true; do
     if (( RESIZE_PENDING == 1 || DASHBOARD_PAUSED == 1 )); then
       process_terminal_resize || true
@@ -1176,10 +1250,13 @@ run_dashboard_loop() {
       continue
     fi
 
+    cycle_started=$SECONDS
     run_panel_commands
     render_dashboard
 
-    if wait_for_quit_or_timeout "$REFRESH_INTERVAL"; then
+    remaining=$((REFRESH_INTERVAL - (SECONDS - cycle_started)))
+    (( remaining < 0 )) && remaining=0
+    if wait_for_quit_or_timeout "$remaining"; then
       return 0
     fi
   done
