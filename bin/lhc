@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-07-06 V4.2: Run panel commands concurrently and collect their results
+#   in deterministic panel order.
+# - 2026-07-06 V4.1: Optimize threshold comparisons, command substitutions,
+#   frame diff lookups, and parsed table data access.
 # - 2026-07-05 V4: Add a fixed one-character gap between table columns.
 # - 2026-07-05 V3: Add partial refresh, background highlighting, fixed column
 #   widths, transpose layout, empty-state rendering, and resize recovery.
@@ -29,6 +33,7 @@ DASHBOARD_PAUSED=0
 FORCE_FULL_REDRAW=1
 RESOLVED_WIDTHS=""
 FUNCTION_RESULT=""
+PANEL_COMMAND_TEMP_DIR=""
 
 declare -a PANEL_TITLES=()
 declare -a PANEL_COMMANDS=()
@@ -56,6 +61,8 @@ declare -a PREVIOUS_FRAME_TEXT=()
 declare -a PREVIOUS_FRAME_STYLES=()
 declare -a CURRENT_FRAME_INDEX=()
 declare -a PREVIOUS_FRAME_INDEX=()
+declare -a PANEL_COMMAND_PIDS=()
+declare -a PANEL_COMMAND_OUTPUT_FILES=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
@@ -71,6 +78,7 @@ setup_terminal() {
 }
 
 cleanup_terminal() {
+  cleanup_panel_commands
   if [[ "$TERMINAL_ACTIVE" -eq 1 ]]; then
     # Show the cursor again before returning control to the shell.
     printf '\033[?25h'
@@ -79,6 +87,31 @@ cleanup_terminal() {
     printf '\n'
     TERMINAL_ACTIVE=0
   fi
+}
+
+cleanup_panel_commands() {
+  local index pid file
+
+  for index in "${!PANEL_COMMAND_PIDS[@]}"; do
+    pid="${PANEL_COMMAND_PIDS[$index]}"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+
+  for index in "${!PANEL_COMMAND_OUTPUT_FILES[@]}"; do
+    file="${PANEL_COMMAND_OUTPUT_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  if [[ -n "$PANEL_COMMAND_TEMP_DIR" ]]; then
+    rmdir "$PANEL_COMMAND_TEMP_DIR" 2>/dev/null || true
+    PANEL_COMMAND_TEMP_DIR=""
+  fi
+
+  PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_OUTPUT_FILES=()
 }
 
 handle_interrupt() {
@@ -912,6 +945,7 @@ render_dashboard() {
 run_panel_commands() {
   local index
   local output
+  local output_file
 
   PANEL_OUTPUTS=()
   PANEL_RENDER_MODES=()
@@ -919,9 +953,32 @@ run_panel_commands() {
   PANEL_TABLE_HEADERS=()
   PANEL_TABLE_ROWS=()
   PANEL_TABLE_CELL_STATUSES=()
+  PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_OUTPUT_FILES=()
 
+  if [[ -z "$PANEL_COMMAND_TEMP_DIR" ]]; then
+    PANEL_COMMAND_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc.commands.XXXXXX")" || {
+      error "unable to create command output directory"
+      return 1
+    }
+  fi
+
+  # Start every panel command before waiting so dashboard latency is bounded by
+  # the slowest panel rather than the sum of all panel runtimes.
   for index in "${PANEL_ORDER[@]}"; do
-    if output="$(bash -c "${PANEL_COMMANDS[$index]}" 2>/dev/null)"; then
+    output_file="$PANEL_COMMAND_TEMP_DIR/output.$index"
+    PANEL_COMMAND_OUTPUT_FILES[$index]="$output_file"
+    bash -c "${PANEL_COMMANDS[$index]}" >"$output_file" 2>/dev/null &
+    PANEL_COMMAND_PIDS[$index]=$!
+  done
+
+  # Consume results in panel order to preserve deterministic parsing and
+  # rendering even though collection happens concurrently.
+  for index in "${PANEL_ORDER[@]}"; do
+    output_file="${PANEL_COMMAND_OUTPUT_FILES[$index]}"
+
+    if wait "${PANEL_COMMAND_PIDS[$index]}" 2>/dev/null; then
+      output="$(<"$output_file")"
       PANEL_OUTPUTS[$index]="$output"
       prepare_panel_output "$index"
     else
@@ -930,6 +987,8 @@ run_panel_commands() {
       PANEL_STATUSES[$index]="FAILED"
     fi
   done
+
+  PANEL_COMMAND_PIDS=()
 }
 
 prepare_panel_output() {

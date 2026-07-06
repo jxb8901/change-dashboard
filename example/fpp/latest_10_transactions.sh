@@ -21,4 +21,9 @@ for ((index = ${#transactions[@]} - 1; index > 0; index--)); do
   transactions[swap_index]="$transaction"
 done
 
+# Simulate a fast dashboard command that takes 100-500 milliseconds.
+delay_ms=$((100 + RANDOM % 401))
+printf -v delay_seconds '0.%03d' "$delay_ms"
+sleep "$delay_seconds"
+
 printf '%s\n' "${transactions[@]}"
