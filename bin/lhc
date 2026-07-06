@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-07-06 V4.5: Mark overflowing numbers with # and truncate overflowing
+#   text with a trailing dot.
 # - 2026-07-06 V4.4: Refresh each panel as soon as its command completes.
 # - 2026-07-06 V4.3: Render the dashboard skeleton immediately while the first
 #   panel data is loading.
@@ -658,7 +660,22 @@ format_cell() {
   local text="$1"
   local width="$2"
   local alignment="${3:-left}"
-  local clipped="${text:0:width}"
+  local clipped="$text"
+
+  if (( ${#text} > width )); then
+    if is_number "$text"; then
+      repeat_char '#' "$width"
+      return
+    fi
+
+    if (( width <= 0 )); then
+      clipped=""
+    elif (( width == 1 )); then
+      clipped="."
+    else
+      clipped="${text:0:$((width - 1))}."
+    fi
+  fi
 
   if [[ "$alignment" == "right" ]]; then
     printf -v FUNCTION_RESULT '%*s' "$width" "$clipped"
