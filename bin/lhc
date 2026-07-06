@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-07-06 V4.3: Render the dashboard skeleton immediately while the first
+#   panel data is loading.
 # - 2026-07-06 V4.2: Run panel commands concurrently and collect their results
 #   in deterministic panel order.
 # - 2026-07-06 V4.1: Optimize threshold comparisons, command substitutions,
@@ -942,6 +944,23 @@ render_dashboard() {
   move_cursor "$((REQUIRED_ROWS + 1))" 1
 }
 
+initialize_loading_dashboard() {
+  local index
+
+  PANEL_OUTPUTS=()
+  PANEL_RENDER_MODES=()
+  PANEL_STATUSES=()
+  PANEL_TABLE_HEADERS=()
+  PANEL_TABLE_ROWS=()
+  PANEL_TABLE_CELL_STATUSES=()
+
+  for index in "${PANEL_ORDER[@]}"; do
+    PANEL_OUTPUTS[$index]="Loading..."
+    PANEL_RENDER_MODES[$index]="raw"
+    PANEL_STATUSES[$index]="OK"
+  done
+}
+
 run_panel_commands() {
   local index
   local output
@@ -1354,6 +1373,8 @@ main() {
   trap handle_resize WINCH
 
   setup_terminal
+  initialize_loading_dashboard
+  render_dashboard
   run_dashboard_loop
 }
 
