@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-07-06 V4.4: Refresh each panel as soon as its command completes.
 # - 2026-07-06 V4.3: Render the dashboard skeleton immediately while the first
 #   panel data is loading.
 # - 2026-07-06 V4.2: Run panel commands concurrently and collect their results
@@ -65,6 +66,8 @@ declare -a CURRENT_FRAME_INDEX=()
 declare -a PREVIOUS_FRAME_INDEX=()
 declare -a PANEL_COMMAND_PIDS=()
 declare -a PANEL_COMMAND_OUTPUT_FILES=()
+declare -a PANEL_COMMAND_STATUS_FILES=()
+declare -a PANEL_COMMAND_COLLECTED=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
@@ -107,6 +110,11 @@ cleanup_panel_commands() {
     [[ -n "$file" ]] && rm -f "$file"
   done
 
+  for index in "${!PANEL_COMMAND_STATUS_FILES[@]}"; do
+    file="${PANEL_COMMAND_STATUS_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
   if [[ -n "$PANEL_COMMAND_TEMP_DIR" ]]; then
     rmdir "$PANEL_COMMAND_TEMP_DIR" 2>/dev/null || true
     PANEL_COMMAND_TEMP_DIR=""
@@ -114,6 +122,8 @@ cleanup_panel_commands() {
 
   PANEL_COMMAND_PIDS=()
   PANEL_COMMAND_OUTPUT_FILES=()
+  PANEL_COMMAND_STATUS_FILES=()
+  PANEL_COMMAND_COLLECTED=()
 }
 
 handle_interrupt() {
@@ -965,15 +975,15 @@ run_panel_commands() {
   local index
   local output
   local output_file
+  local status_file
+  local exit_status
+  local remaining="${#PANEL_ORDER[@]}"
+  local made_progress
 
-  PANEL_OUTPUTS=()
-  PANEL_RENDER_MODES=()
-  PANEL_STATUSES=()
-  PANEL_TABLE_HEADERS=()
-  PANEL_TABLE_ROWS=()
-  PANEL_TABLE_CELL_STATUSES=()
   PANEL_COMMAND_PIDS=()
   PANEL_COMMAND_OUTPUT_FILES=()
+  PANEL_COMMAND_STATUS_FILES=()
+  PANEL_COMMAND_COLLECTED=()
 
   if [[ -z "$PANEL_COMMAND_TEMP_DIR" ]]; then
     PANEL_COMMAND_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc.commands.XXXXXX")" || {
@@ -986,28 +996,53 @@ run_panel_commands() {
   # the slowest panel rather than the sum of all panel runtimes.
   for index in "${PANEL_ORDER[@]}"; do
     output_file="$PANEL_COMMAND_TEMP_DIR/output.$index"
+    status_file="$PANEL_COMMAND_TEMP_DIR/status.$index"
     PANEL_COMMAND_OUTPUT_FILES[$index]="$output_file"
-    bash -c "${PANEL_COMMANDS[$index]}" >"$output_file" 2>/dev/null &
+    PANEL_COMMAND_STATUS_FILES[$index]="$status_file"
+    : >"$status_file"
+    (
+      bash -c "${PANEL_COMMANDS[$index]}" >"$output_file" 2>/dev/null
+      exit_status=$?
+      printf '%s\n' "$exit_status" >"$status_file"
+    ) &
     PANEL_COMMAND_PIDS[$index]=$!
   done
 
-  # Consume results in panel order to preserve deterministic parsing and
-  # rendering even though collection happens concurrently.
-  for index in "${PANEL_ORDER[@]}"; do
-    output_file="${PANEL_COMMAND_OUTPUT_FILES[$index]}"
+  # Poll portable completion markers instead of wait -n, which is unavailable
+  # in the Bash version shipped with older macOS releases.
+  while (( remaining > 0 )); do
+    made_progress=0
+    for index in "${PANEL_ORDER[@]}"; do
+      [[ "${PANEL_COMMAND_COLLECTED[$index]:-0}" -eq 1 ]] && continue
+      status_file="${PANEL_COMMAND_STATUS_FILES[$index]}"
+      [[ -s "$status_file" ]] || continue
 
-    if wait "${PANEL_COMMAND_PIDS[$index]}" 2>/dev/null; then
-      output="$(<"$output_file")"
-      PANEL_OUTPUTS[$index]="$output"
-      prepare_panel_output "$index"
-    else
-      PANEL_OUTPUTS[$index]="Command failed"
-      PANEL_RENDER_MODES[$index]="failed"
-      PANEL_STATUSES[$index]="FAILED"
+      wait "${PANEL_COMMAND_PIDS[$index]}" 2>/dev/null || true
+      output_file="${PANEL_COMMAND_OUTPUT_FILES[$index]}"
+      exit_status="$(<"$status_file")"
+      if [[ "$exit_status" -eq 0 ]]; then
+        output="$(<"$output_file")"
+        PANEL_OUTPUTS[$index]="$output"
+        prepare_panel_output "$index"
+      else
+        PANEL_OUTPUTS[$index]="Command failed"
+        PANEL_RENDER_MODES[$index]="failed"
+        PANEL_STATUSES[$index]="FAILED"
+      fi
+
+      PANEL_COMMAND_COLLECTED[$index]=1
+      remaining=$((remaining - 1))
+      made_progress=1
+      render_dashboard
+    done
+
+    if (( remaining > 0 && made_progress == 0 )); then
+      sleep 0.05
     fi
   done
 
   PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_COLLECTED=()
 }
 
 prepare_panel_output() {
@@ -1344,7 +1379,6 @@ run_dashboard_loop() {
     fi
 
     run_panel_commands
-    render_dashboard
 
     if wait_for_quit_or_timeout "$REFRESH_INTERVAL"; then
       return 0
