@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+set -u
+
+if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$FAKE_SSH_LOG"
+fi
+
+target=""
+while (( $# > 0 )); do
+  case "$1" in
+    -T)
+      shift
+      ;;
+    -o)
+      (( $# >= 2 )) || exit 64
+      shift 2
+      ;;
+    *)
+      target="$1"
+      shift
+      break
+      ;;
+  esac
+done
+
+[[ -n "$target" ]] || exit 64
+[[ "${1:-}" == "bash" && "${2:-}" == "-s" ]] || exit 64
+
+if [[ "$target" == "fail" ]]; then
+  exit 255
+fi
+
+export FAKE_SSH_TARGET="$target"
+bash -s

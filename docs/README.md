@@ -17,3 +17,9 @@ parsing and warning/error coloring.
 
 The `v3/` directory defines partial refresh, background highlighting,
 configurable column widths, transpose layout, and terminal resize recovery.
+
+## V4
+
+The `v4/` directory defines global SSH server aliases, per-panel multi-server
+execution, deterministic result aggregation, failure rows, and multi-row
+transpose behavior.
