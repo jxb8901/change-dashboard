@@ -1,5 +1,10 @@
 # Change Dashboard Documentation
 
+## User manuals
+
+- [繁體中文使用手冊](USER_MANUAL_ZH-HK.md)
+- [English User Manual](USER_MANUAL_EN.md)
+
 ## V1
 
 The `v1/` directory contains the project vision, requirements, architecture,

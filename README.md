@@ -26,6 +26,11 @@ Run the V3 UX example:
 ./bin/lhc example/v3-ux.conf
 ```
 
+User manuals:
+
+- [繁體中文使用手冊](docs/USER_MANUAL_ZH-HK.md)
+- [English User Manual](docs/USER_MANUAL_EN.md)
+
 Review the V4 SSH example before replacing its placeholder SSH targets:
 
 ```bash
