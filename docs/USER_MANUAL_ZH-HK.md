@@ -138,7 +138,7 @@ PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="14 18"
 ```
 
-本機 transpose 命令最多只能輸出一個資料 row；多於一 row 或欄位數不符時，LHC 會回退為 raw。SSH transpose 是例外：每台伺服器可回傳多個 row，每個 row 都會渲染成連續的 key/value block。
+本機及 SSH transpose 都可處理零個或多個資料 row；每個 row 會渲染成連續的 key/value block。任何 row 的欄位數不符時，LHC 會回退為 raw。SSH 面板會先在每個 row 前加上 server alias。
 
 ### 4.6 Warning / error 規則
 
@@ -243,9 +243,9 @@ PANEL_TABLE_WIDTHS[1]="10 8 12"
 PANEL_WARN_RULES[1]="DEPTH:>20"
 PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 
-# Local transpose panel（單一來源 row）
+# Local transpose panel（可有多個來源 row）
 PANEL_TITLES[2]="Summary"
-PANEL_COMMANDS[2]="printf 'state READY\\n'"
+PANEL_COMMANDS[2]="printf 'state READY\\ncount 2\\n'"
 PANEL_X[2]=1; PANEL_Y[2]=10; PANEL_WIDTHS[2]=36; PANEL_HEIGHTS[2]=10
 PANEL_TABLE_COLUMNS[2]="FIELD VALUE"
 PANEL_TABLE_LAYOUT[2]="transpose"

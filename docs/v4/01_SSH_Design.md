@@ -78,7 +78,8 @@ PANEL_TABLE_WIDTHS[0]="8 4 5 4"
 
 ### 2.4 Transpose Configuration
 
-SSH panels also support transpose layout:
+Transpose layout uses the same multi-row rendering for local and SSH panels.
+For an SSH panel, configure it as follows:
 
 ```bash
 PANEL_TABLE_COLUMNS[1]="SERVER APP EAIQ ICLQ"
@@ -92,11 +93,11 @@ and value columns, not the number of source fields. Every non-empty remote
 output row must contain values for every configured column except the first
 `SERVER` column.
 
-LHC prepends the alias to every output row, then renders each resulting logical
-row as one consecutive key/value block. The `SERVER <alias>` row is first in
-every block. Blocks follow panel alias order and remote output order, with no
-blank separator row. One-row and multi-row server output use the same transpose
-path.
+For SSH, LHC prepends the alias to every output row, then renders each
+resulting logical row as one consecutive key/value block. The `SERVER <alias>`
+row is first in every block. Blocks follow panel alias order and remote output
+order, with no blank separator row. Local rows use the same renderer without
+the server-alias prefix.
 
 ### 2.5 Validation Rules
 
@@ -221,8 +222,9 @@ uses the existing raw-output fallback rather than silently discarding data.
 
 ### 4.2 Transpose Panels
 
-Transpose operates on every aggregated logical row without treating one-row and
-multi-row server output differently. For example, with:
+Transpose operates on every logical row for both local and SSH panels without
+treating one-row and multi-row output differently. For example, with an SSH
+panel:
 
 ```bash
 PANEL_TABLE_COLUMNS[0]="SERVER APP EAIQ ICLQ"
@@ -327,10 +329,11 @@ Verify that:
 ### 6.3 Aggregation Tests
 
 - Table mode with one server, multiple servers, and multiple rows per server.
-- Transpose mode with one server and multiple servers.
+- Transpose mode locally and with one or multiple SSH servers.
 - Verify each transpose block begins with `SERVER <alias>` and follows alias
   and source-row order without separator rows.
-- Verify one-row and multi-row remote results use the same transpose path.
+- Verify one-row and multi-row local and remote results use the same transpose
+  path.
 - Raw mode with one server, multiple servers, and multiline output.
 - Successful empty output in both modes.
 - One failed server mixed with successful servers.
@@ -363,8 +366,8 @@ Verify that:
 - An SSH table's first normal `PANEL_TABLE_COLUMNS` field is the server field;
   there are no `PANEL_SSH_DISPLAY_COLUMN` or `PANEL_SSH_DISPLAY_WIDTH`
   settings.
-- SSH transpose renders one key/value block per aggregated source row, without
-  special handling or limits based on each server's row count.
+- Local and SSH transpose render one key/value block per source row, without
+  special handling or limits based on the row count.
 - Successful results remain visible when one server fails.
 - SSH is non-interactive with a 10-second connection timeout.
 - Command runtime timeout is outside this change.

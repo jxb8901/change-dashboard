@@ -23,8 +23,9 @@
 
 ## Transpose
 - `PANEL_TABLE_LAYOUT[index]="transpose"` enables key/value display.
-- The command must produce zero or one parsed data row.
-- Multiple rows or field-count mismatch use raw-output fallback.
+- The command may produce zero or more parsed data rows; each row is rendered
+  as one consecutive key/value block.
+- A field-count mismatch uses raw-output fallback.
 - Rules retain their original source-column mapping.
 
 ## Resilience

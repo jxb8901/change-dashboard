@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-08-13 V4.7: Allow local and SSH transpose panels to render multiple
+#   source rows through the same key/value block renderer.
 # - 2026-08-01 V4.6: Add per-panel multi-server SSH execution, deterministic
 #   aggregation with server aliases, and multi-row transpose rendering.
 # - 2026-07-06 V4.5: Mark overflowing numbers with # and truncate overflowing
@@ -1374,7 +1376,6 @@ parse_table_output() {
   local line
   local field
   local table_rows=""
-  local row_count=0
 
   for line in $columns; do
     column_count=$((column_count + 1))
@@ -1394,15 +1395,7 @@ parse_table_output() {
     fi
 
     table_rows="${table_rows}${line}"$'\n'
-    row_count=$((row_count + 1))
   done <<< "$output"
-
-  if [[ "${PANEL_TABLE_LAYOUT[$index]:-table}" == "transpose" ]] && \
-     ! has_array_index PANEL_SSH_ALIASES "$index" && (( row_count > 1 )); then
-    PANEL_RENDER_MODES[$index]="raw"
-    PANEL_STATUSES[$index]="OK"
-    return 1
-  fi
 
   PANEL_RENDER_MODES[$index]="${PANEL_TABLE_LAYOUT[$index]:-table}"
   PANEL_TABLE_HEADERS[$index]="$columns"

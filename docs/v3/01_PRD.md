@@ -8,7 +8,7 @@ Improve terminal usability without changing the local, Bash-first verification m
 - Refresh only content cells whose text or severity changed.
 - Use full-cell background colors for warning and error values.
 - Support configured table column widths and truncation.
-- Support explicit single-row key/value transpose layout.
+- Support key/value transpose layout for zero or more parsed data rows.
 - Handle empty output and terminal resize clearly.
 
 ## Compatibility

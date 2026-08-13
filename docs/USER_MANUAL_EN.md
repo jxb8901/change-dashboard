@@ -138,7 +138,7 @@ PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="14 18"
 ```
 
-A local transpose command may produce at most one data row; multiple rows or a field-count mismatch fall back to raw output. SSH transpose is different: each server may return multiple rows, and every row is rendered as a consecutive key/value block.
+Both local and SSH transpose panels may contain zero or more data rows; each row is rendered as a consecutive key/value block. A field-count mismatch falls back to raw output. SSH panels prepend the server alias to each row before rendering.
 
 ### 4.6 Warning and error rules
 
@@ -243,9 +243,9 @@ PANEL_TABLE_WIDTHS[1]="10 8 12"
 PANEL_WARN_RULES[1]="DEPTH:>20"
 PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 
-# Local transpose panel (one source row)
+# Local transpose panel (multiple source rows supported)
 PANEL_TITLES[2]="Summary"
-PANEL_COMMANDS[2]="printf 'state READY\\n'"
+PANEL_COMMANDS[2]="printf 'state READY\\ncount 2\\n'"
 PANEL_X[2]=1; PANEL_Y[2]=10; PANEL_WIDTHS[2]=36; PANEL_HEIGHTS[2]=10
 PANEL_TABLE_COLUMNS[2]="FIELD VALUE"
 PANEL_TABLE_LAYOUT[2]="transpose"

@@ -160,10 +160,19 @@ assert_equal "raw" "${PANEL_RENDER_MODES[8]}" "malformed SSH table falls back to
 PANEL_OUTPUTS[9]=$'one 1\ntwo 2'
 PANEL_TABLE_COLUMNS[9]="NAME VALUE"
 PANEL_TABLE_LAYOUT[9]="transpose"
+PANEL_TABLE_WIDTHS[9]="8 10"
+PANEL_WIDTHS[9]=30
+PANEL_HEIGHTS[9]=8
 PANEL_SSH_FAILURE_ROWS[9]=""
 unset 'PANEL_SSH_ALIASES[9]'
 prepare_panel_output 9
-assert_equal "raw" "${PANEL_RENDER_MODES[9]}" "local multi-row transpose keeps V3 fallback"
+assert_equal "transpose" "${PANEL_RENDER_MODES[9]}" "local multi-row transpose render mode"
+assert_equal $'one 1\ntwo 2' "${PANEL_TABLE_ROWS[9]}" "local multi-row transpose rows"
+
+TRANSPOSE_CAPTURE=""
+build_transpose_frame 9
+EXPECTED_LOCAL_CAPTURE="NAME|one|VALUE|1|NAME|two|VALUE|2|"
+assert_equal "$EXPECTED_LOCAL_CAPTURE" "$TRANSPOSE_CAPTURE" "local transpose renders one block per source row"
 
 PANEL_COMMAND_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc-v4-cleanup.XXXXXX")" || fail_test "cleanup temp dir"
 PANEL_COMMAND_JOB_COUNT=0
@@ -181,4 +190,4 @@ cleanup_panel_commands
 (( SECONDS <= 2 )) || fail_test "cleanup did not promptly terminate an active SSH job"
 [[ ! -e "$INTERRUPT_TEMP_DIR" ]] || fail_test "active-job cleanup left its temporary directory"
 
-printf 'PASS: V4 SSH execution, aggregation, transpose, and validation\n'
+printf 'PASS: local/SSH execution, aggregation, multi-row transpose, and validation\n'

@@ -11,8 +11,8 @@
 - Verify configured widths, padding, truncation, and numeric alignment.
 - Reject invalid width count, non-positive width, and excessive total width.
 - Verify omitted widths preserve V2 equal-width behavior.
-- Verify single-row transpose and threshold mapping.
-- Verify multi-row transpose falls back to raw output.
+- Verify single-row and multi-row transpose rendering and threshold mapping.
+- Verify a field-count mismatch falls back to raw output.
 
 ## Resilience
 - Verify empty successful output displays `No data`.
