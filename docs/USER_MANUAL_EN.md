@@ -33,8 +33,12 @@ Each startup or refresh cycle works as follows:
 1. Load and validate the Bash configuration.
 2. Draw all panel borders and `Loading...` placeholders.
 3. Start each due panel's local command or SSH jobs concurrently.
-4. As soon as all jobs for one panel finish, parse and redraw that panel.
-5. Schedule that panel's next run after `REFRESH_INTERVAL` seconds; other panels have independent timers and are not blocked by it.
+4. For a snapshot panel, parse and redraw as soon as all its jobs finish. For a
+   stream panel, redraw whenever new complete output lines arrive while its
+   command remains active.
+5. Schedule that panel's next run after `REFRESH_INTERVAL` seconds when its
+   command set finishes; other panels have independent timers and are not
+   blocked by it.
 
 SSH jobs run concurrently, but results within one panel are aggregated in the order of `PANEL_SSH_ALIASES`, not completion order. LHC updates only changed frame cells; a terminal resize forces a complete redraw.
 
@@ -114,9 +118,24 @@ The footer row remains reserved. A percentage that resolves below the minimum
 size or outside the terminal causes startup validation to fail; after resize,
 the dashboard pauses until the terminal is large enough.
 
+### 4.2.1 Optional stream setting
+
+| Variable | Example | Description |
+| --- | --- | --- |
+| `PANEL_STREAM[i]` | `1` | Enables continuous raw output for panel `i`; valid values are `0` and `1`, and the default is snapshot mode. The rolling buffer is the panel's visible content height. |
+
 ### 4.3 Raw panels
 
 A panel without `PANEL_TABLE_COLUMNS[i]` is a raw panel. Command stdout is displayed line by line; empty stdout displays `No data`. Lines do not wrap. Text wider than the panel is clipped, and lines beyond the visible height are not shown. Raw panels may use the reserved `MESSAGE` rule field with `~` or `!~`; for `~`, only every matching keyword occurrence is highlighted and the rest of the message stays unstyled.
+
+Set `PANEL_STREAM[i]=1` to run a raw panel as a continuous stream. LHC reads
+complete newline-terminated lines while the command is still running and keeps
+the most recent `PANEL_EFFECTIVE_HEIGHTS[i] - 2` lines, so no separate stream
+line-count setting is required. The same setting works for local and raw SSH
+panels; stream table and transpose panels are rejected. When the command exits,
+the final buffer remains visible and the panel is restarted after
+`REFRESH_INTERVAL` seconds. A producer that buffers stdout may need a
+line-buffering option such as `stdbuf -oL`.
 
 ```bash
 PANEL_TITLES[0]="Deployment"
@@ -125,6 +144,15 @@ PANEL_X[0]=1
 PANEL_Y[0]=1
 PANEL_WIDTHS[0]=40
 PANEL_HEIGHTS[0]=7
+```
+
+Example continuous raw panel:
+
+```bash
+PANEL_TITLES[0]="Application log"
+PANEL_COMMANDS[0]="tail -f /var/log/app.log"
+PANEL_STREAM[0]=1
+PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=60; PANEL_HEIGHTS[0]=12
 ```
 
 ### 4.4 Table panels
@@ -253,6 +281,9 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
 - The initial screen draws borders, titles, and `Loading...`; completed panels replace their content progressively.
 - Panel titles are centered and clipped to the available title width when necessary.
 - Raw panels show text, table panels show a header and data rows, and transpose panels show field-name/value blocks without a separate table-header row.
+- Stream raw panels update while their command is still running and retain only
+  the most recent visible content-height lines. A stream command that exits is
+  restarted after `REFRESH_INTERVAL` seconds.
 - Empty results display `No data`. Content is clipped to panel height and does not scroll automatically.
 - Cell widths are fixed. A numeric value that is too wide becomes all `#` characters; an overlong text value keeps a trailing `.` (for example, `abcdefg.` in an eight-character cell).
 - Warning cells use black text on yellow; error cells and failed-panel content use white text on red. `NO_COLOR` only disables ANSI colors.

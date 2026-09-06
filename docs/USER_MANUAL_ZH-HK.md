@@ -33,8 +33,10 @@ NO_COLOR=1 ./bin/lhc example/fpp.conf
 1. 讀取並驗證 Bash 配置。
 2. 先畫出所有面板及 `Loading...` 狀態。
 3. 啟動每個已到期 panel 的本機命令或 SSH jobs。
-4. 某個 panel 的所有 jobs 完成後，立即解析並重畫該 panel。
-5. 該 panel 在完成後等待 `REFRESH_INTERVAL` 秒再執行下一輪；其他 panel 使用獨立計時器，不會被它阻塞。
+4. snapshot panel 在所有 jobs 完成後立即解析並重畫；stream panel
+   在命令仍然運行時，每收到新的完整輸出行便重畫。
+5. 該 panel 的命令結束後等待 `REFRESH_INTERVAL` 秒再執行下一輪；其他
+   panel 使用獨立計時器，不會被它阻塞。
 
 SSH job 會並行執行，但同一面板的結果按 `PANEL_SSH_ALIASES` 配置順序聚合，而不是按完成先後排序。LHC 使用局部 frame diff 更新改變的內容；調整終端機大小後會強制完整重畫。
 
@@ -103,9 +105,23 @@ PANEL_HEIGHTS[1]="100%"
 
 footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機時，啟動驗證會失敗；運行中 resize 至不合適大小時，dashboard 會暫停，直至終端機足夠大。
 
+### 4.2.1 可選的 stream 設定
+
+| 變數 | 例子 | 說明 |
+| --- | --- | --- |
+| `PANEL_STREAM[i]` | `1` | 啟用 panel `i` 的持續 raw 輸出；有效值是 `0` 或 `1`，預設是 snapshot 模式。滾動 buffer 上限等於 panel 可見內容高度。 |
+
 ### 4.3 Raw 面板
 
 不設定 `PANEL_TABLE_COLUMNS[i]` 就是 raw 面板。命令 stdout 按原本的行顯示；空 stdout 顯示 `No data`。內容不會換行，超過面板寬度的文字會被截斷，超過可見高度的行會被裁掉。Raw panel 可使用保留字段 `MESSAGE` 的 `~` 或 `!~` rule；使用 `~` 時只高亮每一個命中的 keyword，其餘 message 保持普通樣式。
+
+設定 `PANEL_STREAM[i]=1` 可把 raw panel 變成持續輸出模式。LHC 會在命令
+仍然運行時讀取完整 newline 行，並只保留最近
+`PANEL_EFFECTIVE_HEIGHTS[i] - 2` 行，因此不需要另外設定 stream 行數。
+本設定同時適用於本機及 raw SSH panel；stream table 和 transpose panel
+會被拒絕。命令退出後保留最後 buffer，並在 `REFRESH_INTERVAL` 秒後重啟。
+如果輸出程序本身有 stdout buffering，可能需要使用 `stdbuf -oL` 等
+line-buffering 設定。
 
 ```bash
 PANEL_TITLES[0]="Deployment"
@@ -114,6 +130,15 @@ PANEL_X[0]=1
 PANEL_Y[0]=1
 PANEL_WIDTHS[0]=40
 PANEL_HEIGHTS[0]=7
+```
+
+持續 raw panel 例子：
+
+```bash
+PANEL_TITLES[0]="Application log"
+PANEL_COMMANDS[0]="tail -f /var/log/app.log"
+PANEL_STREAM[0]=1
+PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=60; PANEL_HEIGHTS[0]=12
 ```
 
 ### 4.4 表格面板
@@ -242,6 +267,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 - 初始畫面先顯示邊框、標題及 `Loading...`；完成的面板會逐一替換內容。
 - 面板標題置中顯示；標題過長時會按面板可用寬度截斷。
 - raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示字段名稱/字段值 block，且不增加獨立表格列頭。
+- stream raw panel 會在命令仍然運行時更新，只保留最近的可見內容高度行數；命令退出後按 `REFRESH_INTERVAL` 秒重啟。
 - 空結果顯示 `No data`。資料按面板高度裁剪，不會自動滾動。
 - cell 寬度是固定的。超寬數字全部顯示為 `#`；超寬文字在最後保留 `.`，例如寬度 8 的文字可能顯示 `abcdefg.`。
 - warning cell 是黑字黃底；error cell 及失敗面板內容是白字紅底。`NO_COLOR` 只關閉 ANSI 顏色。

@@ -20,3 +20,6 @@
 - Percentage X/width values use terminal columns. Percentage Y/height values
   use terminal rows excluding the footer. Values are rounded down; the normal
   minimum-size and bounds checks still apply.
+- `PANEL_STREAM[index]=1` enables continuous raw output for local or SSH panels.
+  The rolling buffer is limited to the panel's effective content height; stream
+  table and transpose panels are rejected.

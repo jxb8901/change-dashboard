@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-06 V5.2: Add continuous raw local and SSH stream panels with
+#   height-bounded ring buffers, live redraws, and clean command termination.
 # - 2026-09-06 V5.1: Accept integer or percentage panel geometry, resolve
 #   responsive dimensions after terminal resize, and preserve source values.
 # - 2026-09-06 V5: Refresh panels independently, reuse SSH connections with
@@ -59,6 +61,7 @@ declare -a SSH_SERVERS=()
 declare -a PANEL_TITLES=()
 declare -a PANEL_COMMANDS=()
 declare -a PANEL_SSH_ALIASES=()
+declare -a PANEL_STREAM=()
 declare -a PANEL_X=()
 declare -a PANEL_Y=()
 declare -a PANEL_WIDTHS=()
@@ -100,6 +103,10 @@ declare -a PANEL_COMMAND_INPUT_FILES=()
 declare -a PANEL_COMMAND_ERROR_FILES=()
 declare -a PANEL_COMMAND_EXIT_STATUSES=()
 declare -a PANEL_COMMAND_CONTROL_PATHS=()
+declare -a PANEL_COMMAND_STREAMS=()
+declare -a PANEL_COMMAND_FIFO_FILES=()
+declare -a PANEL_COMMAND_LAST_OUTPUTS=()
+declare -a PANEL_COMMAND_LAST_STATUSES=()
 declare -a PANEL_COMMAND_COUNTS=()
 declare -a PANEL_COMMAND_COMPLETED_COUNTS=()
 declare -a PANEL_COMMAND_ACTIVE=()
@@ -158,7 +165,9 @@ cleanup_panel_commands() {
 
   for index in "${!PANEL_COMMAND_OUTPUT_FILES[@]}"; do
     file="${PANEL_COMMAND_OUTPUT_FILES[$index]:-}"
-    [[ -n "$file" ]] && rm -f "$file"
+    if [[ -n "$file" ]]; then
+      rm -f "$file" "$file.tmp"
+    fi
   done
 
   for index in "${!PANEL_COMMAND_STATUS_FILES[@]}"; do
@@ -173,6 +182,11 @@ cleanup_panel_commands() {
 
   for index in "${!PANEL_COMMAND_ERROR_FILES[@]}"; do
     file="${PANEL_COMMAND_ERROR_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_FIFO_FILES[@]}"; do
+    file="${PANEL_COMMAND_FIFO_FILES[$index]:-}"
     [[ -n "$file" ]] && rm -f "$file"
   done
 
@@ -192,6 +206,10 @@ cleanup_panel_commands() {
   PANEL_COMMAND_ERROR_FILES=()
   PANEL_COMMAND_EXIT_STATUSES=()
   PANEL_COMMAND_CONTROL_PATHS=()
+  PANEL_COMMAND_STREAMS=()
+  PANEL_COMMAND_FIFO_FILES=()
+  PANEL_COMMAND_LAST_OUTPUTS=()
+  PANEL_COMMAND_LAST_STATUSES=()
   PANEL_COMMAND_COUNTS=()
   PANEL_COMMAND_COMPLETED_COUNTS=()
   PANEL_COMMAND_ACTIVE=()
@@ -246,6 +264,7 @@ load_config() {
   PANEL_TITLES=()
   PANEL_COMMANDS=()
   PANEL_SSH_ALIASES=()
+  PANEL_STREAM=()
   PANEL_X=()
   PANEL_Y=()
   PANEL_WIDTHS=()
@@ -316,11 +335,29 @@ validate_config() {
   validate_optional_panel_indexes PANEL_TABLE_LAYOUT || return 1
   validate_optional_panel_indexes PANEL_TABLE_WIDTHS || return 1
   validate_optional_panel_indexes PANEL_SSH_ALIASES || return 1
+  validate_optional_panel_indexes PANEL_STREAM || return 1
 
   validate_table_configs || return 1
+  validate_stream_configs || return 1
   validate_ssh_configs || return 1
 
   initialize_effective_panel_dimensions
+}
+
+validate_stream_configs() {
+  local index value
+
+  for index in "${!PANEL_STREAM[@]}"; do
+    value="${PANEL_STREAM[$index]}"
+    if [[ "$value" != "0" && "$value" != "1" ]]; then
+      error "PANEL_STREAM[$index] must be 0 or 1"
+      return 1
+    fi
+    if [[ "$value" == "1" ]] && has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_STREAM[$index] is only supported for raw panels"
+      return 1
+    fi
+  done
 }
 
 validate_no_extra_panel_indexes() {
@@ -1508,6 +1545,135 @@ initialize_loading_dashboard() {
   done
 }
 
+get_stream_capacity() {
+  local panel_index="$1"
+  local capacity=$((PANEL_EFFECTIVE_HEIGHTS[panel_index] - 2))
+
+  (( capacity < 1 )) && capacity=1
+  FUNCTION_RESULT="$capacity"
+}
+
+limit_stream_output() {
+  local panel_index="$1"
+  local capacity content="${PANEL_OUTPUTS[$panel_index]:-}"
+
+  get_stream_capacity "$panel_index"
+  capacity="$FUNCTION_RESULT"
+  if [[ -z "$content" ]]; then
+    FUNCTION_RESULT=""
+  else
+    FUNCTION_RESULT="$(printf '%s\n' "$content" | tail -n "$capacity")"
+  fi
+}
+
+stream_collect() {
+  local fifo="$1"
+  local snapshot_file="$2"
+  local capacity="$3"
+  local line temporary start position slot
+  local count=0
+  local next=0
+  local -a lines
+
+  lines=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lines[$next]="$line"
+    next=$(( (next + 1) % capacity ))
+    if (( count < capacity )); then
+      count=$((count + 1))
+    fi
+
+    temporary="${snapshot_file}.tmp"
+    : >"$temporary"
+    if (( count == capacity )); then
+      start="$next"
+    else
+      start=0
+    fi
+    for ((position = 0; position < count; position++)); do
+      slot=$(( (start + position) % capacity ))
+      printf '%s\n' "${lines[$slot]}" >>"$temporary"
+    done
+    mv -f "$temporary" "$snapshot_file"
+  done <"$fifo"
+}
+
+aggregate_ssh_stream_output() {
+  local panel_index="$1" job alias status output line
+  local aggregate="" failed=0
+
+  for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
+    alias="${PANEL_COMMAND_ALIASES[$job]}"
+    status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
+    output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+
+    if [[ -n "$status" && "$status" -ne 0 ]]; then
+      aggregate="${aggregate}${alias} SSH_FAILED (exit ${status})"$'\n'
+      failed=1
+    elif [[ -z "$output" ]]; then
+      aggregate="${aggregate}${alias} No data"$'\n'
+    else
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        aggregate="${aggregate}${alias} ${line}"$'\n'
+      done <<<"$output"
+    fi
+  done
+
+  PANEL_OUTPUTS[$panel_index]="${aggregate%$'\n'}"
+  limit_stream_output "$panel_index"
+  PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+  PANEL_SSH_FAILURE_ROWS[$panel_index]=""
+  prepare_panel_output "$panel_index"
+  if (( failed == 1 )); then
+    PANEL_RENDER_MODES[$panel_index]="failed"
+    PANEL_STATUSES[$panel_index]="FAILED"
+  fi
+}
+
+refresh_stream_panels() {
+  local panel_index job output_file current previous status last_status changed
+
+  for panel_index in "${PANEL_ORDER[@]}"; do
+    [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-0}" -eq 1 ]] || continue
+    [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 ]] || continue
+    changed=0
+
+    for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+      [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+      [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
+      output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
+      [[ -f "$output_file" ]] || continue
+      current="$(<"$output_file")"
+      previous="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
+      status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
+      last_status="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
+      if [[ "$current" != "$previous" || "$status" != "$last_status" ]]; then
+        PANEL_COMMAND_LAST_OUTPUTS[$job]="$current"
+        PANEL_COMMAND_LAST_STATUSES[$job]="$status"
+        changed=1
+      fi
+    done
+
+    (( changed == 1 )) || continue
+    if has_array_index PANEL_SSH_ALIASES "$panel_index"; then
+      aggregate_ssh_stream_output "$panel_index"
+    else
+      for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+        [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+        [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
+        PANEL_OUTPUTS[$panel_index]="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+        limit_stream_output "$panel_index"
+        PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+        prepare_panel_output "$panel_index"
+        break
+      done
+    fi
+    render_dashboard
+  done
+}
+
 run_panel_commands() {
   local index alias target job panel_index status_file
   local completed total now
@@ -1524,6 +1690,10 @@ run_panel_commands() {
     PANEL_COMMAND_ERROR_FILES=()
     PANEL_COMMAND_EXIT_STATUSES=()
     PANEL_COMMAND_CONTROL_PATHS=()
+    PANEL_COMMAND_STREAMS=()
+    PANEL_COMMAND_FIFO_FILES=()
+    PANEL_COMMAND_LAST_OUTPUTS=()
+    PANEL_COMMAND_LAST_STATUSES=()
     PANEL_COMMAND_COUNTS=()
     PANEL_COMMAND_COMPLETED_COUNTS=()
     PANEL_COMMAND_ACTIVE=()
@@ -1558,14 +1728,16 @@ run_panel_commands() {
       for alias in ${PANEL_SSH_ALIASES[$index]}; do
         resolve_ssh_target "$alias"
         target="$FUNCTION_RESULT"
-        start_panel_command_job "$index" "$alias" "$target"
+        start_panel_command_job "$index" "$alias" "$target" || return 1
         PANEL_COMMAND_COUNTS[$index]=$((PANEL_COMMAND_COUNTS[index] + 1))
       done
     else
-      start_panel_command_job "$index" "" ""
+      start_panel_command_job "$index" "" "" || return 1
       PANEL_COMMAND_COUNTS[$index]=1
     fi
   done
+
+  refresh_stream_panels
 
   # Poll portable completion markers instead of wait -n, which is unavailable
   # in the Bash version shipped with older macOS releases. One invocation is a
@@ -1590,6 +1762,8 @@ run_panel_commands() {
       render_dashboard
     fi
   done
+
+  refresh_stream_panels
 }
 
 cleanup_panel_result_files() {
@@ -1597,11 +1771,15 @@ cleanup_panel_result_files() {
 
   for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    file="${PANEL_COMMAND_OUTPUT_FILES[$job]:-}"
+    if [[ -n "$file" ]]; then
+      rm -f "$file" "$file.tmp"
+    fi
     for file in \
-      "${PANEL_COMMAND_OUTPUT_FILES[$job]:-}" \
       "${PANEL_COMMAND_STATUS_FILES[$job]:-}" \
       "${PANEL_COMMAND_INPUT_FILES[$job]:-}" \
-      "${PANEL_COMMAND_ERROR_FILES[$job]:-}"; do
+      "${PANEL_COMMAND_ERROR_FILES[$job]:-}" \
+      "${PANEL_COMMAND_FIFO_FILES[$job]:-}"; do
       [[ -n "$file" ]] && rm -f "$file"
     done
   done
@@ -1630,7 +1808,20 @@ start_panel_command_job() {
   local status_file="$PANEL_COMMAND_TEMP_DIR/status.$job"
   local input_file="$PANEL_COMMAND_TEMP_DIR/input.$job"
   local error_file="$PANEL_COMMAND_TEMP_DIR/error.$job"
+  local fifo_file="$PANEL_COMMAND_TEMP_DIR/fifo.$job"
   local control_path=""
+  local stream_mode="${PANEL_STREAM[$panel_index]:-0}"
+  local stream_capacity=""
+
+  if [[ "$stream_mode" == "1" ]]; then
+    get_stream_capacity "$panel_index"
+    stream_capacity="$FUNCTION_RESULT"
+    if ! mkfifo "$fifo_file"; then
+      error "unable to create stream FIFO for panel $panel_index"
+      return 1
+    fi
+    : >"$output_file"
+  fi
 
   PANEL_COMMAND_JOB_COUNT=$((PANEL_COMMAND_JOB_COUNT + 1))
   PANEL_COMMAND_PANEL_INDEXES[$job]="$panel_index"
@@ -1640,8 +1831,16 @@ start_panel_command_job() {
   PANEL_COMMAND_STATUS_FILES[$job]="$status_file"
   PANEL_COMMAND_ERROR_FILES[$job]="$error_file"
   PANEL_COMMAND_CONTROL_PATHS[$job]=""
+  PANEL_COMMAND_STREAMS[$job]="$stream_mode"
+  PANEL_COMMAND_FIFO_FILES[$job]=""
+  PANEL_COMMAND_LAST_OUTPUTS[$job]=""
+  PANEL_COMMAND_LAST_STATUSES[$job]=""
   : >"$status_file"
   : >"$error_file"
+
+  if [[ "$stream_mode" == "1" ]]; then
+    PANEL_COMMAND_FIFO_FILES[$job]="$fifo_file"
+  fi
 
   if [[ -n "$alias" ]]; then
     get_ssh_control_path "$target"
@@ -1652,8 +1851,16 @@ start_panel_command_job() {
   fi
 
   (
-    local child_pid="" exit_status
-    trap 'if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; exit 143' TERM INT
+    local child_pid="" collector_pid="" exit_status output_target
+    trap 'if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; fi; if [[ -n "$collector_pid" ]] && kill -0 "$collector_pid" 2>/dev/null; then kill "$collector_pid" 2>/dev/null || true; fi; wait "$child_pid" 2>/dev/null || true; wait "$collector_pid" 2>/dev/null || true; exit 143' TERM INT
+
+    output_target="$output_file"
+    if [[ "$stream_mode" == "1" ]]; then
+      stream_collect "$fifo_file" "$output_file" "$stream_capacity" &
+      collector_pid=$!
+      output_target="$fifo_file"
+    fi
+
     if [[ -n "$alias" ]]; then
       ssh -T \
         -o BatchMode=yes \
@@ -1662,13 +1869,16 @@ start_panel_command_job() {
         -o ControlMaster=auto \
         -o ControlPersist=yes \
         -o ControlPath="$control_path" \
-        "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file" &
+        "$target" bash -s <"$input_file" >"$output_target" 2>"$error_file" &
     else
-      bash -c "${PANEL_COMMANDS[$panel_index]}" >"$output_file" 2>"$error_file" &
+      bash -c "${PANEL_COMMANDS[$panel_index]}" >"$output_target" 2>"$error_file" &
     fi
     child_pid=$!
     wait "$child_pid"
     exit_status=$?
+    if [[ "$stream_mode" == "1" ]]; then
+      wait "$collector_pid" 2>/dev/null || true
+    fi
     trap - TERM INT
     printf '%s\n' "$exit_status" >"$status_file"
   ) &
@@ -1689,7 +1899,19 @@ finalize_panel_command_output() {
     output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
     if [[ "$exit_status" -eq 0 ]]; then
       PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      if [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]]; then
+        limit_stream_output "$panel_index"
+        PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+      fi
       prepare_panel_output "$panel_index"
+    elif [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 && -s "$output_file" ]]; then
+      # Keep the final stream window visible while marking the panel failed.
+      PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      limit_stream_output "$panel_index"
+      PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+      prepare_panel_output "$panel_index"
+      PANEL_RENDER_MODES[$panel_index]="failed"
+      PANEL_STATUSES[$panel_index]="FAILED"
     else
       PANEL_OUTPUTS[$panel_index]="Command failed"
       PANEL_RENDER_MODES[$panel_index]="failed"
@@ -1750,6 +1972,10 @@ aggregate_ssh_panel_output() {
   done
 
   PANEL_OUTPUTS[$panel_index]="${aggregate%$'\n'}"
+  if [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 ]]; then
+    limit_stream_output "$panel_index"
+    PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+  fi
   PANEL_SSH_FAILURE_ROWS[$panel_index]="${failure_rows% }"
   prepare_panel_output "$panel_index"
   if (( failed == 1 )) && [[ "${PANEL_RENDER_MODES[$panel_index]}" == "raw" ]]; then
@@ -2115,7 +2341,19 @@ process_terminal_resize() {
   if (( DASHBOARD_PAUSED == 1 )); then
     DASHBOARD_PAUSED=0
   fi
+
+  # Resize changes the visible stream window. Trim the already aggregated
+  # output immediately so a smaller panel continues to show its newest lines.
+  local panel_index
+  for panel_index in "${PANEL_ORDER[@]}"; do
+    [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-0}" -eq 1 ]] || continue
+    [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 ]] || continue
+    limit_stream_output "$panel_index"
+    PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+  done
+
   FORCE_FULL_REDRAW=1
+  render_dashboard
   return 0
 }
 

@@ -35,7 +35,7 @@ Run the V3 UX example:
 ./bin/lhc example/v3-ux.conf
 ```
 
-Run the V5.1 percentage-layout example:
+Run the V5.2 percentage-layout example:
 
 ```bash
 ./bin/lhc example/v5-percentage.conf
@@ -54,9 +54,9 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.1 multi-server SSH execution, partial refresh, fixed-width tables, multi-row
-transpose layout, automatic sizing, and percentage-based responsive panel
-geometry are implemented.
+V5.2 multi-server SSH execution, partial refresh, continuous raw stream panels,
+fixed-width tables, multi-row transpose layout, automatic sizing, and
+percentage-based responsive panel geometry are implemented.
 
 The dashboard remains compatible with V1 raw-output configs. It accepts a Bash
 source config file, validates panel layout and optional table rules, runs local
@@ -93,4 +93,10 @@ Run the V4 regression test without real SSH servers:
 
 ```bash
 ./tests/test_v4_ssh.sh
+```
+
+Run the V5 raw-stream regression test without real SSH servers:
+
+```bash
+bash tests/test_v5_stream.sh
 ```
