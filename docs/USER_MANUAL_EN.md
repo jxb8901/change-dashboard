@@ -126,7 +126,7 @@ Rules:
 - LHC inserts a fixed one-character gap between columns. Configured widths plus gaps must fit `PANEL_WIDTHS[i] - 2`.
 - Numbers are right-aligned; headers and text are left-aligned. A number may have an optional minus sign, integer digits, and fractional digits, such as `-2`, `0`, or `12.50`.
 
-If `PANEL_WARN_RULES` or `PANEL_ERROR_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
+If `PANEL_WARN_RULES`, `PANEL_ERROR_RULES`, or `PANEL_INFO_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
 
 ### 4.5 Transpose layout
 
@@ -150,14 +150,15 @@ Both local and SSH transpose panels may contain zero or more data rows. For the 
 
 ### 4.6 Warning and error rules
 
-Rule tokens use `source-field:condition` and are separated by whitespace. Rules reference the actual names in `PANEL_TABLE_COLUMNS[i]` in both `table` and `transpose` layouts; `field name` and `field value` are display concepts, not rule names. `field:~keyword` matches a field containing the keyword; `field:!~keyword` matches a field not containing it:
+Rule tokens use `source-field:condition` and are separated by whitespace. Rules reference the actual names in `PANEL_TABLE_COLUMNS[i]` in both `table` and `transpose` layouts; `field name` and `field value` are display concepts, not rule names. `field:~keyword` matches a field containing the keyword; `field:!~keyword` matches a field not containing it. `PANEL_INFO_RULES` uses the same syntax and displays matched cells or raw keywords in green:
 
 ```bash
 PANEL_WARN_RULES[0]="DEPTH:>20 LATENCY:>=200 STATUS:!=OK"
 PANEL_ERROR_RULES[0]="DEPTH:>50 STATUS:==DOWN"
+PANEL_INFO_RULES[0]="STATUS:==READY"
 ```
 
-Supported operators are `>`, `>=`, `<`, `<=`, `==`, `!=`, `~`, and `!~`.
+Supported operators are `>`, `>=`, `<`, `<=`, `==`, `!=`, `~`, and `!~`. Severity precedence is `ERROR > WARN > INFO > OK`.
 
 - `>`, `>=`, `<`, and `<=` match only when both the cell value and threshold are numeric.
 - `==` and `!=` compare two numeric values numerically; other values are compared as strings.

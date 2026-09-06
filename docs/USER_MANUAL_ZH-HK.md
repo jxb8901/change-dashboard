@@ -124,7 +124,7 @@ PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 - 表格欄位之間固定有一個字元間距。指定寬度的總和加間距不能超過面板內寬，即 `PANEL_WIDTHS[i] - 2`。
 - 數字靠右，文字及標題靠左。數字格式是可選負號、整數或小數，例如 `-2`、`0`、`12.50`。
 
-Raw panel 若設定 `PANEL_WARN_RULES` 或 `PANEL_ERROR_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
+Raw panel 若設定 `PANEL_WARN_RULES`、`PANEL_ERROR_RULES` 或 `PANEL_INFO_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
 
 ### 4.5 Transpose layout
 
@@ -148,14 +148,15 @@ PANEL_ERROR_RULES[2]="STATE:==DEGRADED"
 
 ### 4.6 Warning / error 規則
 
-規則 token 格式是 `來源字段:條件`，同一設定以空白分隔。`field:~keyword` 匹配包含 keyword 的字段；`field:!~keyword` 匹配不包含 keyword 的字段。`table` 及 `transpose` 都必須引用 `PANEL_TABLE_COLUMNS[i]` 中的實際字段名稱；`字段名稱` 和 `字段值` 只是顯示概念，不是 rules 名稱：
+規則 token 格式是 `來源字段:條件`，同一設定以空白分隔。`field:~keyword` 匹配包含 keyword 的字段；`field:!~keyword` 匹配不包含 keyword 的字段。`PANEL_INFO_RULES` 使用相同語法，命中的 cell 或 raw keyword 會以綠色顯示。`table` 及 `transpose` 都必須引用 `PANEL_TABLE_COLUMNS[i]` 中的實際字段名稱；`字段名稱` 和 `字段值` 只是顯示概念，不是 rules 名稱：
 
 ```bash
 PANEL_WARN_RULES[0]="DEPTH:>20 LATENCY:>=200 STATUS:!=OK"
 PANEL_ERROR_RULES[0]="DEPTH:>50 STATUS:==DOWN"
+PANEL_INFO_RULES[0]="STATUS:==READY"
 ```
 
-支援運算子：`>`、`>=`、`<`、`<=`、`==`、`!=`、`~`、`!~`。
+支援運算子：`>`、`>=`、`<`、`<=`、`==`、`!=`、`~`、`!~`。優先順序是 `ERROR > WARN > INFO > OK`。
 
 - `>`、`>=`、`<`、`<=` 只有在值及門檻都是數字時才會匹配。
 - `==` / `!=` 對兩個數字作數值比較；其他值作字串比較。

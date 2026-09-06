@@ -4,6 +4,8 @@
   process while commands retain independent sessions/channels.
 - `field:~keyword` and `field:!~keyword` warning/error rules use actual
   `PANEL_TABLE_COLUMNS` field names.
+- `PANEL_INFO_RULES` uses the same rule syntax and displays matching cells or
+  raw keywords in green. Severity precedence is `ERROR > WARN > INFO > OK`.
 - Raw panels use the reserved `MESSAGE` field with `MESSAGE:~keyword` or
   `MESSAGE:!~keyword`; all matching `~` keyword occurrences are highlighted
   while the rest of the line remains unstyled.

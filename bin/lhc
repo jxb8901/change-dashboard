@@ -4,7 +4,7 @@
 # - 2026-09-06 V5: Refresh panels independently, reuse SSH connections with
 #   OpenSSH multiplexing, support contains/not-contains rules, and calculate
 #   automatic dimensions for the final panel and rightmost table field;
-#   highlight matching raw MESSAGE keywords.
+#   highlight matching raw MESSAGE keywords and support green INFO rules.
 # - 2026-08-13 V4.7: Allow local and SSH transpose panels to render multiple
 #   source rows through the same key/value block renderer.
 # - 2026-08-01 V4.6: Add per-panel multi-server SSH execution, deterministic
@@ -65,6 +65,7 @@ declare -a PANEL_OUTPUTS=()
 declare -a PANEL_TABLE_COLUMNS=()
 declare -a PANEL_WARN_RULES=()
 declare -a PANEL_ERROR_RULES=()
+declare -a PANEL_INFO_RULES=()
 declare -a PANEL_TABLE_LAYOUT=()
 declare -a PANEL_TABLE_WIDTHS=()
 declare -a PANEL_RENDER_MODES=()
@@ -247,6 +248,7 @@ load_config() {
   PANEL_TABLE_COLUMNS=()
   PANEL_WARN_RULES=()
   PANEL_ERROR_RULES=()
+  PANEL_INFO_RULES=()
   PANEL_TABLE_LAYOUT=()
   PANEL_TABLE_WIDTHS=()
   PANEL_RENDER_MODES=()
@@ -298,6 +300,7 @@ validate_config() {
   validate_optional_panel_indexes PANEL_TABLE_COLUMNS || return 1
   validate_optional_panel_indexes PANEL_WARN_RULES || return 1
   validate_optional_panel_indexes PANEL_ERROR_RULES || return 1
+  validate_optional_panel_indexes PANEL_INFO_RULES || return 1
   validate_optional_panel_indexes PANEL_TABLE_LAYOUT || return 1
   validate_optional_panel_indexes PANEL_TABLE_WIDTHS || return 1
   validate_optional_panel_indexes PANEL_SSH_ALIASES || return 1
@@ -396,6 +399,7 @@ validate_table_configs() {
     validate_table_columns "$index" || return 1
     validate_rule_list "$index" "WARN" "${PANEL_WARN_RULES[$index]:-}" || return 1
     validate_rule_list "$index" "ERROR" "${PANEL_ERROR_RULES[$index]:-}" || return 1
+    validate_rule_list "$index" "INFO" "${PANEL_INFO_RULES[$index]:-}" || return 1
     validate_table_layout "$index" || return 1
   done
 
@@ -408,6 +412,12 @@ validate_table_configs() {
   for index in "${!PANEL_ERROR_RULES[@]}"; do
     if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
       validate_raw_rule_list "$index" "ERROR" "${PANEL_ERROR_RULES[$index]:-}" || return 1
+    fi
+  done
+
+  for index in "${!PANEL_INFO_RULES[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      validate_raw_rule_list "$index" "INFO" "${PANEL_INFO_RULES[$index]:-}" || return 1
     fi
   done
 
@@ -866,7 +876,7 @@ draw_panel_border() {
   printf '+%s+' "$FUNCTION_RESULT"
 }
 
-status_sequence() {
+  status_sequence() {
   FUNCTION_RESULT=""
   [[ -n "${NO_COLOR:-}" ]] && return 0
   case "$1" in
@@ -874,6 +884,8 @@ status_sequence() {
     ERROR|FAILED) FUNCTION_RESULT=$'\033[37;41m' ;;
     # Set black foreground text on a yellow background for warnings.
     WARN) FUNCTION_RESULT=$'\033[30;43m' ;;
+    # Set black foreground text on a green background for informational values.
+    INFO) FUNCTION_RESULT=$'\033[30;42m' ;;
   esac
 }
 
@@ -1113,6 +1125,12 @@ get_raw_line_rules() {
   rules="${PANEL_WARN_RULES[$index]:-}"
   if raw_rule_list_matches "$line" "$rules"; then
     RAW_LINE_STYLE="WARN"
+    get_raw_matching_keywords "$line" "$rules"
+    return
+  fi
+  rules="${PANEL_INFO_RULES[$index]:-}"
+  if raw_rule_list_matches "$line" "$rules"; then
+    RAW_LINE_STYLE="INFO"
     get_raw_matching_keywords "$line" "$rules"
   fi
 }
@@ -1743,6 +1761,11 @@ evaluate_cell() {
     return 0
   fi
 
+  if rule_list_matches "$value" "$column" "${PANEL_INFO_RULES[$index]:-}"; then
+    FUNCTION_RESULT="INFO"
+    return 0
+  fi
+
   FUNCTION_RESULT="OK"
 }
 
@@ -1872,6 +1895,8 @@ worst_status() {
     FUNCTION_RESULT="ERROR"
   elif [[ "$current" == "WARN" || "$candidate" == "WARN" ]]; then
     FUNCTION_RESULT="WARN"
+  elif [[ "$current" == "INFO" || "$candidate" == "INFO" ]]; then
+    FUNCTION_RESULT="INFO"
   else
     FUNCTION_RESULT="OK"
   fi
@@ -1932,7 +1957,7 @@ run_dashboard_loop() {
 
     run_panel_commands
 
-    if wait_for_quit_or_timeout 0.05; then
+    if wait_for_quit_or_timeout 1; then
       return 0
     fi
   done

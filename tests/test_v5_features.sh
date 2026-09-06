@@ -27,6 +27,7 @@ PANEL_TABLE_LAYOUT[0]="table"
 PANEL_TABLE_WIDTHS[0]="8"
 PANEL_WARN_RULES[0]="STATE:~READY"
 PANEL_ERROR_RULES[0]="STATE:!~READY"
+PANEL_INFO_RULES[0]="COUNT:==1"
 
 validate_config || fail_test "v5 configuration should be valid"
 assert_equal "1" "$AUTO_PANEL_HEIGHT_INDEX" "only final panel may omit height"
@@ -40,12 +41,18 @@ assert_equal "8 19" "$RESOLVED_WIDTHS" "omitted final table width fills remainin
 condition_matches "READY" "~REA" || fail_test "contains rule should match"
 condition_matches "READY" "!~FAIL" || fail_test "not-contains rule should match"
 condition_matches "READY" "!~REA" && fail_test "not-contains rule should reject matching text"
+evaluate_cell 0 "COUNT" "1"
+assert_equal "INFO" "$FUNCTION_RESULT" "info rule should match table fields"
+NO_COLOR=""
+status_sequence INFO
+assert_equal $'\033[30;42m' "$FUNCTION_RESULT" "info status should use green"
 
 PANEL_TITLES[2]="Raw messages"
 PANEL_COMMANDS[2]="printf 'ok WARN WARN\nhealthy\n'"
 PANEL_X[2]=1; PANEL_Y[2]=15; PANEL_WIDTHS[2]=30; PANEL_HEIGHTS[2]=6
 PANEL_WARN_RULES[2]="MESSAGE:~WARN"
 PANEL_ERROR_RULES[2]="MESSAGE:~failed"
+PANEL_INFO_RULES[2]="MESSAGE:~healthy"
 validate_config || fail_test "raw MESSAGE rules should be valid"
 PANEL_OUTPUTS[2]=$'ok WARN WARN\nhealthy'
 prepare_panel_output 2
@@ -58,6 +65,9 @@ assert_equal "ok :OK|WARN:WARN| :OK|WARN:WARN|:OK|" "$RAW_CAPTURE" "raw warning 
 get_raw_line_rules 2 "service failed"
 assert_equal "ERROR" "$RAW_LINE_STYLE" "raw error severity wins"
 assert_equal "failed" "$RAW_LINE_KEYWORDS" "raw error keyword is selected"
+get_raw_line_rules 2 "service healthy"
+assert_equal "INFO" "$RAW_LINE_STYLE" "raw info severity should match"
+assert_equal "healthy" "$RAW_LINE_KEYWORDS" "raw info keyword is selected"
 
 unset 'PANEL_HEIGHTS[0]'
 PANEL_HEIGHTS[1]=5
