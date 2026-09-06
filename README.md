@@ -35,6 +35,12 @@ Run the V3 UX example:
 ./bin/lhc example/v3-ux.conf
 ```
 
+Run the V5.1 percentage-layout example:
+
+```bash
+./bin/lhc example/v5-percentage.conf
+```
+
 User manuals:
 
 - [繁體中文使用手冊](docs/USER_MANUAL_ZH-HK.md)
@@ -48,8 +54,9 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V4.6 multi-server SSH execution is implemented alongside partial refresh,
-fixed-width tables, and multi-row transpose layout.
+V5.1 multi-server SSH execution, partial refresh, fixed-width tables, multi-row
+transpose layout, automatic sizing, and percentage-based responsive panel
+geometry are implemented.
 
 The dashboard remains compatible with V1 raw-output configs. It accepts a Bash
 source config file, validates panel layout and optional table rules, runs local

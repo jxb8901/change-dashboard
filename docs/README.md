@@ -31,5 +31,6 @@ transpose behavior.
 
 ## V5
 
-The `v5/` directory defines SSH multiplexing, contains/not-contains rules, and
-automatic sizing for the final panel and rightmost table field.
+The `v5/` directory defines SSH multiplexing, contains/not-contains rules,
+automatic sizing for the final panel and rightmost table field, and responsive
+percentage-based panel geometry.

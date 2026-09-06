@@ -59,6 +59,8 @@ PANEL_HEIGHTS[0]=8
 
 最後一個 panel 可以省略 `PANEL_HEIGHTS[i]`；LHC 會由 `PANEL_Y[i]` 計算至 footer 上一列的最大可用高度。其他 panel 必須定義 height；終端機 resize 時會重新計算自動高度。
 
+`PANEL_X`、`PANEL_Y`、`PANEL_WIDTHS` 及 `PANEL_HEIGHTS` 亦接受例如 `50%` 的百分比。X 及 width 百分比按終端機欄數計算；Y 及 height 百分比按扣除 footer 的可用行數計算。位置使用 `0%` 代表最左或最上邊界。百分比會向下取整，並在每次 resize 後根據原始配置重新計算。單一 panel 內可以混用整數及百分比；換算後仍須符合原有最小尺寸及邊界檢查。
+
 ## 4. 配置參考
 
 ### 4.1 全域設定
@@ -72,18 +74,34 @@ PANEL_HEIGHTS[0]=8
 
 ### 4.2 每個面板的必需欄位
 
-同一 index 必須同時設定以下六個欄位；缺少欄位、空標題/命令或非正整數會令啟動驗證失敗。
+同一 index 必須同時設定以下六個欄位；缺少欄位、空標題/命令或無效的整數/百分比幾何值會令啟動驗證失敗。
 
 | 變數 | 例子 | 說明 |
 | --- | --- | --- |
 | `PANEL_TITLES[i]` | `"Queue"` | 面板標題，不能為空。 |
 | `PANEL_COMMANDS[i]` | `"check_queue.sh"` | 要執行的 Bash 命令，不能為空。 |
-| `PANEL_X[i]` | `1` | 左邊界，一-based 欄位。 |
-| `PANEL_Y[i]` | `1` | 上邊界，一-based 行數。 |
-| `PANEL_WIDTHS[i]` | `40` | 面板總寬，包括左右邊框；最小 `4`。 |
-| `PANEL_HEIGHTS[i]` | `8` | 面板總高，包括上下邊框；最小 `3`。 |
+| `PANEL_X[i]` | `1` 或 `"0%"` | 左邊界；整數是一-based 欄位，百分比按終端機寬度計算。 |
+| `PANEL_Y[i]` | `1` 或 `"0%"` | 上邊界；整數是一-based 行數，百分比按可用終端機高度計算。 |
+| `PANEL_WIDTHS[i]` | `40` 或 `"50%"` | 面板總寬，包括左右邊框；換算後最小 `4`。 |
+| `PANEL_HEIGHTS[i]` | `8` 或 `"50%"` | 面板總高，包括上下邊框；換算後最小 `3`。 |
 
 面板 index 必須是非負整數。額外設定的 index（例如有 `PANEL_COMMANDS[4]` 卻沒有 `PANEL_TITLES[4]`）會被拒絕。
+
+例如以下配置會把終端機左右分成兩個 panel，並在 resize 後自動適應：
+
+```bash
+PANEL_X[0]="0%"
+PANEL_Y[0]="0%"
+PANEL_WIDTHS[0]="50%"
+PANEL_HEIGHTS[0]="100%"
+
+PANEL_X[1]="50%"
+PANEL_Y[1]="0%"
+PANEL_WIDTHS[1]="50%"
+PANEL_HEIGHTS[1]="100%"
+```
+
+footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機時，啟動驗證會失敗；運行中 resize 至不合適大小時，dashboard 會暫停，直至終端機足夠大。
 
 ### 4.3 Raw 面板
 

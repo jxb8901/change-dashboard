@@ -14,3 +14,9 @@
 - Omitting only the final `PANEL_TABLE_WIDTHS[index]` value makes the rightmost
   field fill the remaining content width. An entirely omitted width list keeps
   equal-width behavior.
+- `PANEL_X`, `PANEL_Y`, `PANEL_WIDTHS`, and `PANEL_HEIGHTS` accept either the
+  existing character value or a percentage value such as `50%`; percentage
+  positions and sizes are recalculated after terminal resize.
+- Percentage X/width values use terminal columns. Percentage Y/height values
+  use terminal rows excluding the footer. Values are rounded down; the normal
+  minimum-size and bounds checks still apply.

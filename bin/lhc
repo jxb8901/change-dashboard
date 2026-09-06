@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-06 V5.1: Accept integer or percentage panel geometry, resolve
+#   responsive dimensions after terminal resize, and preserve source values.
 # - 2026-09-06 V5: Refresh panels independently, reuse SSH connections with
 #   OpenSSH multiplexing, support contains/not-contains rules, and calculate
 #   automatic dimensions for the final panel and rightmost table field;
@@ -37,6 +39,7 @@ TERMINAL_COLS=0
 REQUIRED_ROWS=0
 REQUIRED_COLS=0
 REQUIRED_TERMINAL_ROWS=0
+LAYOUT_ERROR=""
 CONDITION_OPERATOR=""
 CONDITION_VALUE=""
 RAW_LINE_STYLE="OK"
@@ -60,6 +63,10 @@ declare -a PANEL_X=()
 declare -a PANEL_Y=()
 declare -a PANEL_WIDTHS=()
 declare -a PANEL_HEIGHTS=()
+declare -a PANEL_EFFECTIVE_X=()
+declare -a PANEL_EFFECTIVE_Y=()
+declare -a PANEL_EFFECTIVE_WIDTHS=()
+declare -a PANEL_EFFECTIVE_HEIGHTS=()
 declare -a PANEL_ORDER=()
 declare -a PANEL_OUTPUTS=()
 declare -a PANEL_TABLE_COLUMNS=()
@@ -233,6 +240,7 @@ load_config() {
   fi
 
   REFRESH_INTERVAL=2
+  LAYOUT_ERROR=""
   PANEL_COUNT=0
   SSH_SERVERS=()
   PANEL_TITLES=()
@@ -242,6 +250,10 @@ load_config() {
   PANEL_Y=()
   PANEL_WIDTHS=()
   PANEL_HEIGHTS=()
+  PANEL_EFFECTIVE_X=()
+  PANEL_EFFECTIVE_Y=()
+  PANEL_EFFECTIVE_WIDTHS=()
+  PANEL_EFFECTIVE_HEIGHTS=()
   AUTO_PANEL_HEIGHT_INDEX=""
   PANEL_ORDER=()
   PANEL_OUTPUTS=()
@@ -308,6 +320,7 @@ validate_config() {
   validate_table_configs || return 1
   validate_ssh_configs || return 1
 
+  initialize_effective_panel_dimensions
 }
 
 validate_no_extra_panel_indexes() {
@@ -361,33 +374,45 @@ validate_panel() {
     return 1
   fi
 
-  if ! is_positive_integer "${PANEL_X[$index]}"; then
-    error "PANEL_X[$index] must be a positive integer"
-    return 1
+  validate_panel_geometry_value "$index" "PANEL_X" "${PANEL_X[$index]}" 0 1 || return 1
+  validate_panel_geometry_value "$index" "PANEL_Y" "${PANEL_Y[$index]}" 0 1 || return 1
+  validate_panel_geometry_value "$index" "PANEL_WIDTHS" "${PANEL_WIDTHS[$index]}" 1 4 || return 1
+
+  if has_array_index PANEL_HEIGHTS "$index"; then
+    validate_panel_geometry_value "$index" "PANEL_HEIGHTS" "${PANEL_HEIGHTS[$index]}" 1 3 || return 1
+  fi
+}
+
+validate_panel_geometry_value() {
+  local index="$1"
+  local field="$2"
+  local value="$3"
+  local percentage_min="$4"
+  local integer_min="$5"
+  local percentage
+  local integer_value
+
+  if [[ "$value" =~ ^[0-9]+%$ ]]; then
+    percentage="${value%%%}"
+    percentage=$((10#$percentage))
+    if (( percentage < percentage_min || percentage > 100 )); then
+      error "$field[$index] percentage must be between ${percentage_min}% and 100%"
+      return 1
+    fi
+    return 0
   fi
 
-  if ! is_positive_integer "${PANEL_Y[$index]}"; then
-    error "PANEL_Y[$index] must be a positive integer"
-    return 1
+  if is_positive_integer "$value"; then
+    integer_value=$((10#$value))
+    (( integer_value >= integer_min )) && return 0
   fi
 
-  if ! is_positive_integer "${PANEL_WIDTHS[$index]}"; then
-    error "PANEL_WIDTHS[$index] must be a positive integer"
-    return 1
-  fi
-
-  if (( PANEL_WIDTHS[index] < 4 )); then
-    error "PANEL_WIDTHS[$index] must be at least 4"
-    return 1
-  fi
-
-  if [[ -n "${PANEL_HEIGHTS[$index]:-}" ]] && ! is_positive_integer "${PANEL_HEIGHTS[$index]}"; then
-    error "PANEL_HEIGHTS[$index] must be a positive integer"
-    return 1
-  fi
-
-  if [[ -n "${PANEL_HEIGHTS[$index]:-}" ]] && (( PANEL_HEIGHTS[index] < 3 )); then
-    error "PANEL_HEIGHTS[$index] must be at least 3"
+  if ! is_positive_integer "$value" || (( integer_value < integer_min )); then
+    if [[ "$integer_min" -eq 1 ]]; then
+      error "$field[$index] must be a positive integer or a percentage between ${percentage_min}% and 100%"
+    else
+      error "$field[$index] must be at least $integer_min or a percentage between ${percentage_min}% and 100%"
+    fi
     return 1
   fi
 }
@@ -564,17 +589,49 @@ validate_table_layout() {
   local widths="${PANEL_TABLE_WIDTHS[$index]:-}"
   local expected=0
   local count=0
-  local total=0
   local width
   local column
-  local content_width=$((PANEL_WIDTHS[index] - 2))
-  local gap_total=0
-  local required_width=0
 
   if [[ "$layout" != "table" && "$layout" != "transpose" ]]; then
     error "PANEL_TABLE_LAYOUT[$index] must be table or transpose"
     return 1
   fi
+
+  if [[ "$layout" == "transpose" ]]; then
+    expected=2
+  else
+    for column in ${PANEL_TABLE_COLUMNS[$index]}; do
+      expected=$((expected + 1))
+    done
+  fi
+  [[ -z "$widths" ]] && return 0
+
+  for width in $widths; do
+    if ! is_positive_integer "$width"; then
+      error "PANEL_TABLE_WIDTHS[$index] values must be positive integers"
+      return 1
+    fi
+    count=$((count + 1))
+  done
+
+  if (( count != expected && count != expected - 1 )); then
+    error "PANEL_TABLE_WIDTHS[$index] requires $expected widths, or omits only the final width, for $layout layout"
+    return 1
+  fi
+}
+
+validate_resolved_table_layout() {
+  local index="$1"
+  local layout="${PANEL_TABLE_LAYOUT[$index]:-table}"
+  local widths="${PANEL_TABLE_WIDTHS[$index]:-}"
+  local expected=0
+  local count=0
+  local total=0
+  local width
+  local column
+  local content_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
+  local gap_total=0
+  local required_width=0
 
   if [[ "$layout" == "transpose" ]]; then
     expected=2
@@ -594,18 +651,9 @@ validate_table_layout() {
   fi
 
   for width in $widths; do
-    if ! is_positive_integer "$width"; then
-      error "PANEL_TABLE_WIDTHS[$index] values must be positive integers"
-      return 1
-    fi
     count=$((count + 1))
     total=$((total + width))
   done
-
-  if (( count != expected && count != expected - 1 )); then
-    error "PANEL_TABLE_WIDTHS[$index] requires $expected widths, or omits only the final width, for $layout layout"
-    return 1
-  fi
 
   if (( count == expected - 1 )); then
     required_width=$((total + gap_total + 1))
@@ -754,6 +802,40 @@ build_panel_model() {
   PANEL_COUNT="${#PANEL_ORDER[@]}"
 }
 
+initialize_effective_panel_dimensions() {
+  local index
+
+  PANEL_EFFECTIVE_X=()
+  PANEL_EFFECTIVE_Y=()
+  PANEL_EFFECTIVE_WIDTHS=()
+  PANEL_EFFECTIVE_HEIGHTS=()
+  for index in "${PANEL_ORDER[@]}"; do
+    PANEL_EFFECTIVE_X[$index]="${PANEL_X[$index]}"
+    PANEL_EFFECTIVE_Y[$index]="${PANEL_Y[$index]}"
+    PANEL_EFFECTIVE_WIDTHS[$index]="${PANEL_WIDTHS[$index]}"
+    if has_array_index PANEL_HEIGHTS "$index"; then
+      PANEL_EFFECTIVE_HEIGHTS[$index]="${PANEL_HEIGHTS[$index]}"
+    fi
+  done
+}
+
+ensure_effective_panel_dimensions() {
+  local index="$1"
+
+  if ! has_array_index PANEL_EFFECTIVE_X "$index"; then
+    PANEL_EFFECTIVE_X[$index]="${PANEL_X[$index]:-0}"
+  fi
+  if ! has_array_index PANEL_EFFECTIVE_Y "$index"; then
+    PANEL_EFFECTIVE_Y[$index]="${PANEL_Y[$index]:-0}"
+  fi
+  if ! has_array_index PANEL_EFFECTIVE_WIDTHS "$index"; then
+    PANEL_EFFECTIVE_WIDTHS[$index]="${PANEL_WIDTHS[$index]:-0}"
+  fi
+  if ! has_array_index PANEL_EFFECTIVE_HEIGHTS "$index" && has_array_index PANEL_HEIGHTS "$index"; then
+    PANEL_EFFECTIVE_HEIGHTS[$index]="${PANEL_HEIGHTS[$index]:-0}"
+  fi
+}
+
 calculate_required_terminal_size() {
   local index
   local panel_right
@@ -763,8 +845,8 @@ calculate_required_terminal_size() {
   REQUIRED_ROWS=0
 
   for index in "${PANEL_ORDER[@]}"; do
-    panel_right=$((PANEL_X[index] + PANEL_WIDTHS[index] - 1))
-    panel_bottom=$((PANEL_Y[index] + PANEL_HEIGHTS[index] - 1))
+    panel_right=$((PANEL_EFFECTIVE_X[index] + PANEL_EFFECTIVE_WIDTHS[index] - 1))
+    panel_bottom=$((PANEL_EFFECTIVE_Y[index] + PANEL_EFFECTIVE_HEIGHTS[index] - 1))
 
     if (( panel_right > REQUIRED_COLS )); then
       REQUIRED_COLS="$panel_right"
@@ -777,6 +859,85 @@ calculate_required_terminal_size() {
 
   # Reserve one row below the panels for the refresh and exit footer.
   REQUIRED_TERMINAL_ROWS=$((REQUIRED_ROWS + 1))
+}
+
+resolve_panel_value() {
+  local value="$1"
+  local axis_size="$2"
+  local position_offset="$3"
+  local percentage
+
+  if [[ "$value" == *% ]]; then
+    percentage="${value%%%}"
+    percentage=$((10#$percentage))
+    FUNCTION_RESULT=$(( (10#$percentage * axis_size) / 100 + position_offset ))
+  else
+    FUNCTION_RESULT=$((10#$value))
+  fi
+}
+
+resolve_panel_dimensions() {
+  local index usable_rows height
+
+  usable_rows=$((TERMINAL_ROWS - 1))
+  PANEL_EFFECTIVE_X=()
+  PANEL_EFFECTIVE_Y=()
+  PANEL_EFFECTIVE_WIDTHS=()
+  PANEL_EFFECTIVE_HEIGHTS=()
+
+  for index in "${PANEL_ORDER[@]}"; do
+    resolve_panel_value "${PANEL_X[$index]}" "$TERMINAL_COLS" 1
+    PANEL_EFFECTIVE_X[$index]="$FUNCTION_RESULT"
+
+    resolve_panel_value "${PANEL_Y[$index]}" "$usable_rows" 1
+    PANEL_EFFECTIVE_Y[$index]="$FUNCTION_RESULT"
+
+    resolve_panel_value "${PANEL_WIDTHS[$index]}" "$TERMINAL_COLS" 0
+    PANEL_EFFECTIVE_WIDTHS[$index]="$FUNCTION_RESULT"
+
+    if has_array_index PANEL_HEIGHTS "$index"; then
+      resolve_panel_value "${PANEL_HEIGHTS[$index]}" "$usable_rows" 0
+      PANEL_EFFECTIVE_HEIGHTS[$index]="$FUNCTION_RESULT"
+    else
+      height=$((usable_rows - PANEL_EFFECTIVE_Y[index] + 1))
+      (( height < 3 )) && height=3
+      PANEL_EFFECTIVE_HEIGHTS[$index]="$height"
+    fi
+  done
+}
+
+validate_effective_panel_layout() {
+  local index panel_right panel_bottom
+  local usable_rows=$((TERMINAL_ROWS - 1))
+
+  LAYOUT_ERROR=""
+  for index in "${PANEL_ORDER[@]}"; do
+    if (( PANEL_EFFECTIVE_WIDTHS[index] < 4 )); then
+      LAYOUT_ERROR="panel $index width resolves to ${PANEL_EFFECTIVE_WIDTHS[index]}, minimum is 4"
+      return 1
+    fi
+    if (( PANEL_EFFECTIVE_HEIGHTS[index] < 3 )); then
+      LAYOUT_ERROR="panel $index height resolves to ${PANEL_EFFECTIVE_HEIGHTS[index]}, minimum is 3"
+      return 1
+    fi
+
+    panel_right=$((PANEL_EFFECTIVE_X[index] + PANEL_EFFECTIVE_WIDTHS[index] - 1))
+    panel_bottom=$((PANEL_EFFECTIVE_Y[index] + PANEL_EFFECTIVE_HEIGHTS[index] - 1))
+    if (( PANEL_EFFECTIVE_X[index] < 1 || panel_right > TERMINAL_COLS )); then
+      LAYOUT_ERROR="panel $index is outside terminal width after resolving geometry"
+      return 1
+    fi
+    if (( PANEL_EFFECTIVE_Y[index] < 1 || panel_bottom > usable_rows )); then
+      LAYOUT_ERROR="panel $index is outside dashboard height after resolving geometry"
+      return 1
+    fi
+
+    if has_array_index PANEL_TABLE_COLUMNS "$index" &&
+       ! validate_resolved_table_layout "$index" >/dev/null 2>&1; then
+      LAYOUT_ERROR="panel $index has an invalid table layout for its resolved width"
+      return 1
+    fi
+  done
 }
 
 read_terminal_size() {
@@ -799,23 +960,22 @@ read_terminal_size() {
 
 validate_terminal_size() {
   read_terminal_size || return 1
-  resolve_auto_panel_dimensions
+  resolve_panel_dimensions
   calculate_required_terminal_size
 
   if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
     error "terminal too small: need ${REQUIRED_COLS}x${REQUIRED_TERMINAL_ROWS}, have ${TERMINAL_COLS}x${TERMINAL_ROWS}"
     return 1
   fi
+
+  if ! validate_effective_panel_layout; then
+    error "$LAYOUT_ERROR"
+    return 1
+  fi
 }
 
 resolve_auto_panel_dimensions() {
-  local index height
-
-  [[ -n "$AUTO_PANEL_HEIGHT_INDEX" ]] || return 0
-  index="$AUTO_PANEL_HEIGHT_INDEX"
-  height=$((TERMINAL_ROWS - PANEL_Y[index]))
-  (( height < 3 )) && height=3
-  PANEL_HEIGHTS[$index]="$height"
+  resolve_panel_dimensions
 }
 
 move_cursor() {
@@ -1013,7 +1173,8 @@ get_line_at_position() {
 
 resolve_table_widths() {
   local index="$1" layout="${PANEL_TABLE_LAYOUT[$1]:-table}"
-  local content_width=$((PANEL_WIDTHS[index] - 2))
+  ensure_effective_panel_dimensions "$index"
+  local content_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
   local count=0 specified_count=0 width column result="" available_width fixed_total=0
 
   if [[ -n "${PANEL_TABLE_WIDTHS[$index]:-}" ]]; then
@@ -1052,8 +1213,9 @@ resolve_table_widths() {
 
 build_raw_frame() {
   local index="$1" row=0 line
-  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
-  local width=$((PANEL_WIDTHS[index] - 2)) height=$((PANEL_HEIGHTS[index] - 2))
+  ensure_effective_panel_dimensions "$index"
+  local x=$((PANEL_EFFECTIVE_X[index] + 1)) y=$((PANEL_EFFECTIVE_Y[index] + 1))
+  local width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2)) height=$((PANEL_EFFECTIVE_HEIGHTS[index] - 2))
   local content="${PANEL_OUTPUTS[$index]:-No data}"
 
   while (( row < height )); do
@@ -1164,9 +1326,10 @@ get_raw_matching_keywords() {
 
 build_table_frame() {
   local index="$1" row=0 col width offset cell line status_line status alignment column_count=0
-  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
-  local content_width=$((PANEL_WIDTHS[index] - 2))
-  local content_height=$((PANEL_HEIGHTS[index] - 2))
+  ensure_effective_panel_dimensions "$index"
+  local x=$((PANEL_EFFECTIVE_X[index] + 1)) y=$((PANEL_EFFECTIVE_Y[index] + 1))
+  local content_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
+  local content_height=$((PANEL_EFFECTIVE_HEIGHTS[index] - 2))
 
   resolve_table_widths "$index"
   for width in $RESOLVED_WIDTHS; do column_count=$((column_count + 1)); done
@@ -1221,9 +1384,10 @@ build_table_frame() {
 
 build_transpose_frame() {
   local index="$1" row=0 source_row=1 column_index column value status alignment line
-  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
-  local content_width=$((PANEL_WIDTHS[index] - 2))
-  local content_height=$((PANEL_HEIGHTS[index] - 2))
+  ensure_effective_panel_dimensions "$index"
+  local x=$((PANEL_EFFECTIVE_X[index] + 1)) y=$((PANEL_EFFECTIVE_Y[index] + 1))
+  local content_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
+  local content_height=$((PANEL_EFFECTIVE_HEIGHTS[index] - 2))
   local source="${PANEL_TABLE_ROWS[$index]:-}"
   local statuses=""
   local key_width value_width
@@ -1295,8 +1459,8 @@ draw_static_dashboard() {
   # Clear the terminal and return the cursor home for a forced full redraw.
   printf '\033[2J\033[H'
   for index in "${PANEL_ORDER[@]}"; do
-    draw_panel_border "${PANEL_X[$index]}" "${PANEL_Y[$index]}" "${PANEL_WIDTHS[$index]}" "${PANEL_HEIGHTS[$index]}"
-    inner_width=$((PANEL_WIDTHS[index] - 2))
+    draw_panel_border "${PANEL_EFFECTIVE_X[$index]}" "${PANEL_EFFECTIVE_Y[$index]}" "${PANEL_EFFECTIVE_WIDTHS[$index]}" "${PANEL_EFFECTIVE_HEIGHTS[$index]}"
+    inner_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
     title_width=$((inner_width - 2))
     (( title_width < 0 )) && title_width=0
     clip_text "${PANEL_TITLES[$index]}" "$title_width"
@@ -1304,7 +1468,7 @@ draw_static_dashboard() {
     title=" ${title_text} "
     left_fill=$(((inner_width - ${#title}) / 2))
     # Move to the centered title position, leaving the remaining border dashes intact.
-    move_cursor "${PANEL_Y[$index]}" "$((PANEL_X[index] + 1 + left_fill))"
+    move_cursor "${PANEL_EFFECTIVE_Y[$index]}" "$((PANEL_EFFECTIVE_X[index] + 1 + left_fill))"
     printf '%s' "$title"
   done
   # Move below the configured layout before drawing the static footer.
@@ -1917,17 +2081,30 @@ wait_for_quit_or_timeout() {
 show_resize_pause() {
   # Clear the dashboard and return the cursor home for the resize message.
   printf '\033[2J\033[H'
-  printf 'Terminal too small: need %sx%s, have %sx%s. Resize or press q to exit.' \
-    "$REQUIRED_COLS" "$REQUIRED_TERMINAL_ROWS" "$TERMINAL_COLS" "$TERMINAL_ROWS"
+  if [[ -n "$LAYOUT_ERROR" ]]; then
+    printf 'Layout invalid: %s Resize or press q to exit.' "$LAYOUT_ERROR"
+  else
+    printf 'Terminal too small: need %sx%s, have %sx%s. Resize or press q to exit.' \
+      "$REQUIRED_COLS" "$REQUIRED_TERMINAL_ROWS" "$TERMINAL_COLS" "$TERMINAL_ROWS"
+  fi
 }
 
 process_terminal_resize() {
   read_terminal_size || return 1
-  resolve_auto_panel_dimensions
+  resolve_panel_dimensions
   calculate_required_terminal_size
   RESIZE_PENDING=0
+  LAYOUT_ERROR=""
 
   if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
+    if (( DASHBOARD_PAUSED == 0 )); then
+      show_resize_pause
+    fi
+    DASHBOARD_PAUSED=1
+    return 1
+  fi
+
+  if ! validate_effective_panel_layout; then
     if (( DASHBOARD_PAUSED == 0 )); then
       show_resize_pause
     fi

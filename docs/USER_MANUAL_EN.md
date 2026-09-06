@@ -61,6 +61,14 @@ The final panel may omit `PANEL_HEIGHTS[i]`; LHC uses the maximum height from
 `PANEL_Y[i]` to the row above the footer. Other panels must define height.
 The automatic height is recalculated after terminal resize.
 
+`PANEL_X`, `PANEL_Y`, `PANEL_WIDTHS`, and `PANEL_HEIGHTS` also accept a
+percentage such as `50%`. X and width percentages use terminal columns; Y and
+height percentages use the terminal rows excluding the footer. `0%` means the
+left or top boundary for a position. Percentage values are rounded down and
+are resolved again from the original configuration after every resize. Integer
+and percentage values may be mixed within one panel. The normal minimum-size
+and bounds checks still apply.
+
 ## 4. Configuration reference
 
 ### 4.1 Global settings
@@ -74,18 +82,37 @@ The automatic height is recalculated after terminal resize.
 
 ### 4.2 Required fields for every panel
 
-All six fields below must be set at the same index. A missing field, empty title/command, or non-positive integer causes startup validation to fail.
+All six fields below must be set at the same index. A missing field, empty title/command, or invalid integer/percentage geometry value causes startup validation to fail.
 
 | Variable | Example | Description |
 | --- | --- | --- |
 | `PANEL_TITLES[i]` | `"Queue"` | Panel title; must not be empty. |
 | `PANEL_COMMANDS[i]` | `"check_queue.sh"` | Bash command to run; must not be empty. |
-| `PANEL_X[i]` | `1` | Left edge, one-based column. |
-| `PANEL_Y[i]` | `1` | Top edge, one-based row. |
-| `PANEL_WIDTHS[i]` | `40` | Total panel width, including borders; minimum `4`. |
-| `PANEL_HEIGHTS[i]` | `8` | Total panel height, including borders; minimum `3`. |
+| `PANEL_X[i]` | `1` or `"0%"` | Left edge, one-based column for integers or percentage of terminal width. |
+| `PANEL_Y[i]` | `1` or `"0%"` | Top edge, one-based row for integers or percentage of usable terminal height. |
+| `PANEL_WIDTHS[i]` | `40` or `"50%"` | Total panel width, including borders; minimum `4` after resolution. |
+| `PANEL_HEIGHTS[i]` | `8` or `"50%"` | Total panel height, including borders; minimum `3` after resolution. |
 
 Panel indexes must be non-negative integers. An extra index (for example, `PANEL_COMMANDS[4]` without `PANEL_TITLES[4]`) is rejected.
+
+For example, two panels can split the terminal horizontally and adapt to
+resize:
+
+```bash
+PANEL_X[0]="0%"
+PANEL_Y[0]="0%"
+PANEL_WIDTHS[0]="50%"
+PANEL_HEIGHTS[0]="100%"
+
+PANEL_X[1]="50%"
+PANEL_Y[1]="0%"
+PANEL_WIDTHS[1]="50%"
+PANEL_HEIGHTS[1]="100%"
+```
+
+The footer row remains reserved. A percentage that resolves below the minimum
+size or outside the terminal causes startup validation to fail; after resize,
+the dashboard pauses until the terminal is large enough.
 
 ### 4.3 Raw panels
 
