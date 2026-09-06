@@ -14,6 +14,9 @@ LHC will support running a panel command on zero or more SSH servers.
 - Every result includes the server alias in its first column.
 - Other panels retain the existing concurrent and progressive rendering
   behavior.
+- During one LHC process, the same SSH target reuses one OpenSSH transport
+  through connection multiplexing; each command still uses an independent SSH
+  session/channel.
 - The implementation must remain compatible with Bash 3.2 and must not depend
   on associative arrays or `wait -n`.
 
@@ -58,17 +61,20 @@ locally.
 
 ### 2.3 Table Column Configuration
 
-For an SSH table panel, the first normal table column is reserved for the SSH
-server alias. No SSH-specific display-column or display-width setting is used.
+For an SSH table panel, the first configured table field is the synthetic SSH
+server-identity field. It is normally named `SERVER`; it is not emitted by the
+remote command. The remaining configured fields are the actual remote data
+fields. No SSH-specific display-column or display-width setting is used.
 
 ```bash
 PANEL_TABLE_COLUMNS[0]="SERVER APP EAIQ ICLQ"
 PANEL_TABLE_WIDTHS[0]="8 4 5 4"
 ```
 
-- The first `PANEL_TABLE_COLUMNS[index]` token supplies the server-column name.
-- The remote command emits values only for the remaining configured columns;
-  LHC prepends the alias to each logical row.
+- The first `PANEL_TABLE_COLUMNS[index]` token supplies the displayed server
+  identity label, normally `SERVER`.
+- The remote command emits values only for the remaining configured data
+  fields; LHC prepends the alias to each logical row.
 - If `PANEL_TABLE_WIDTHS[index]` is configured for normal table layout, its
   first width is the server-column width and its remaining widths map to the
   command-output columns.
@@ -88,16 +94,18 @@ PANEL_TABLE_WIDTHS[1]="8 10"
 PANEL_SSH_ALIASES[1]="APP01 APP02"
 ```
 
-Transpose widths retain their existing meaning: they describe the rendered key
-and value columns, not the number of source fields. Every non-empty remote
-output row must contain values for every configured column except the first
-`SERVER` column.
+Transpose widths describe the rendered field-name and field-value cells, not the
+number or names of source fields. `PANEL_TABLE_COLUMNS[index]` still contains
+the actual source-field names in source order. For SSH, the first configured
+name is the synthetic server-identity label and every non-empty remote output
+row must contain values for every configured data field after that first label.
 
 For SSH, LHC prepends the alias to every output row, then renders each
-resulting logical row as one consecutive key/value block. The `SERVER <alias>`
+resulting logical row as one consecutive field-name/value block. The `SERVER <alias>`
 row is first in every block. Blocks follow panel alias order and remote output
-order, with no blank separator row. Local rows use the same renderer without
-the server-alias prefix.
+order, with no blank separator row or separate table-header row. Local rows use
+the same renderer without the server-alias prefix; their configured field names
+are all actual source-field names.
 
 ### 2.5 Validation Rules
 
@@ -121,21 +129,23 @@ Unused, valid global SSH server entries are allowed.
 
 ### 3.1 Job Scheduling
 
-The existing command scheduler will be generalized into flat jobs:
+The command scheduler uses flat jobs with independent panel timers:
 
 - a local panel creates one local job;
 - an SSH panel creates one job for every configured alias; and
 - every job tracks its panel index, alias, PID, stdout file, status file, and
   collection state.
 
-All jobs start before collection begins. This preserves panel-level
+Each panel starts when its own timer is due. This preserves panel-level
 concurrency while also allowing the servers within a panel to run in parallel.
 Using flat jobs also allows the main process to track and clean up every SSH
-process directly.
+process directly. A slow panel remains active until its jobs finish, but does
+not prevent another panel whose timer is due from starting or rendering.
 
 A local panel is ready when its single job finishes. An SSH panel is ready only
 when every job belonging to that panel has finished. The dashboard renders the
-panel once at that point; it does not expose partially aggregated server data.
+panel once at that point, starts its next timer, and does not expose partially
+aggregated server data.
 
 ### 3.2 SSH Invocation
 
@@ -149,7 +159,18 @@ SSH uses non-interactive settings equivalent to:
 BatchMode=yes
 ConnectTimeout=10
 StrictHostKeyChecking=yes
+ControlMaster=auto
+ControlPersist=yes
+ControlPath=<process-temporary-directory>/control.<target-index>
 ```
+
+The control path is allocated once for each distinct `ssh-target` and is reused
+by all panels and refreshes in the same LHC process. This keeps the underlying
+SSH connection alive while preserving independent stdout, stderr, exit status,
+and command concurrency. Different target strings use different control
+paths, even if they may ultimately resolve to the same host. The temporary
+control sockets and master connections are closed when LHC exits; they are not
+shared across LHC launches.
 
 The dashboard therefore never prompts for a password, key passphrase, or host
 key confirmation. Authentication, SSH agent access, and `known_hosts` entries
@@ -166,6 +187,8 @@ Normal exit, `q`, Ctrl+C, and startup/runtime failure must:
 - wait for terminated child processes;
 - remove all stdout and completion-marker files;
 - remove the command temporary directory; and
+- send `ssh -O exit` for every known control socket so persistent SSH masters
+  do not remain after LHC exits; and
 - restore the cursor and terminal attributes as before.
 
 No SSH child process or temporary result file may remain after LHC exits.
@@ -175,8 +198,8 @@ No SSH child process or temporary result file may remain after LHC exits.
 ### 4.1 Table Panels
 
 For successful remote output, LHC prepends the server alias to every parsed
-row. The first configured table column is already the server column, so LHC
-does not inject an additional header.
+row. The first configured table field is the synthetic server-identity field,
+so LHC does not add a separate table-header row.
 
 Example command output from both servers:
 
@@ -194,8 +217,10 @@ APP02 FPP 2 10
 APP02 API 0 4
 ```
 
-Warning and error rules continue to reference `PANEL_TABLE_COLUMNS` normally,
-including the server column if a rule explicitly targets it.
+Warning and error rules continue to reference the actual names in
+`PANEL_TABLE_COLUMNS` normally. In an SSH panel, a rule may target the synthetic
+`SERVER` identity field, but remote data rules should use the configured names
+after `SERVER`.
 
 If a successful server returns no data, LHC adds an informational row in the
 shape:
@@ -249,8 +274,9 @@ EAIQ    2
 ICLQ    10
 ```
 
-The server row starts every block and blocks are rendered consecutively in
-alias and source-row order without a blank separator. Empty and failed servers
+The server-identity row starts every block; it is not a separate table header.
+Blocks are rendered consecutively in alias and source-row order without a blank
+separator. Empty and failed servers
 use the same synthetic logical rows as normal table mode, so their transposed
 block remains identifiable by alias. A row with the wrong field count makes the
 whole panel use prefixed raw-output fallback.
@@ -366,8 +392,8 @@ Verify that:
 - An SSH table's first normal `PANEL_TABLE_COLUMNS` field is the server field;
   there are no `PANEL_SSH_DISPLAY_COLUMN` or `PANEL_SSH_DISPLAY_WIDTH`
   settings.
-- Local and SSH transpose render one key/value block per source row, without
-  special handling or limits based on the row count.
+- Local and SSH transpose render one field-name/value block per source row,
+  without special handling or limits based on the row count.
 - Successful results remain visible when one server fails.
 - SSH is non-interactive with a 10-second connection timeout.
 - Command runtime timeout is outside this change.

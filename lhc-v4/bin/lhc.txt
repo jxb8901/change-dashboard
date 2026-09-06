@@ -92,6 +92,9 @@ usage() {
   printf '\n'
   printf 'Starts the local and SSH change dashboard.\n'
   printf 'Default config: %s\n' "$DEFAULT_CONFIG"
+  printf '\n'
+  printf 'Options:\n'
+  printf '  -h, --help, --usage  Show this help and exit.\n'
 }
 
 setup_terminal() {
@@ -1696,10 +1699,12 @@ run_dashboard_loop() {
 }
 
 main() {
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    return 0
-  fi
+  case "${1:-}" in
+    -h|--help|--usage)
+      usage
+      return 0
+      ;;
+  esac
 
   local config_file="${1:-$DEFAULT_CONFIG}"
 

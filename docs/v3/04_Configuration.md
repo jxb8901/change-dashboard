@@ -16,13 +16,24 @@ plus all gaps must fit the panel content area.
 ## Transpose
 
 ```bash
-PANEL_TABLE_COLUMNS[1]="host queue status"
+PANEL_TABLE_COLUMNS[1]="HOST QUEUE STATUS"
 PANEL_TABLE_LAYOUT[1]="transpose"
 PANEL_TABLE_WIDTHS[1]="14 12"
 ```
 
-Transpose widths represent the rendered key and value columns. The command may
-return zero or more rows; each row is rendered as a consecutive key/value block.
+The three `PANEL_TABLE_COLUMNS` tokens are the actual source-field names. A
+command row must therefore contain three values, for example:
+
+```text
+app01 27 READY
+app02 4 OK
+```
+
+Transpose widths represent the rendered field-name and field-value cells, not
+the number or names of source fields. The command may return zero or more rows;
+each row is rendered as a consecutive field-name/value block without a
+separate table-header row. Rules, if configured, reference `HOST`, `QUEUE`, or
+`STATUS` directly.
 
 ## Color Control
 

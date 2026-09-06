@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-06 V5: Refresh panels independently, reuse SSH connections with
+#   OpenSSH multiplexing, support contains/not-contains rules, and calculate
+#   automatic dimensions for the final panel and rightmost table field;
+#   highlight matching raw MESSAGE keywords.
 # - 2026-08-13 V4.7: Allow local and SSH transpose panels to render multiple
 #   source rows through the same key/value block renderer.
 # - 2026-08-01 V4.6: Add per-panel multi-server SSH execution, deterministic
@@ -35,6 +39,8 @@ REQUIRED_COLS=0
 REQUIRED_TERMINAL_ROWS=0
 CONDITION_OPERATOR=""
 CONDITION_VALUE=""
+RAW_LINE_STYLE="OK"
+RAW_LINE_KEYWORDS=""
 NUMERIC_COMPARE=0
 FRAME_KEY_INDEX=0
 RESIZE_PENDING=0
@@ -44,6 +50,7 @@ RESOLVED_WIDTHS=""
 FUNCTION_RESULT=""
 PANEL_COMMAND_TEMP_DIR=""
 PANEL_COMMAND_JOB_COUNT=0
+AUTO_PANEL_HEIGHT_INDEX=""
 
 declare -a SSH_SERVERS=()
 declare -a PANEL_TITLES=()
@@ -84,14 +91,24 @@ declare -a PANEL_COMMAND_TARGETS=()
 declare -a PANEL_COMMAND_INPUT_FILES=()
 declare -a PANEL_COMMAND_ERROR_FILES=()
 declare -a PANEL_COMMAND_EXIT_STATUSES=()
+declare -a PANEL_COMMAND_CONTROL_PATHS=()
 declare -a PANEL_COMMAND_COUNTS=()
 declare -a PANEL_COMMAND_COMPLETED_COUNTS=()
+declare -a PANEL_COMMAND_ACTIVE=()
+declare -a PANEL_NEXT_RUN_SECONDS=()
+declare -a PANEL_COMMAND_START_JOBS=()
+PANEL_COMMAND_SCHEDULER_INITIALIZED=0
+declare -a SSH_CONTROL_TARGETS=()
+declare -a SSH_CONTROL_PATHS=()
 
 usage() {
   printf 'Usage: %s [config-file]\n' "${0##*/}"
   printf '\n'
   printf 'Starts the local and SSH change dashboard.\n'
   printf 'Default config: %s\n' "$DEFAULT_CONFIG"
+  printf '\n'
+  printf 'Options:\n'
+  printf '  -h, --help, --usage  Show this help and exit.\n'
 }
 
 setup_terminal() {
@@ -121,6 +138,14 @@ cleanup_panel_commands() {
       kill "$pid" 2>/dev/null || true
     fi
     wait "$pid" 2>/dev/null || true
+  done
+
+  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+    ssh -T \
+      -o BatchMode=yes \
+      -o ControlPath="${SSH_CONTROL_PATHS[$index]}" \
+      -O exit \
+      "${SSH_CONTROL_TARGETS[$index]}" >/dev/null 2>&1 || true
   done
 
   for index in "${!PANEL_COMMAND_OUTPUT_FILES[@]}"; do
@@ -158,9 +183,16 @@ cleanup_panel_commands() {
   PANEL_COMMAND_INPUT_FILES=()
   PANEL_COMMAND_ERROR_FILES=()
   PANEL_COMMAND_EXIT_STATUSES=()
+  PANEL_COMMAND_CONTROL_PATHS=()
   PANEL_COMMAND_COUNTS=()
   PANEL_COMMAND_COMPLETED_COUNTS=()
+  PANEL_COMMAND_ACTIVE=()
+  PANEL_NEXT_RUN_SECONDS=()
+  PANEL_COMMAND_START_JOBS=()
+  SSH_CONTROL_TARGETS=()
+  SSH_CONTROL_PATHS=()
   PANEL_COMMAND_JOB_COUNT=0
+  PANEL_COMMAND_SCHEDULER_INITIALIZED=0
 }
 
 handle_interrupt() {
@@ -209,6 +241,7 @@ load_config() {
   PANEL_Y=()
   PANEL_WIDTHS=()
   PANEL_HEIGHTS=()
+  AUTO_PANEL_HEIGHT_INDEX=""
   PANEL_ORDER=()
   PANEL_OUTPUTS=()
   PANEL_TABLE_COLUMNS=()
@@ -251,6 +284,8 @@ validate_config() {
     return 1
   fi
 
+  build_panel_model || return 1
+
   for index in "${!PANEL_TITLES[@]}"; do
     validate_panel "$index" || return 1
   done
@@ -270,7 +305,6 @@ validate_config() {
   validate_table_configs || return 1
   validate_ssh_configs || return 1
 
-  build_panel_model
 }
 
 validate_no_extra_panel_indexes() {
@@ -305,7 +339,14 @@ validate_panel() {
   require_panel_field PANEL_X "$index" || return 1
   require_panel_field PANEL_Y "$index" || return 1
   require_panel_field PANEL_WIDTHS "$index" || return 1
-  require_panel_field PANEL_HEIGHTS "$index" || return 1
+  if ! has_array_index PANEL_HEIGHTS "$index"; then
+    if [[ "$index" == "${PANEL_ORDER[${#PANEL_ORDER[@]}-1]}" ]]; then
+      AUTO_PANEL_HEIGHT_INDEX="$index"
+    else
+      error "PANEL_HEIGHTS[$index] is required"
+      return 1
+    fi
+  fi
 
   if [[ -z "${PANEL_TITLES[$index]}" ]]; then
     error "PANEL_TITLES[$index] must not be empty"
@@ -337,12 +378,12 @@ validate_panel() {
     return 1
   fi
 
-  if ! is_positive_integer "${PANEL_HEIGHTS[$index]}"; then
+  if [[ -n "${PANEL_HEIGHTS[$index]:-}" ]] && ! is_positive_integer "${PANEL_HEIGHTS[$index]}"; then
     error "PANEL_HEIGHTS[$index] must be a positive integer"
     return 1
   fi
 
-  if (( PANEL_HEIGHTS[index] < 3 )); then
+  if [[ -n "${PANEL_HEIGHTS[$index]:-}" ]] && (( PANEL_HEIGHTS[index] < 3 )); then
     error "PANEL_HEIGHTS[$index] must be at least 3"
     return 1
   fi
@@ -360,15 +401,13 @@ validate_table_configs() {
 
   for index in "${!PANEL_WARN_RULES[@]}"; do
     if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
-      error "PANEL_WARN_RULES[$index] requires PANEL_TABLE_COLUMNS[$index]"
-      return 1
+      validate_raw_rule_list "$index" "WARN" "${PANEL_WARN_RULES[$index]:-}" || return 1
     fi
   done
 
   for index in "${!PANEL_ERROR_RULES[@]}"; do
     if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
-      error "PANEL_ERROR_RULES[$index] requires PANEL_TABLE_COLUMNS[$index]"
-      return 1
+      validate_raw_rule_list "$index" "ERROR" "${PANEL_ERROR_RULES[$index]:-}" || return 1
     fi
   done
 
@@ -383,6 +422,28 @@ validate_table_configs() {
   for index in "${!PANEL_TABLE_WIDTHS[@]}"; do
     if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
       error "PANEL_TABLE_WIDTHS[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+}
+
+validate_raw_rule_list() {
+  local index="$1" severity="$2" rules="$3" rule field condition
+
+  for rule in $rules; do
+    if [[ "$rule" != MESSAGE:* ]]; then
+      error "$severity raw rule must use MESSAGE:condition format for panel $index: $rule"
+      return 1
+    fi
+    field="${rule%%:*}"
+    condition="${rule#*:}"
+    parse_condition "$condition" || {
+      error "$severity raw rule has invalid condition for panel $index: $condition"
+      return 1
+    }
+    if [[ "$CONDITION_OPERATOR" != '~' && "$CONDITION_OPERATOR" != '!~' ]] ||
+       [[ -z "$CONDITION_VALUE" ]]; then
+      error "$severity raw rule only supports non-empty ~ or !~ conditions for panel $index"
       return 1
     fi
   done
@@ -531,9 +592,17 @@ validate_table_layout() {
     total=$((total + width))
   done
 
-  if (( count != expected )); then
-    error "PANEL_TABLE_WIDTHS[$index] requires $expected widths for $layout layout"
+  if (( count != expected && count != expected - 1 )); then
+    error "PANEL_TABLE_WIDTHS[$index] requires $expected widths, or omits only the final width, for $layout layout"
     return 1
+  fi
+
+  if (( count == expected - 1 )); then
+    required_width=$((total + gap_total + 1))
+    if (( required_width > content_width )); then
+      error "PANEL_TABLE_WIDTHS[$index] leaves no space for the final width"
+      return 1
+    fi
   fi
 
   required_width=$((total + gap_total))
@@ -621,7 +690,7 @@ validate_condition() {
   fi
 
   case "$CONDITION_OPERATOR" in
-    '>'|'>='|'<'|'<='|'=='|'!=')
+    '>'|'>='|'<'|'<='|'=='|'!='|'~'|'!~')
       return 0
       ;;
   esac
@@ -635,6 +704,8 @@ parse_condition() {
   local value
 
   case "$condition" in
+    '!~'*) operator='!~'; value="${condition:2}" ;;
+    '~'*) operator='~'; value="${condition:1}" ;;
     '>='*) operator='>='; value="${condition#>=}" ;;
     '<='*) operator='<='; value="${condition#<=}" ;;
     '=='*) operator='=='; value="${condition#==}" ;;
@@ -717,13 +788,24 @@ read_terminal_size() {
 }
 
 validate_terminal_size() {
-  calculate_required_terminal_size
   read_terminal_size || return 1
+  resolve_auto_panel_dimensions
+  calculate_required_terminal_size
 
   if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
     error "terminal too small: need ${REQUIRED_COLS}x${REQUIRED_TERMINAL_ROWS}, have ${TERMINAL_COLS}x${TERMINAL_ROWS}"
     return 1
   fi
+}
+
+resolve_auto_panel_dimensions() {
+  local index height
+
+  [[ -n "$AUTO_PANEL_HEIGHT_INDEX" ]] || return 0
+  index="$AUTO_PANEL_HEIGHT_INDEX"
+  height=$((TERMINAL_ROWS - PANEL_Y[index]))
+  (( height < 3 )) && height=3
+  PANEL_HEIGHTS[$index]="$height"
 }
 
 move_cursor() {
@@ -920,10 +1002,26 @@ get_line_at_position() {
 resolve_table_widths() {
   local index="$1" layout="${PANEL_TABLE_LAYOUT[$1]:-table}"
   local content_width=$((PANEL_WIDTHS[index] - 2))
-  local count=0 width column result="" available_width
+  local count=0 specified_count=0 width column result="" available_width fixed_total=0
 
   if [[ -n "${PANEL_TABLE_WIDTHS[$index]:-}" ]]; then
-    RESOLVED_WIDTHS="${PANEL_TABLE_WIDTHS[$index]}"
+    if [[ "$layout" == "transpose" ]]; then
+      count=2
+    else
+      for column in ${PANEL_TABLE_COLUMNS[$index]}; do count=$((count + 1)); done
+    fi
+    for width in ${PANEL_TABLE_WIDTHS[$index]}; do
+      result="${result}${width} "
+      fixed_total=$((fixed_total + width))
+      specified_count=$((specified_count + 1))
+    done
+    if (( specified_count == count - 1 )); then
+      width=$((content_width - (count - 1) * TABLE_COLUMN_GAP - fixed_total))
+      result="${result}${width}"
+    else
+      result="${result% }"
+    fi
+    RESOLVED_WIDTHS="$result"
     return
   fi
   if [[ "$layout" == "transpose" ]]; then
@@ -941,18 +1039,109 @@ resolve_table_widths() {
 }
 
 build_raw_frame() {
-  local index="$1" row=0 line style=OK
+  local index="$1" row=0 line
   local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
   local width=$((PANEL_WIDTHS[index] - 2)) height=$((PANEL_HEIGHTS[index] - 2))
   local content="${PANEL_OUTPUTS[$index]:-No data}"
 
-  [[ "${PANEL_RENDER_MODES[$index]:-raw}" == "failed" ]] && style=ERROR
   while (( row < height )); do
     get_line_at_position "$content" "$row"
     line="$FUNCTION_RESULT"
-    frame_add "$((y + row))" "$x" "$width" "$line" "$style"
+    render_raw_line "$index" "$((y + row))" "$x" "$width" "$line"
     row=$((row + 1))
   done
+}
+
+render_raw_line() {
+  local index="$1" row="$2" x="$3" width="$4" line="$5"
+  local offset=0 rendered=0 normal="" keyword match candidate
+  local style="OK"
+
+  get_raw_line_rules "$index" "$line"
+  style="$RAW_LINE_STYLE"
+  if [[ -z "$RAW_LINE_KEYWORDS" ]]; then
+    [[ "${PANEL_RENDER_MODES[$index]:-raw}" == "failed" ]] && style=ERROR
+    frame_add "$row" "$x" "$width" "$line" "$style"
+    return
+  fi
+
+  while (( offset < ${#line} && rendered < width )); do
+    match=""
+    for candidate in $RAW_LINE_KEYWORDS; do
+      if (( ${#candidate} <= width - rendered )) &&
+         [[ "${line:offset:${#candidate}}" == "$candidate" ]] &&
+         (( ${#candidate} > ${#match} )); then
+        match="$candidate"
+      fi
+    done
+
+    if [[ -n "$match" ]]; then
+      if [[ -n "$normal" ]]; then
+        frame_add "$row" "$((x + rendered - ${#normal}))" "${#normal}" "$normal" OK
+        normal=""
+      fi
+      keyword="${line:offset:${#match}}"
+      frame_add "$row" "$((x + rendered))" "${#keyword}" "$keyword" "$style"
+      offset=$((offset + ${#keyword}))
+      rendered=$((rendered + ${#keyword}))
+    else
+      normal="${normal}${line:offset:1}"
+      offset=$((offset + 1))
+      rendered=$((rendered + 1))
+    fi
+  done
+
+  if [[ -n "$normal" ]]; then
+    frame_add "$row" "$((x + rendered - ${#normal}))" "${#normal}" "$normal" OK
+  fi
+  if (( rendered < width )); then
+    frame_add "$row" "$((x + rendered))" "$((width - rendered))" "" OK
+  fi
+}
+
+get_raw_line_rules() {
+  local index="$1" line="$2" rules rule condition keyword
+
+  RAW_LINE_STYLE="OK"
+  RAW_LINE_KEYWORDS=""
+  rules="${PANEL_ERROR_RULES[$index]:-}"
+  if raw_rule_list_matches "$line" "$rules"; then
+    RAW_LINE_STYLE="ERROR"
+    get_raw_matching_keywords "$line" "$rules"
+    return
+  fi
+  rules="${PANEL_WARN_RULES[$index]:-}"
+  if raw_rule_list_matches "$line" "$rules"; then
+    RAW_LINE_STYLE="WARN"
+    get_raw_matching_keywords "$line" "$rules"
+  fi
+}
+
+raw_rule_list_matches() {
+  local value="$1" rules="$2" rule condition
+
+  for rule in $rules; do
+    condition="${rule#*:}"
+    if condition_matches "$value" "$condition"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_raw_matching_keywords() {
+  local value="$1" rules="$2" rule condition keyword result=""
+
+  for rule in $rules; do
+    condition="${rule#*:}"
+    parse_condition "$condition" || continue
+    [[ "$CONDITION_OPERATOR" == '~' ]] || continue
+    keyword="$CONDITION_VALUE"
+    condition_matches "$value" "$condition" || continue
+    [[ " $result " == *" $keyword "* ]] && continue
+    result="${result}${keyword} "
+  done
+  RAW_LINE_KEYWORDS="${result% }"
 }
 
 build_table_frame() {
@@ -1139,21 +1328,32 @@ initialize_loading_dashboard() {
 
 run_panel_commands() {
   local index alias target job panel_index status_file
-  local remaining made_progress completed total
+  local completed total now
 
-  PANEL_COMMAND_PIDS=()
-  PANEL_COMMAND_OUTPUT_FILES=()
-  PANEL_COMMAND_STATUS_FILES=()
-  PANEL_COMMAND_COLLECTED=()
-  PANEL_COMMAND_PANEL_INDEXES=()
-  PANEL_COMMAND_ALIASES=()
-  PANEL_COMMAND_TARGETS=()
-  PANEL_COMMAND_INPUT_FILES=()
-  PANEL_COMMAND_ERROR_FILES=()
-  PANEL_COMMAND_EXIT_STATUSES=()
-  PANEL_COMMAND_COUNTS=()
-  PANEL_COMMAND_COMPLETED_COUNTS=()
-  PANEL_COMMAND_JOB_COUNT=0
+  if (( PANEL_COMMAND_SCHEDULER_INITIALIZED == 0 )); then
+    PANEL_COMMAND_PIDS=()
+    PANEL_COMMAND_OUTPUT_FILES=()
+    PANEL_COMMAND_STATUS_FILES=()
+    PANEL_COMMAND_COLLECTED=()
+    PANEL_COMMAND_PANEL_INDEXES=()
+    PANEL_COMMAND_ALIASES=()
+    PANEL_COMMAND_TARGETS=()
+    PANEL_COMMAND_INPUT_FILES=()
+    PANEL_COMMAND_ERROR_FILES=()
+    PANEL_COMMAND_EXIT_STATUSES=()
+    PANEL_COMMAND_CONTROL_PATHS=()
+    PANEL_COMMAND_COUNTS=()
+    PANEL_COMMAND_COMPLETED_COUNTS=()
+    PANEL_COMMAND_ACTIVE=()
+    PANEL_NEXT_RUN_SECONDS=()
+    PANEL_COMMAND_START_JOBS=()
+    PANEL_COMMAND_JOB_COUNT=0
+    for index in "${PANEL_ORDER[@]}"; do
+      PANEL_COMMAND_ACTIVE[$index]=0
+      PANEL_NEXT_RUN_SECONDS[$index]=0
+    done
+    PANEL_COMMAND_SCHEDULER_INITIALIZED=1
+  fi
 
   if [[ -z "$PANEL_COMMAND_TEMP_DIR" ]]; then
     PANEL_COMMAND_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc.commands.XXXXXX")" || {
@@ -1162,12 +1362,16 @@ run_panel_commands() {
     }
   fi
 
-  # Flatten local panels and per-server SSH commands into independently tracked
-  # jobs. This keeps Bash 3.2 compatibility while allowing both levels to run
-  # concurrently.
+  now="$SECONDS"
+  # Launch only panels whose own refresh timer is due. A panel remains active
+  # until all of its local/SSH jobs finish, without blocking other panels.
   for index in "${PANEL_ORDER[@]}"; do
+    [[ "${PANEL_COMMAND_ACTIVE[$index]:-0}" -eq 0 ]] || continue
+    (( now >= ${PANEL_NEXT_RUN_SECONDS[$index]:-0} )) || continue
     PANEL_COMMAND_COUNTS[$index]=0
     PANEL_COMMAND_COMPLETED_COUNTS[$index]=0
+    PANEL_COMMAND_ACTIVE[$index]=1
+    PANEL_COMMAND_START_JOBS[$index]="$PANEL_COMMAND_JOB_COUNT"
     if has_array_index PANEL_SSH_ALIASES "$index"; then
       for alias in ${PANEL_SSH_ALIASES[$index]}; do
         resolve_ssh_target "$alias"
@@ -1181,38 +1385,60 @@ run_panel_commands() {
     fi
   done
 
-  remaining="$PANEL_COMMAND_JOB_COUNT"
   # Poll portable completion markers instead of wait -n, which is unavailable
-  # in the Bash version shipped with older macOS releases.
-  while (( remaining > 0 )); do
-    made_progress=0
-    for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
-      [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 1 ]] && continue
-      status_file="${PANEL_COMMAND_STATUS_FILES[$job]}"
-      [[ -s "$status_file" ]] || continue
+  # in the Bash version shipped with older macOS releases. One invocation is a
+  # scheduler tick; the dashboard loop calls it again shortly afterward.
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 1 ]] && continue
+    status_file="${PANEL_COMMAND_STATUS_FILES[$job]}"
+    [[ -s "$status_file" ]] || continue
 
-      wait "${PANEL_COMMAND_PIDS[$job]}" 2>/dev/null || true
-      PANEL_COMMAND_EXIT_STATUSES[$job]="$(<"$status_file")"
-      PANEL_COMMAND_COLLECTED[$job]=1
-      remaining=$((remaining - 1))
-      made_progress=1
-      panel_index="${PANEL_COMMAND_PANEL_INDEXES[$job]}"
-      completed=$((PANEL_COMMAND_COMPLETED_COUNTS[panel_index] + 1))
-      PANEL_COMMAND_COMPLETED_COUNTS[$panel_index]="$completed"
-      total="${PANEL_COMMAND_COUNTS[$panel_index]}"
-      if (( completed == total )); then
-        finalize_panel_command_output "$panel_index"
-        render_dashboard
-      fi
+    wait "${PANEL_COMMAND_PIDS[$job]}" 2>/dev/null || true
+    PANEL_COMMAND_EXIT_STATUSES[$job]="$(<"$status_file")"
+    PANEL_COMMAND_COLLECTED[$job]=1
+    panel_index="${PANEL_COMMAND_PANEL_INDEXES[$job]}"
+    completed=$((PANEL_COMMAND_COMPLETED_COUNTS[panel_index] + 1))
+    PANEL_COMMAND_COMPLETED_COUNTS[$panel_index]="$completed"
+    total="${PANEL_COMMAND_COUNTS[$panel_index]}"
+    if (( completed == total )); then
+      finalize_panel_command_output "$panel_index"
+      PANEL_COMMAND_ACTIVE[$panel_index]=0
+      PANEL_NEXT_RUN_SECONDS[$panel_index]=$((SECONDS + REFRESH_INTERVAL))
+      cleanup_panel_result_files "$panel_index"
+      render_dashboard
+    fi
+  done
+}
+
+cleanup_panel_result_files() {
+  local panel_index="$1" job file
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    for file in \
+      "${PANEL_COMMAND_OUTPUT_FILES[$job]:-}" \
+      "${PANEL_COMMAND_STATUS_FILES[$job]:-}" \
+      "${PANEL_COMMAND_INPUT_FILES[$job]:-}" \
+      "${PANEL_COMMAND_ERROR_FILES[$job]:-}"; do
+      [[ -n "$file" ]] && rm -f "$file"
     done
+  done
+}
 
-    if (( remaining > 0 && made_progress == 0 )); then
-      sleep 0.05
+get_ssh_control_path() {
+  local target="$1" index
+
+  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+    if [[ "${SSH_CONTROL_TARGETS[$index]}" == "$target" ]]; then
+      FUNCTION_RESULT="${SSH_CONTROL_PATHS[$index]}"
+      return 0
     fi
   done
 
-  PANEL_COMMAND_PIDS=()
-  PANEL_COMMAND_COLLECTED=()
+  index="${#SSH_CONTROL_TARGETS[@]}"
+  SSH_CONTROL_TARGETS[$index]="$target"
+  SSH_CONTROL_PATHS[$index]="$PANEL_COMMAND_TEMP_DIR/control.$index"
+  FUNCTION_RESULT="${SSH_CONTROL_PATHS[$index]}"
 }
 
 start_panel_command_job() {
@@ -1222,6 +1448,7 @@ start_panel_command_job() {
   local status_file="$PANEL_COMMAND_TEMP_DIR/status.$job"
   local input_file="$PANEL_COMMAND_TEMP_DIR/input.$job"
   local error_file="$PANEL_COMMAND_TEMP_DIR/error.$job"
+  local control_path=""
 
   PANEL_COMMAND_JOB_COUNT=$((PANEL_COMMAND_JOB_COUNT + 1))
   PANEL_COMMAND_PANEL_INDEXES[$job]="$panel_index"
@@ -1230,10 +1457,14 @@ start_panel_command_job() {
   PANEL_COMMAND_OUTPUT_FILES[$job]="$output_file"
   PANEL_COMMAND_STATUS_FILES[$job]="$status_file"
   PANEL_COMMAND_ERROR_FILES[$job]="$error_file"
+  PANEL_COMMAND_CONTROL_PATHS[$job]=""
   : >"$status_file"
   : >"$error_file"
 
   if [[ -n "$alias" ]]; then
+    get_ssh_control_path "$target"
+    control_path="$FUNCTION_RESULT"
+    PANEL_COMMAND_CONTROL_PATHS[$job]="$control_path"
     PANEL_COMMAND_INPUT_FILES[$job]="$input_file"
     printf '%s\n' "${PANEL_COMMANDS[$panel_index]}" >"$input_file"
   fi
@@ -1246,6 +1477,9 @@ start_panel_command_job() {
         -o BatchMode=yes \
         -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=yes \
+        -o ControlMaster=auto \
+        -o ControlPersist=yes \
+        -o ControlPath="$control_path" \
         "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file" &
     else
       bash -c "${PANEL_COMMANDS[$panel_index]}" >"$output_file" 2>"$error_file" &
@@ -1267,7 +1501,7 @@ finalize_panel_command_output() {
     return
   fi
 
-  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+  for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]}" == "$panel_index" ]] || continue
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
     output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
@@ -1295,7 +1529,7 @@ aggregate_ssh_panel_output() {
     done
   fi
 
-  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+  for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]}" == "$panel_index" ]] || continue
     alias="${PANEL_COMMAND_ALIASES[$job]}"
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
@@ -1542,6 +1776,13 @@ condition_matches() {
   expected="$CONDITION_VALUE"
 
   case "$operator" in
+    '~'|'!~')
+      if [[ "$value" == *"$expected"* ]]; then
+        [[ "$operator" == '~' ]]
+      else
+        [[ "$operator" == '!~' ]]
+      fi
+      ;;
     '=='|'!=')
       if is_number "$value" && is_number "$expected"; then
         compare_numbers "$value" "$operator" "$expected"
@@ -1657,6 +1898,8 @@ show_resize_pause() {
 
 process_terminal_resize() {
   read_terminal_size || return 1
+  resolve_auto_panel_dimensions
+  calculate_required_terminal_size
   RESIZE_PENDING=0
 
   if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
@@ -1689,17 +1932,19 @@ run_dashboard_loop() {
 
     run_panel_commands
 
-    if wait_for_quit_or_timeout "$REFRESH_INTERVAL"; then
+    if wait_for_quit_or_timeout 0.05; then
       return 0
     fi
   done
 }
 
 main() {
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    return 0
-  fi
+  case "${1:-}" in
+    -h|--help|--usage)
+      usage
+      return 0
+      ;;
+  esac
 
   local config_file="${1:-$DEFAULT_CONFIG}"
 

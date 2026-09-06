@@ -15,18 +15,23 @@
 ## Widths
 - `PANEL_TABLE_WIDTHS[index]` is optional.
 - In table layout, one positive width is required per source column.
-- In transpose layout, exactly two widths define key and value cells.
+- In transpose layout, exactly two widths define the field-name and field-value
+  display cells; they are not source-field definitions.
 - Width totals must fit within `PANEL_WIDTHS[index] - 2`.
 - Text is truncated and padded to its exact cell width.
 - A fixed one-character gap separates adjacent columns.
 - Numeric values are right-aligned; headers and text values are left-aligned.
 
 ## Transpose
-- `PANEL_TABLE_LAYOUT[index]="transpose"` enables key/value display.
+- `PANEL_TABLE_LAYOUT[index]="transpose"` enables field-name/value display.
+- `PANEL_TABLE_COLUMNS[index]` contains the actual source-field names in source
+  order.
 - The command may produce zero or more parsed data rows; each row is rendered
-  as one consecutive key/value block.
+  as one consecutive field-name/value block.
+- Transpose does not add a separate table-header row; source-field names are
+  shown as labels inside each block.
 - A field-count mismatch uses raw-output fallback.
-- Rules retain their original source-column mapping.
+- Rules reference the actual source-field names, not the display-cell names.
 
 ## Resilience
 - Successful empty output displays `No data`.

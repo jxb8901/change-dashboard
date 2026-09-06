@@ -1,6 +1,6 @@
 # LHC 使用手冊（繁體中文）
 
-LHC（Local Change Dashboard）是一個以 Bash 編寫的終端機儀表板，用來週期性執行本機或 SSH 檢查命令，並以 raw、表格或 transpose 方式顯示結果。本文以目前 `bin/lhc` 的實際行為為準。
+LHC（Local Change Dashboard）是一個以 Bash 編寫的終端機儀表板，用來週期性執行本機或 SSH 檢查命令，並以 raw、表格或字段/值 transpose 方式顯示結果。本文以目前 `bin/lhc` 的實際行為為準。
 
 ## 1. 快速開始
 
@@ -13,7 +13,7 @@ LHC（Local Change Dashboard）是一個以 Bash 編寫的終端機儀表板，�
 # 使用指定配置
 ./bin/lhc example/v3-ux.conf
 
-# 查看命令說明（`-h` 或 `--help`）
+# 查看命令說明（`-h`、`--help` 或 `--usage`）
 ./bin/lhc --help
 
 # 關閉警告/錯誤的 ANSI 顏色
@@ -24,15 +24,17 @@ NO_COLOR=1 ./bin/lhc example/fpp.conf
 
 不指定檔案時，預設使用 `example/sample.conf`（相對於腳本所在的專案根目錄）。
 
+`-h`、`--help` 及 `--usage` 是等效選項；每個選項都會顯示使用方法並退出，不會啟動儀表板。沒有指定選項或配置檔路徑時，LHC 會使用預設配置並啟動儀表板。
+
 ## 2. 執行模型
 
 每次啟動或刷新時，流程如下：
 
 1. 讀取並驗證 Bash 配置。
 2. 先畫出所有面板及 `Loading...` 狀態。
-3. 同時啟動所有本機命令；有 SSH 的面板則為每個目標啟動一個 SSH job。
-4. 某個面板的所有 job 完成後，立即解析並重畫該面板；其他面板可以仍在載入。
-5. 所有面板完成後等待 `REFRESH_INTERVAL` 秒，再開始下一輪。
+3. 啟動每個已到期 panel 的本機命令或 SSH jobs。
+4. 某個 panel 的所有 jobs 完成後，立即解析並重畫該 panel。
+5. 該 panel 在完成後等待 `REFRESH_INTERVAL` 秒再執行下一輪；其他 panel 使用獨立計時器，不會被它阻塞。
 
 SSH job 會並行執行，但同一面板的結果按 `PANEL_SSH_ALIASES` 配置順序聚合，而不是按完成先後排序。LHC 使用局部 frame diff 更新改變的內容；調整終端機大小後會強制完整重畫。
 
@@ -55,13 +57,15 @@ PANEL_HEIGHTS[0]=8
 
 座標以終端機左上角為 `(1,1)`；寬度及高度包含邊框。每個面板的最小值是寬 `4`、高 `3`。配置的最右欄及最底行再加上底部 footer，必須容納在終端機內；LHC 不會自動防止面板互相重疊。
 
+最後一個 panel 可以省略 `PANEL_HEIGHTS[i]`；LHC 會由 `PANEL_Y[i]` 計算至 footer 上一列的最大可用高度。其他 panel 必須定義 height；終端機 resize 時會重新計算自動高度。
+
 ## 4. 配置參考
 
 ### 4.1 全域設定
 
 | 變數 | 必需 | 說明 |
 | --- | --- | --- |
-| `REFRESH_INTERVAL` | 否 | 正整數秒數；預設 `2`。每輪所有命令完成後，等待這段時間才刷新。 |
+| `REFRESH_INTERVAL` | 否 | 正整數秒數；預設 `2`。每個 panel 在自己的命令完成後等待這段時間再刷新。 |
 | `NO_COLOR` | 環境變數 | 任何非空值都會關閉 warning/error 的 ANSI 顏色。 |
 
 `TMPDIR` 不是面板配置欄位；若已設定，LHC 會在其下建立短暫的命令輸出目錄，離開時清理。未設定時使用 `/tmp`。
@@ -83,7 +87,7 @@ PANEL_HEIGHTS[0]=8
 
 ### 4.3 Raw 面板
 
-不設定 `PANEL_TABLE_COLUMNS[i]` 就是 raw 面板。命令 stdout 按原本的行顯示；空 stdout 顯示 `No data`。內容不會換行，超過面板寬度的文字會被截斷，超過可見高度的行會被裁掉。
+不設定 `PANEL_TABLE_COLUMNS[i]` 就是 raw 面板。命令 stdout 按原本的行顯示；空 stdout 顯示 `No data`。內容不會換行，超過面板寬度的文字會被截斷，超過可見高度的行會被裁掉。Raw panel 可使用保留字段 `MESSAGE` 的 `~` 或 `!~` rule；使用 `~` 時只高亮每一個命中的 keyword，其餘 message 保持普通樣式。
 
 ```bash
 PANEL_TITLES[0]="Deployment"
@@ -96,7 +100,7 @@ PANEL_HEIGHTS[0]=7
 
 ### 4.4 表格面板
 
-設定 `PANEL_TABLE_COLUMNS[i]` 後，LHC 會按空白分隔 stdout：每個非空行必須剛好包含相同數目的欄位。
+設定 `PANEL_TABLE_COLUMNS[i]` 後，LHC 會按空白分隔 stdout。其空白分隔的 token 是實際來源數據字段名稱，不是固定的 `key`、`value` 字樣；每個非空行必須剛好包含相同數目的欄位。
 
 ```bash
 PANEL_TITLES[1]="Queue Status"
@@ -116,44 +120,46 @@ PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 - 欄名以空白分隔，必須非空、互不重複，且不能包含 `:`。
 - 空行會跳過；欄位值本身不能包含空白。若輸出行的欄位數不符，整個面板回退為 raw，且不套用 threshold 顏色。
 - `PANEL_TABLE_LAYOUT[i]` 可省略（預設 `table`），或設為 `table` / `transpose`。
-- `PANEL_TABLE_WIDTHS[i]` 在 `table` layout 要有每個來源欄位一個正整數寬度；省略時會按可用寬度平均分配。
+- `PANEL_TABLE_WIDTHS[i]` 在 `table` layout 可省略最右欄的 width；該欄會取得扣除其他寬度及間隔後的全部剩餘寬度。整個設定省略時則按可用寬度平均分配。
 - 表格欄位之間固定有一個字元間距。指定寬度的總和加間距不能超過面板內寬，即 `PANEL_WIDTHS[i] - 2`。
 - 數字靠右，文字及標題靠左。數字格式是可選負號、整數或小數，例如 `-2`、`0`、`12.50`。
 
-若設定 `PANEL_WARN_RULES`、`PANEL_ERROR_RULES`、`PANEL_TABLE_LAYOUT` 或 `PANEL_TABLE_WIDTHS`，相同 index 必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，而寬度數量及每個寬度值也必須符合該 layout。
+Raw panel 若設定 `PANEL_WARN_RULES` 或 `PANEL_ERROR_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
 
 ### 4.5 Transpose layout
 
-Transpose 把每個資料 row 直向顯示為 `欄名 / 值`。其 `PANEL_TABLE_WIDTHS[i]` 不是來源欄位數，而是剛好兩個寬度：key 寬度及 value 寬度。
+Transpose 把每個資料 row 直向顯示為一個「字段名稱 / 字段值」block。`PANEL_TABLE_COLUMNS[i]` 必須按來源字段順序填寫實際數據字段名稱。`PANEL_TABLE_WIDTHS[i]` 是字段名稱及字段值的顯示寬度；最右的字段值 width 可以省略，由 LHC 取得全部剩餘內容寬度。
 
 ```bash
 PANEL_TITLES[2]="Release Summary"
-PANEL_COMMANDS[2]="printf 'release READY\\n'"
+PANEL_COMMANDS[2]="printf 'READY 2 BLUE\\nDEGRADED 5 RED\\n'"
 PANEL_X[2]=1
 PANEL_Y[2]=10
 PANEL_WIDTHS[2]=38
 PANEL_HEIGHTS[2]=10
-PANEL_TABLE_COLUMNS[2]="FIELD VALUE"
+PANEL_TABLE_COLUMNS[2]="STATE COUNT COLOR"
 PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="14 18"
+PANEL_WARN_RULES[2]="COUNT:>3"
+PANEL_ERROR_RULES[2]="STATE:==DEGRADED"
 ```
 
-本機及 SSH transpose 都可處理零個或多個資料 row；每個 row 會渲染成連續的 key/value block。任何 row 的欄位數不符時，LHC 會回退為 raw。SSH 面板會先在每個 row 前加上 server alias。
+本機及 SSH transpose 都可處理零個或多個資料 row。以上例子會顯示 `STATE READY`、`COUNT 2`、`COLOR BLUE`，再顯示 `STATE DEGRADED`、`COUNT 5`、`COLOR RED`。Transpose 不會增加獨立的表格列頭；配置的字段名稱只會在每個資料 block 內作為標籤重複顯示。任何 row 的欄位數不符時，LHC 會回退為 raw。SSH 面板會先在每個 row 前加上 server alias，因此 SSH block 會以 `SERVER <alias>` 開始，之後才是配置的數據字段。
 
 ### 4.6 Warning / error 規則
 
-規則 token 格式是 `欄名:條件`，同一設定以空白分隔：
+規則 token 格式是 `來源字段:條件`，同一設定以空白分隔。`field:~keyword` 匹配包含 keyword 的字段；`field:!~keyword` 匹配不包含 keyword 的字段。`table` 及 `transpose` 都必須引用 `PANEL_TABLE_COLUMNS[i]` 中的實際字段名稱；`字段名稱` 和 `字段值` 只是顯示概念，不是 rules 名稱：
 
 ```bash
 PANEL_WARN_RULES[0]="DEPTH:>20 LATENCY:>=200 STATUS:!=OK"
 PANEL_ERROR_RULES[0]="DEPTH:>50 STATUS:==DOWN"
 ```
 
-支援運算子：`>`、`>=`、`<`、`<=`、`==`、`!=`。
+支援運算子：`>`、`>=`、`<`、`<=`、`==`、`!=`、`~`、`!~`。
 
 - `>`、`>=`、`<`、`<=` 只有在值及門檻都是數字時才會匹配。
 - `==` / `!=` 對兩個數字作數值比較；其他值作字串比較。
-- 欄名必須完全匹配，且必須存在於 `PANEL_TABLE_COLUMNS`。
+- 字段名稱必須完全匹配，且必須存在於 `PANEL_TABLE_COLUMNS`。
 - error 優先於 warning；面板狀態取所有 cell 中最嚴重者：`ERROR > WARN > OK`。
 - 匹配的 cell 以 warning 黃底或 error 紅底顯示；設置 `NO_COLOR` 後保留判定但不顯示顏色。
 
@@ -184,9 +190,10 @@ Registry record 必須是 `alias|target`：
 - target 不可為空、不可含空白或 `|`，亦不能以 `-` 開頭。複雜的 port、identity、ProxyJump 等設定應放在 `~/.ssh/config`，再以 SSH config alias 作為 target。
 - `PANEL_SSH_ALIASES[i]` 是空白分隔且不可重複的 registry alias。面板未設定此欄位時，命令在本機執行。
 - SSH 使用 `ssh -T`、`BatchMode=yes`、`ConnectTimeout=10`、`StrictHostKeyChecking=yes`，並以 `bash -s` 在遠端執行 `PANEL_COMMANDS[i]`。
+- 同一次 LHC 執行期間，相同 SSH target 會透過 `ControlMaster`/`ControlPersist` 重用一條底層 OpenSSH 連線；每個命令仍使用獨立的 session/channel。LHC 結束時會關閉連線，下一次啟動不會重用。
 - `ConnectTimeout=10` 只限制建立 SSH 連線的時間；成功連線後的遠端命令沒有額外 timeout。請預先準備 key/agent 及 `known_hosts`，否則不會互動式要求密碼或確認 host key。
 
-SSH table 面板的第一個欄位是 alias 欄位；遠端命令只應輸出其餘欄位。例如上述設定中，每行應輸出三個欄位：
+SSH 面板的第一個配置欄位是名為 `SERVER` 的合成伺服器識別字段，不由遠端命令輸出；遠端命令只應為其餘配置的數據字段各輸出一個值。例如上述設定中，每行應輸出三個欄位：
 
 ```text
 FPP 2 OK
@@ -215,7 +222,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 
 - 初始畫面先顯示邊框、標題及 `Loading...`；完成的面板會逐一替換內容。
 - 面板標題置中顯示；標題過長時會按面板可用寬度截斷。
-- raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示 key/value block。
+- raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示字段名稱/字段值 block，且不增加獨立表格列頭。
 - 空結果顯示 `No data`。資料按面板高度裁剪，不會自動滾動。
 - cell 寬度是固定的。超寬數字全部顯示為 `#`；超寬文字在最後保留 `.`，例如寬度 8 的文字可能顯示 `abcdefg.`。
 - warning cell 是黑字黃底；error cell 及失敗面板內容是白字紅底。`NO_COLOR` 只關閉 ANSI 顏色。
@@ -245,11 +252,13 @@ PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 
 # Local transpose panel（可有多個來源 row）
 PANEL_TITLES[2]="Summary"
-PANEL_COMMANDS[2]="printf 'state READY\\ncount 2\\n'"
+PANEL_COMMANDS[2]="printf 'READY 2 BLUE\\nDEGRADED 5 RED\\n'"
 PANEL_X[2]=1; PANEL_Y[2]=10; PANEL_WIDTHS[2]=36; PANEL_HEIGHTS[2]=10
-PANEL_TABLE_COLUMNS[2]="FIELD VALUE"
+PANEL_TABLE_COLUMNS[2]="STATE COUNT COLOR"
 PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="12 18"
+PANEL_WARN_RULES[2]="COUNT:>3"
+PANEL_ERROR_RULES[2]="STATE:==DEGRADED"
 
 # SSH table panel
 SSH_SERVERS[0]="APP01|ops@app01"

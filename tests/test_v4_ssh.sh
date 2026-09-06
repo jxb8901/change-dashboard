@@ -89,6 +89,10 @@ render_dashboard() {
 
 SECONDS=0
 run_panel_commands || fail_test "V4 command scheduler failed"
+while (( RENDER_COUNT < 3 )); do
+  run_panel_commands || fail_test "V4 scheduler polling failed"
+  sleep 0.05
+done
 ELAPSED="$SECONDS"
 (( ELAPSED <= 2 )) || fail_test "SSH jobs did not run concurrently: ${ELAPSED}s"
 assert_equal "3" "$RENDER_COUNT" "each panel should render exactly once after aggregation"
@@ -122,7 +126,28 @@ SSH_LOG_CONTENT="$(<"$FAKE_SSH_LOG")"
 assert_contains "$SSH_LOG_CONTENT" "-o BatchMode=yes" "BatchMode SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o ConnectTimeout=10" "connect timeout SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o StrictHostKeyChecking=yes" "host key SSH option"
+assert_contains "$SSH_LOG_CONTENT" "-o ControlMaster=auto" "SSH control master option"
+assert_contains "$SSH_LOG_CONTENT" "-o ControlPersist=yes" "SSH control persist option"
+assert_contains "$SSH_LOG_CONTENT" "-o ControlPath=" "SSH control path option"
 assert_contains "$SSH_LOG_CONTENT" "bash -s" "remote Bash invocation"
+
+MASTER_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "master" { count += 1 } END { print count + 0 }')"
+CHANNEL_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "channel" { count += 1 } END { print count + 0 }')"
+assert_equal "5" "$MASTER_COUNT" "one SSH master per target"
+assert_equal "3" "$CHANNEL_COUNT" "additional SSH commands use logical channels"
+
+for panel_index in "${PANEL_ORDER[@]}"; do
+  PANEL_NEXT_RUN_SECONDS[$panel_index]=0
+done
+while (( RENDER_COUNT < 6 )); do
+  run_panel_commands || fail_test "second SSH refresh failed"
+  sleep 0.05
+done
+SSH_LOG_CONTENT="$(<"$FAKE_SSH_LOG")"
+MASTER_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "master" { count += 1 } END { print count + 0 }')"
+CHANNEL_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "channel" { count += 1 } END { print count + 0 }')"
+assert_equal "5" "$MASTER_COUNT" "SSH masters persist across refreshes"
+assert_equal "11" "$CHANNEL_COUNT" "refreshes use new logical channels"
 
 COMMAND_TEMP_DIR="$PANEL_COMMAND_TEMP_DIR"
 cleanup_panel_commands

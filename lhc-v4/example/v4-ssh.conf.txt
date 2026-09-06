@@ -1,7 +1,8 @@
 REFRESH_INTERVAL=2
 
 # Replace these placeholder targets with user@host values or entries from
-# ~/.ssh/config. The alias before | is also rendered in the SERVER column.
+# ~/.ssh/config. SERVER is a synthetic identity field: the alias before | is
+# prepended by LHC, while remote commands emit only the remaining data fields.
 SSH_SERVERS[0]="APP01|ops@app01"
 SSH_SERVERS[1]="APP02|ops@app02"
 

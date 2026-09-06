@@ -28,3 +28,8 @@ configurable column widths, transpose layout, and terminal resize recovery.
 The `v4/` directory defines global SSH server aliases, per-panel multi-server
 execution, deterministic result aggregation, failure rows, and multi-row
 transpose behavior.
+
+## V5
+
+The `v5/` directory defines SSH multiplexing, contains/not-contains rules, and
+automatic sizing for the final panel and rightmost table field.

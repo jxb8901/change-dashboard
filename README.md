@@ -14,6 +14,15 @@ Use a custom config:
 ./bin/lhc example/sample.conf
 ```
 
+Show usage and available options:
+
+```bash
+./bin/lhc --help
+./bin/lhc --usage
+```
+
+With no option or config path, LHC starts with `example/sample.conf`.
+
 Run the V2 threshold example:
 
 ```bash
@@ -61,9 +70,11 @@ PANEL_TABLE_COLUMNS[0]="SERVER APP DEPTH STATUS"
 PANEL_TABLE_WIDTHS[0]="8 8 8 10"
 ```
 
-The alias is also the displayed server value. For table panels, the first
-configured column is reserved for that alias; the remote command emits only the
-remaining fields. Raw panels prefix every physical line with the alias.
+The alias is also the displayed server value. For table and transpose panels,
+the first configured field is the synthetic server-identity field (normally
+`SERVER`); the remote command emits only the remaining actual data fields. Raw
+panels prefix every physical line with the alias. Transpose panels show each
+configured field name with its value and do not add a separate table-header row.
 
 Servers within a panel run concurrently and are aggregated in configured alias
 order. SSH uses `BatchMode=yes`, `ConnectTimeout=10`, and

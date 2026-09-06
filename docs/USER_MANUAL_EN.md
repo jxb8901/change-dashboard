@@ -1,6 +1,6 @@
 # LHC User Manual
 
-LHC (Local Change Dashboard) is a Bash terminal dashboard for running local or SSH checks on a schedule and displaying their results as raw output, a table, or a transposed key/value view. This manual describes the current behavior of `bin/lhc`.
+LHC (Local Change Dashboard) is a Bash terminal dashboard for running local or SSH checks on a schedule and displaying their results as raw output, a table, or a transposed field/value view. This manual describes the current behavior of `bin/lhc`.
 
 ## 1. Quick start
 
@@ -13,7 +13,7 @@ LHC requires Bash (including Bash 3.2) and an interactive terminal; SSH panels a
 # Use a specific configuration
 ./bin/lhc example/v3-ux.conf
 
-# Show command help (`-h` or `--help`)
+# Show command help (`-h`, `--help`, or `--usage`)
 ./bin/lhc --help
 
 # Disable ANSI warning/error colors
@@ -24,15 +24,17 @@ Press `q` to exit the dashboard. `Ctrl+C` also exits. On normal exit, `q`, an in
 
 When no file is supplied, LHC uses `example/sample.conf` relative to the project root containing the script.
 
+`-h`, `--help`, and `--usage` are equivalent options. Each prints the usage text and exits without starting the dashboard. With no option or config path, LHC uses the default configuration and starts the dashboard.
+
 ## 2. Execution model
 
 Each startup or refresh cycle works as follows:
 
 1. Load and validate the Bash configuration.
 2. Draw all panel borders and `Loading...` placeholders.
-3. Start all local commands concurrently; an SSH panel starts one SSH job per target.
-4. As soon as all jobs for one panel finish, parse and redraw that panel while other panels may still be loading.
-5. After all panels finish, wait `REFRESH_INTERVAL` seconds and start the next cycle.
+3. Start each due panel's local command or SSH jobs concurrently.
+4. As soon as all jobs for one panel finish, parse and redraw that panel.
+5. Schedule that panel's next run after `REFRESH_INTERVAL` seconds; other panels have independent timers and are not blocked by it.
 
 SSH jobs run concurrently, but results within one panel are aggregated in the order of `PANEL_SSH_ALIASES`, not completion order. LHC updates only changed frame cells; a terminal resize forces a complete redraw.
 
@@ -55,13 +57,17 @@ The command's stdout is displayed in the panel. A non-zero exit status displays 
 
 Coordinates are one-based, with `(1,1)` at the upper-left terminal cell. Width and height include the panel border. The minimum panel width is `4` and the minimum height is `3`. The terminal must contain the configured rightmost column and bottom row plus the footer; LHC does not automatically prevent panels from overlapping.
 
+The final panel may omit `PANEL_HEIGHTS[i]`; LHC uses the maximum height from
+`PANEL_Y[i]` to the row above the footer. Other panels must define height.
+The automatic height is recalculated after terminal resize.
+
 ## 4. Configuration reference
 
 ### 4.1 Global settings
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `REFRESH_INTERVAL` | No | Positive integer seconds; default `2`. The delay starts after all commands in a cycle finish. |
+| `REFRESH_INTERVAL` | No | Positive integer seconds; default `2`. Each panel starts its next run this many seconds after its own command set finishes. |
 | `NO_COLOR` | Environment | Any non-empty value disables ANSI warning/error colors. |
 
 `TMPDIR` is not a panel setting. When set, LHC creates its temporary command-output directory below it and removes that directory on exit; otherwise it uses `/tmp`.
@@ -83,7 +89,7 @@ Panel indexes must be non-negative integers. An extra index (for example, `PANEL
 
 ### 4.3 Raw panels
 
-A panel without `PANEL_TABLE_COLUMNS[i]` is a raw panel. Command stdout is displayed line by line; empty stdout displays `No data`. Lines do not wrap. Text wider than the panel is clipped, and lines beyond the visible height are not shown.
+A panel without `PANEL_TABLE_COLUMNS[i]` is a raw panel. Command stdout is displayed line by line; empty stdout displays `No data`. Lines do not wrap. Text wider than the panel is clipped, and lines beyond the visible height are not shown. Raw panels may use the reserved `MESSAGE` rule field with `~` or `!~`; for `~`, only every matching keyword occurrence is highlighted and the rest of the message stays unstyled.
 
 ```bash
 PANEL_TITLES[0]="Deployment"
@@ -96,7 +102,7 @@ PANEL_HEIGHTS[0]=7
 
 ### 4.4 Table panels
 
-Setting `PANEL_TABLE_COLUMNS[i]` enables whitespace-delimited table parsing. Every non-empty stdout line must contain exactly the configured number of fields.
+Setting `PANEL_TABLE_COLUMNS[i]` enables whitespace-delimited table parsing. Its whitespace-separated tokens are the names of the source data fields, not literal `key` and `value` labels. Every non-empty stdout line must contain exactly the configured number of fields.
 
 ```bash
 PANEL_TITLES[1]="Queue Status"
@@ -116,44 +122,46 @@ Rules:
 - Column names are whitespace-separated, must be non-empty and unique, and must not contain `:`.
 - Blank lines are skipped; a field value cannot contain whitespace. If any non-empty row has the wrong field count, the whole panel falls back to raw output and threshold colors are not applied.
 - `PANEL_TABLE_LAYOUT[i]` may be omitted (default `table`) or set to `table` / `transpose`.
-- In `table` layout, `PANEL_TABLE_WIDTHS[i]` contains one positive width per source column. If omitted, widths are divided equally across the available content width.
+- In `table` layout, `PANEL_TABLE_WIDTHS[i]` contains one positive width per source column. If only the final width is omitted, it fills all remaining content width. If the list is omitted entirely, widths are divided equally.
 - LHC inserts a fixed one-character gap between columns. Configured widths plus gaps must fit `PANEL_WIDTHS[i] - 2`.
 - Numbers are right-aligned; headers and text are left-aligned. A number may have an optional minus sign, integer digits, and fractional digits, such as `-2`, `0`, or `12.50`.
 
-If `PANEL_WARN_RULES`, `PANEL_ERROR_RULES`, `PANEL_TABLE_LAYOUT`, or `PANEL_TABLE_WIDTHS` is set, the same index must also define `PANEL_TABLE_COLUMNS`. The layout must be `table` or `transpose`, and width count and values must match that layout.
+If `PANEL_WARN_RULES` or `PANEL_ERROR_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
 
 ### 4.5 Transpose layout
 
-Transpose displays each data row vertically as `column / value`. In this layout, `PANEL_TABLE_WIDTHS[i]` contains exactly two widths: the key width and the value width.
+Transpose displays each data row vertically as one `field name / field value` block. `PANEL_TABLE_COLUMNS[i]` must contain the actual source-field names, in source-field order. `PANEL_TABLE_WIDTHS[i]` contains the field-name width and optionally the field-value width; if the final width is omitted, it fills all remaining content width.
 
 ```bash
 PANEL_TITLES[2]="Release Summary"
-PANEL_COMMANDS[2]="printf 'release READY\\n'"
+PANEL_COMMANDS[2]="printf 'READY 2 BLUE\\nDEGRADED 5 RED\\n'"
 PANEL_X[2]=1
 PANEL_Y[2]=10
 PANEL_WIDTHS[2]=38
 PANEL_HEIGHTS[2]=10
-PANEL_TABLE_COLUMNS[2]="FIELD VALUE"
+PANEL_TABLE_COLUMNS[2]="STATE COUNT COLOR"
 PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="14 18"
+PANEL_WARN_RULES[2]="COUNT:>3"
+PANEL_ERROR_RULES[2]="STATE:==DEGRADED"
 ```
 
-Both local and SSH transpose panels may contain zero or more data rows; each row is rendered as a consecutive key/value block. A field-count mismatch falls back to raw output. SSH panels prepend the server alias to each row before rendering.
+Both local and SSH transpose panels may contain zero or more data rows. For the example above, the display is `STATE READY`, `COUNT 2`, `COLOR BLUE`, then `STATE DEGRADED`, `COUNT 5`, `COLOR RED`. Transpose does not add a separate table-header row; the configured field names are repeated as labels inside each data block. A field-count mismatch falls back to raw output. SSH panels prepend the server alias to each row before rendering, so an SSH block starts with `SERVER <alias>` followed by the configured data fields.
 
 ### 4.6 Warning and error rules
 
-Rule tokens use `column:condition` and are separated by whitespace:
+Rule tokens use `source-field:condition` and are separated by whitespace. Rules reference the actual names in `PANEL_TABLE_COLUMNS[i]` in both `table` and `transpose` layouts; `field name` and `field value` are display concepts, not rule names. `field:~keyword` matches a field containing the keyword; `field:!~keyword` matches a field not containing it:
 
 ```bash
 PANEL_WARN_RULES[0]="DEPTH:>20 LATENCY:>=200 STATUS:!=OK"
 PANEL_ERROR_RULES[0]="DEPTH:>50 STATUS:==DOWN"
 ```
 
-Supported operators are `>`, `>=`, `<`, `<=`, `==`, and `!=`.
+Supported operators are `>`, `>=`, `<`, `<=`, `==`, `!=`, `~`, and `!~`.
 
 - `>`, `>=`, `<`, and `<=` match only when both the cell value and threshold are numeric.
 - `==` and `!=` compare two numeric values numerically; other values are compared as strings.
-- Column names must match exactly and must exist in `PANEL_TABLE_COLUMNS`.
+- Field names must match exactly and must exist in `PANEL_TABLE_COLUMNS`.
 - An error takes precedence over a warning. Panel severity is the worst cell status: `ERROR > WARN > OK`.
 - Matching cells use a yellow background for warnings and a red background for errors. `NO_COLOR` preserves the evaluation but hides the colors.
 
@@ -184,9 +192,10 @@ Each registry record is `alias|target`:
 - A target must be non-empty and contain no whitespace or `|`, and must not start with `-`. Put complex port, identity, ProxyJump, and similar settings in `~/.ssh/config`, then use the SSH config alias as the target.
 - `PANEL_SSH_ALIASES[i]` is a whitespace-separated list of unique registry aliases. Without it, the panel command runs locally.
 - SSH uses `ssh -T`, `BatchMode=yes`, `ConnectTimeout=10`, `StrictHostKeyChecking=yes`, and executes `PANEL_COMMANDS[i]` remotely through `bash -s`.
+- During one LHC run, the same SSH target reuses one underlying OpenSSH connection with `ControlMaster`/`ControlPersist`; each command still uses an independent session/channel. Connections are closed when LHC exits and are not reused by a later LHC launch.
 - `ConnectTimeout=10` limits connection establishment only; there is no additional timeout after the remote command starts. Prepare keys/agent access and `known_hosts` first, because LHC will not prompt for a password or host-key confirmation.
 
-For an SSH table panel, the first configured column is the alias column; the remote command should output the remaining columns. With the example above, each remote line should have three fields:
+For an SSH panel, the first configured column is a synthetic server-identity field named `SERVER`; it is not emitted by the remote command. The remote command should output one value for each remaining configured data field. With the example above, each remote line should have three fields:
 
 ```text
 FPP 2 OK
@@ -215,7 +224,7 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
 
 - The initial screen draws borders, titles, and `Loading...`; completed panels replace their content progressively.
 - Panel titles are centered and clipped to the available title width when necessary.
-- Raw panels show text, table panels show a header and data rows, and transpose panels show key/value blocks.
+- Raw panels show text, table panels show a header and data rows, and transpose panels show field-name/value blocks without a separate table-header row.
 - Empty results display `No data`. Content is clipped to panel height and does not scroll automatically.
 - Cell widths are fixed. A numeric value that is too wide becomes all `#` characters; an overlong text value keeps a trailing `.` (for example, `abcdefg.` in an eight-character cell).
 - Warning cells use black text on yellow; error cells and failed-panel content use white text on red. `NO_COLOR` only disables ANSI colors.
@@ -245,11 +254,13 @@ PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 
 # Local transpose panel (multiple source rows supported)
 PANEL_TITLES[2]="Summary"
-PANEL_COMMANDS[2]="printf 'state READY\\ncount 2\\n'"
+PANEL_COMMANDS[2]="printf 'READY 2 BLUE\\nDEGRADED 5 RED\\n'"
 PANEL_X[2]=1; PANEL_Y[2]=10; PANEL_WIDTHS[2]=36; PANEL_HEIGHTS[2]=10
-PANEL_TABLE_COLUMNS[2]="FIELD VALUE"
+PANEL_TABLE_COLUMNS[2]="STATE COUNT COLOR"
 PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="12 18"
+PANEL_WARN_RULES[2]="COUNT:>3"
+PANEL_ERROR_RULES[2]="STATE:==DEGRADED"
 
 # SSH table panel
 SSH_SERVERS[0]="APP01|ops@app01"

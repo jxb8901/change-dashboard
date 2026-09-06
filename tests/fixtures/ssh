@@ -7,6 +7,8 @@ if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
 fi
 
 target=""
+operation=""
+control_path=""
 while (( $# > 0 )); do
   case "$1" in
     -T)
@@ -14,6 +16,14 @@ while (( $# > 0 )); do
       ;;
     -o)
       (( $# >= 2 )) || exit 64
+      case "$2" in
+        ControlPath=*) control_path="${2#ControlPath=}" ;;
+      esac
+      shift 2
+      ;;
+    -O)
+      (( $# >= 2 )) || exit 64
+      operation="$2"
       shift 2
       ;;
     *)
@@ -25,7 +35,19 @@ while (( $# > 0 )); do
 done
 
 [[ -n "$target" ]] || exit 64
+if [[ "$operation" == "exit" ]]; then
+  [[ -n "$control_path" ]] && rm -rf "${control_path}.fake-state"
+  exit 0
+fi
 [[ "${1:-}" == "bash" && "${2:-}" == "-s" ]] || exit 64
+
+if [[ -n "$FAKE_SSH_LOG" && -n "$control_path" ]]; then
+  if mkdir "${control_path}.fake-state" 2>/dev/null; then
+    printf 'master %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+  else
+    printf 'channel %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+  fi
+fi
 
 if [[ "$target" == "fail" ]]; then
   exit 255
