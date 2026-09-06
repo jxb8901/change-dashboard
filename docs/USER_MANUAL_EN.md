@@ -35,7 +35,9 @@ Each startup or refresh cycle works as follows:
 3. Start each due panel's local command or SSH jobs concurrently.
 4. For a snapshot panel, parse and redraw as soon as all its jobs finish. For a
    stream panel, redraw whenever new complete output lines arrive while its
-   command remains active.
+   command remains active. The stream collector sends an event to the main
+   terminal loop after each snapshot update, so this does not wait for the
+   one-second scheduler timeout.
 5. Schedule that panel's next run after `REFRESH_INTERVAL` seconds when its
    command set finishes; other panels have independent timers and are not
    blocked by it.
@@ -282,12 +284,14 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
 - Panel titles are centered and clipped to the available title width when necessary.
 - Raw panels show text, table panels show a header and data rows, and transpose panels show field-name/value blocks without a separate table-header row.
 - Stream raw panels update while their command is still running and retain only
-  the most recent visible content-height lines. A stream command that exits is
-  restarted after `REFRESH_INTERVAL` seconds.
+  the most recent visible content-height lines. Updates are event-driven;
+  `REFRESH_INTERVAL` controls only when an exited command is restarted. A
+  stream command that exits is restarted after `REFRESH_INTERVAL` seconds.
 - Empty results display `No data`. Content is clipped to panel height and does not scroll automatically.
 - Cell widths are fixed. A numeric value that is too wide becomes all `#` characters; an overlong text value keeps a trailing `.` (for example, `abcdefg.` in an eight-character cell).
 - Warning cells use black text on yellow; error cells and failed-panel content use white text on red. `NO_COLOR` only disables ANSI colors.
-- The footer displays `Refresh: Ns | Press q to exit.`
+- The footer displays `Refresh: Ns | Press q to exit.`; this value is the
+  command restart interval, not the live stream redraw interval.
 - If the terminal becomes too small, execution pauses and shows the required size. It resumes and fully redraws after the terminal is enlarged. `q` still exits while paused.
 
 ## 6. Complete simple configuration

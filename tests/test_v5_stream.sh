@@ -139,4 +139,31 @@ export PATH
 )
 
 rm -rf "$STREAM_TEST_TEMP_DIR"
-printf 'PASS: local and SSH raw streams, bounded buffers, validation, and cleanup\n'
+
+EVENT_TEST_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc-v5-event.XXXXXX")" || exit 1
+EVENT_FIFO="$EVENT_TEST_TEMP_DIR/input.fifo"
+EVENT_STDIN_FIFO="$EVENT_TEST_TEMP_DIR/stdin.fifo"
+EVENT_SNAPSHOT="$EVENT_TEST_TEMP_DIR/snapshot"
+mkfifo "$EVENT_FIFO" "$EVENT_STDIN_FIFO" || exit 1
+source "$TEST_ROOT/bin/lhc"
+STREAM_REFRESH_PENDING=0
+trap handle_stream_refresh USR1
+exec 8<&0
+exec 0<>"$EVENT_STDIN_FIFO"
+stream_collect "$EVENT_FIFO" "$EVENT_SNAPSHOT" 3 "$$" &
+COLLECTOR_PID=$!
+(
+  sleep 0.1
+  printf 'event-line\n' >"$EVENT_FIFO"
+) &
+WRITER_PID=$!
+
+wait_for_quit_or_timeout 1 || true
+[[ "$STREAM_REFRESH_PENDING" -eq 1 ]] || fail_test "stream event did not interrupt the main wait"
+assert_equal "event-line" "$(<"$EVENT_SNAPSHOT")" "stream event snapshot"
+wait "$WRITER_PID"
+wait "$COLLECTOR_PID"
+exec 0<&8
+trap - USR1
+rm -rf "$EVENT_TEST_TEMP_DIR"
+printf 'PASS: local and SSH raw streams, event-driven refresh, bounded buffers, validation, and cleanup\n'

@@ -22,4 +22,6 @@
   minimum-size and bounds checks still apply.
 - `PANEL_STREAM[index]=1` enables continuous raw output for local or SSH panels.
   The rolling buffer is limited to the panel's effective content height; stream
-  table and transpose panels are rejected.
+  table and transpose panels are rejected. Each complete newline-terminated
+  output line wakes the main renderer immediately; `REFRESH_INTERVAL` only
+  controls restart after the command exits.

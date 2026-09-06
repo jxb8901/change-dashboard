@@ -54,9 +54,9 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.2 multi-server SSH execution, partial refresh, continuous raw stream panels,
-fixed-width tables, multi-row transpose layout, automatic sizing, and
-percentage-based responsive panel geometry are implemented.
+V5.2 multi-server SSH execution, partial refresh, continuous raw stream panels
+with event-driven redraws, fixed-width tables, multi-row transpose layout,
+automatic sizing, and percentage-based responsive panel geometry are implemented.
 
 The dashboard remains compatible with V1 raw-output configs. It accepts a Bash
 source config file, validates panel layout and optional table rules, runs local

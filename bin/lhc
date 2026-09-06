@@ -2,7 +2,7 @@
 # Author: Jeffrey + ChatGPT
 # Changelog:
 # - 2026-09-06 V5.2: Add continuous raw local and SSH stream panels with
-#   height-bounded ring buffers, live redraws, and clean command termination.
+#   height-bounded ring buffers, event-driven redraws, and clean termination.
 # - 2026-09-06 V5.1: Accept integer or percentage panel geometry, resolve
 #   responsive dimensions after terminal resize, and preserve source values.
 # - 2026-09-06 V5: Refresh panels independently, reuse SSH connections with
@@ -55,6 +55,8 @@ RESOLVED_WIDTHS=""
 FUNCTION_RESULT=""
 PANEL_COMMAND_TEMP_DIR=""
 PANEL_COMMAND_JOB_COUNT=0
+STREAM_REFRESH_PENDING=0
+STREAM_REFRESH_PID=""
 AUTO_PANEL_HEIGHT_INDEX=""
 
 declare -a SSH_SERVERS=()
@@ -219,6 +221,12 @@ cleanup_panel_commands() {
   SSH_CONTROL_PATHS=()
   PANEL_COMMAND_JOB_COUNT=0
   PANEL_COMMAND_SCHEDULER_INITIALIZED=0
+}
+
+handle_stream_refresh() {
+  # Signals only wake the main event loop. Terminal drawing remains in the
+  # main shell so a burst of stream output cannot interleave ANSI sequences.
+  STREAM_REFRESH_PENDING=1
 }
 
 handle_interrupt() {
@@ -1570,6 +1578,7 @@ stream_collect() {
   local fifo="$1"
   local snapshot_file="$2"
   local capacity="$3"
+  local refresh_pid="${4:-}"
   local line temporary start position slot
   local count=0
   local next=0
@@ -1595,6 +1604,9 @@ stream_collect() {
       printf '%s\n' "${lines[$slot]}" >>"$temporary"
     done
     mv -f "$temporary" "$snapshot_file"
+    if [[ -n "$refresh_pid" ]]; then
+      kill -USR1 "$refresh_pid" 2>/dev/null || true
+    fi
   done <"$fifo"
 }
 
@@ -1851,12 +1863,12 @@ start_panel_command_job() {
   fi
 
   (
-    local child_pid="" collector_pid="" exit_status output_target
+    local child_pid="" collector_pid="" exit_status output_target refresh_pid="${STREAM_REFRESH_PID:-}"
     trap 'if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; fi; if [[ -n "$collector_pid" ]] && kill -0 "$collector_pid" 2>/dev/null; then kill "$collector_pid" 2>/dev/null || true; fi; wait "$child_pid" 2>/dev/null || true; wait "$collector_pid" 2>/dev/null || true; exit 143' TERM INT
 
     output_target="$output_file"
     if [[ "$stream_mode" == "1" ]]; then
-      stream_collect "$fifo_file" "$output_file" "$stream_capacity" &
+      stream_collect "$fifo_file" "$output_file" "$stream_capacity" "$refresh_pid" &
       collector_pid=$!
       output_target="$fifo_file"
     fi
@@ -1881,6 +1893,9 @@ start_panel_command_job() {
     fi
     trap - TERM INT
     printf '%s\n' "$exit_status" >"$status_file"
+    if [[ "$stream_mode" == "1" && -n "$refresh_pid" ]]; then
+      kill -USR1 "$refresh_pid" 2>/dev/null || true
+    fi
   ) &
   PANEL_COMMAND_PIDS[$job]=$!
 }
@@ -2372,6 +2387,14 @@ run_dashboard_loop() {
 
     run_panel_commands
 
+    # A stream collector interrupts the keyboard wait through SIGUSR1. The
+    # snapshot comparison still happens in run_panel_commands, where all
+    # rendering is serialized in the main shell.
+    if (( STREAM_REFRESH_PENDING == 1 )); then
+      STREAM_REFRESH_PENDING=0
+      continue
+    fi
+
     if wait_for_quit_or_timeout 1; then
       return 0
     fi
@@ -2399,6 +2422,8 @@ main() {
   trap cleanup_terminal EXIT
   trap handle_interrupt INT
   trap handle_resize WINCH
+  STREAM_REFRESH_PID="$$"
+  trap handle_stream_refresh USR1
 
   setup_terminal
   initialize_loading_dashboard
