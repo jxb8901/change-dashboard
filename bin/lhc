@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
-# - 2026-09-06 V5.2: Add continuous raw local and SSH stream panels with
+# - 2026-09-06 V5.2: Add continuous raw/table local and SSH stream panels with
 #   height-bounded ring buffers, event-driven redraws, and clean termination.
 # - 2026-09-06 V5.1: Accept integer or percentage panel geometry, resolve
 #   responsive dimensions after terminal resize, and preserve source values.
@@ -353,7 +353,7 @@ validate_config() {
 }
 
 validate_stream_configs() {
-  local index value
+  local index value layout
 
   for index in "${!PANEL_STREAM[@]}"; do
     value="${PANEL_STREAM[$index]}"
@@ -362,8 +362,11 @@ validate_stream_configs() {
       return 1
     fi
     if [[ "$value" == "1" ]] && has_array_index PANEL_TABLE_COLUMNS "$index"; then
-      error "PANEL_STREAM[$index] is only supported for raw panels"
-      return 1
+      layout="${PANEL_TABLE_LAYOUT[$index]:-table}"
+      if [[ "$layout" != "table" ]]; then
+        error "PANEL_STREAM[$index] supports raw or table layout, not $layout"
+        return 1
+      fi
     fi
   done
 }
@@ -1556,6 +1559,12 @@ initialize_loading_dashboard() {
 get_stream_capacity() {
   local panel_index="$1"
   local capacity=$((PANEL_EFFECTIVE_HEIGHTS[panel_index] - 2))
+  local layout="${PANEL_TABLE_LAYOUT[$panel_index]:-table}"
+
+  if has_array_index PANEL_TABLE_COLUMNS "$panel_index" && [[ "$layout" == "table" ]]; then
+    # Table row zero is the rendered header, so reserve one content row for it.
+    capacity=$((capacity - 1))
+  fi
 
   (( capacity < 1 )) && capacity=1
   FUNCTION_RESULT="$capacity"
@@ -1612,7 +1621,14 @@ stream_collect() {
 
 aggregate_ssh_stream_output() {
   local panel_index="$1" job alias status output line
-  local aggregate="" failed=0
+  local aggregate="" failed=0 table_mode=0 column_count=0 column
+
+  if has_array_index PANEL_TABLE_COLUMNS "$panel_index"; then
+    table_mode=1
+    for column in ${PANEL_TABLE_COLUMNS[$panel_index]}; do
+      column_count=$((column_count + 1))
+    done
+  fi
 
   for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
@@ -1621,15 +1637,31 @@ aggregate_ssh_stream_output() {
     status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
     output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
 
-    if [[ -n "$status" && "$status" -ne 0 ]]; then
-      aggregate="${aggregate}${alias} SSH_FAILED (exit ${status})"$'\n'
-      failed=1
-    elif [[ -z "$output" ]]; then
-      aggregate="${aggregate}${alias} No data"$'\n'
+    if (( table_mode == 1 )); then
+      if [[ -n "$status" && "$status" -ne 0 ]]; then
+        build_ssh_synthetic_row "$alias" "SSH_FAILED" "$column_count"
+        aggregate="${aggregate}${FUNCTION_RESULT}"$'\n'
+        failed=1
+      elif [[ -z "$output" ]]; then
+        build_ssh_synthetic_row "$alias" "No_data" "$column_count"
+        aggregate="${aggregate}${FUNCTION_RESULT}"$'\n'
+      else
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          [[ -z "$line" ]] && continue
+          aggregate="${aggregate}${alias} ${line}"$'\n'
+        done <<<"$output"
+      fi
     else
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        aggregate="${aggregate}${alias} ${line}"$'\n'
-      done <<<"$output"
+      if [[ -n "$status" && "$status" -ne 0 ]]; then
+        aggregate="${aggregate}${alias} SSH_FAILED (exit ${status})"$'\n'
+        failed=1
+      elif [[ -z "$output" ]]; then
+        aggregate="${aggregate}${alias} No data"$'\n'
+      else
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          aggregate="${aggregate}${alias} ${line}"$'\n'
+        done <<<"$output"
+      fi
     fi
   done
 
@@ -1638,7 +1670,11 @@ aggregate_ssh_stream_output() {
   PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
   PANEL_SSH_FAILURE_ROWS[$panel_index]=""
   prepare_panel_output "$panel_index"
-  if (( failed == 1 )); then
+  if [[ "${PANEL_RENDER_MODES[$panel_index]:-raw}" == "table" ]]; then
+    mark_ssh_failure_rows "$panel_index"
+    evaluate_table_output "$panel_index"
+  fi
+  if (( failed == 1 )) && [[ "${PANEL_RENDER_MODES[$panel_index]}" == "raw" ]]; then
     PANEL_RENDER_MODES[$panel_index]="failed"
     PANEL_STATUSES[$panel_index]="FAILED"
   fi
@@ -1938,7 +1974,7 @@ finalize_panel_command_output() {
 
 aggregate_ssh_panel_output() {
   local panel_index="$1" job alias exit_status output line
-  local aggregate="" failed=0 row_number=0 failure_rows=" "
+  local aggregate="" failed=0
   local table_mode=0 column_count=0 column
 
   if has_array_index PANEL_TABLE_COLUMNS "$panel_index"; then
@@ -1958,18 +1994,14 @@ aggregate_ssh_panel_output() {
       if [[ "$exit_status" -ne 0 ]]; then
         build_ssh_synthetic_row "$alias" "SSH_FAILED" "$column_count"
         aggregate="${aggregate}${FUNCTION_RESULT}"$'\n'
-        row_number=$((row_number + 1))
-        failure_rows="${failure_rows}${row_number} "
         failed=1
       elif [[ -z "$output" ]]; then
         build_ssh_synthetic_row "$alias" "No_data" "$column_count"
         aggregate="${aggregate}${FUNCTION_RESULT}"$'\n'
-        row_number=$((row_number + 1))
       else
         while IFS= read -r line || [[ -n "$line" ]]; do
           [[ -z "$line" ]] && continue
           aggregate="${aggregate}${alias} ${line}"$'\n'
-          row_number=$((row_number + 1))
         done <<< "$output"
       fi
     else
@@ -1991,8 +2023,12 @@ aggregate_ssh_panel_output() {
     limit_stream_output "$panel_index"
     PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
   fi
-  PANEL_SSH_FAILURE_ROWS[$panel_index]="${failure_rows% }"
+  PANEL_SSH_FAILURE_ROWS[$panel_index]=""
   prepare_panel_output "$panel_index"
+  if [[ "${PANEL_RENDER_MODES[$panel_index]:-raw}" == "table" ]]; then
+    mark_ssh_failure_rows "$panel_index"
+    evaluate_table_output "$panel_index"
+  fi
   if (( failed == 1 )) && [[ "${PANEL_RENDER_MODES[$panel_index]}" == "raw" ]]; then
     PANEL_RENDER_MODES[$panel_index]="failed"
     PANEL_STATUSES[$panel_index]="FAILED"
@@ -2008,6 +2044,21 @@ build_ssh_synthetic_row() {
     position=$((position + 1))
   done
   FUNCTION_RESULT="$row"
+}
+
+mark_ssh_failure_rows() {
+  local index="$1" row=1 line marker failure_rows=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    get_word_at_position "$line" 1
+    marker="$FUNCTION_RESULT"
+    if [[ "$marker" == "SSH_FAILED" ]]; then
+      failure_rows="${failure_rows}${row} "
+    fi
+    row=$((row + 1))
+  done <<< "${PANEL_TABLE_ROWS[$index]:-}"
+
+  PANEL_SSH_FAILURE_ROWS[$index]="${failure_rows% }"
 }
 
 prepare_panel_output() {
@@ -2316,6 +2367,14 @@ wait_for_quit_or_timeout() {
     return
   fi
 
+  # A stream refresh signal can interrupt the blocking read. Check stdin once
+  # more without blocking so a q that arrived with the signal is handled
+  # before the event loop starts another refresh cycle.
+  if IFS= read -rsn1 -t 0 key; then
+    [[ "$key" == "q" ]]
+    return
+  fi
+
   return 1
 }
 
@@ -2363,8 +2422,13 @@ process_terminal_resize() {
   for panel_index in "${PANEL_ORDER[@]}"; do
     [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-0}" -eq 1 ]] || continue
     [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 ]] || continue
-    limit_stream_output "$panel_index"
-    PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+    if has_array_index PANEL_SSH_ALIASES "$panel_index"; then
+      aggregate_ssh_stream_output "$panel_index"
+    else
+      limit_stream_output "$panel_index"
+      PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+      prepare_panel_output "$panel_index"
+    fi
   done
 
   FORCE_FULL_REDRAW=1

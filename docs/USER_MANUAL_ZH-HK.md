@@ -111,7 +111,7 @@ footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機�
 
 | 變數 | 例子 | 說明 |
 | --- | --- | --- |
-| `PANEL_STREAM[i]` | `1` | 啟用 panel `i` 的持續 raw 輸出；有效值是 `0` 或 `1`，預設是 snapshot 模式。滾動 buffer 上限等於 panel 可見內容高度。 |
+| `PANEL_STREAM[i]` | `1` | 啟用 panel `i` 的持續 raw 或 `table` 輸出；有效值是 `0` 或 `1`，預設是 snapshot 模式。滾動 buffer 按 panel 有效高度計算。 |
 
 ### 4.3 Raw 面板
 
@@ -120,8 +120,9 @@ footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機�
 設定 `PANEL_STREAM[i]=1` 可把 raw panel 變成持續輸出模式。LHC 會在命令
 仍然運行時讀取完整 newline 行，並只保留最近
 `PANEL_EFFECTIVE_HEIGHTS[i] - 2` 行，因此不需要另外設定 stream 行數。
-本設定同時適用於本機及 raw SSH panel；stream table 和 transpose panel
-會被拒絕。命令退出後保留最後 buffer，並在 `REFRESH_INTERVAL` 秒後重啟。
+本設定同時適用於本機及 raw SSH panel。Table stream 的規則見下文；
+transpose stream panel 仍不支援。命令退出後保留最後 buffer，並在
+`REFRESH_INTERVAL` 秒後重啟。
 如果輸出程序本身有 stdout buffering，可能需要使用 `stdbuf -oL` 等
 line-buffering 設定。
 
@@ -168,6 +169,26 @@ PANEL_ERROR_RULES[1]="DEPTH:>50 STATUS:==DOWN"
 - `PANEL_TABLE_WIDTHS[i]` 在 `table` layout 可省略最右欄的 width；該欄會取得扣除其他寬度及間隔後的全部剩餘寬度。整個設定省略時則按可用寬度平均分配。
 - 表格欄位之間固定有一個字元間距。指定寬度的總和加間距不能超過面板內寬，即 `PANEL_WIDTHS[i] - 2`。
 - 數字靠右，文字及標題靠左。數字格式是可選負號、整數或小數，例如 `-2`、`0`、`12.50`。
+
+`table` panel 也可以設定 `PANEL_STREAM[i]=1`。每個完整 newline 行會被
+追加為一筆新 row，只保留 header 以下可容納的最新 rows，因此不需要另設
+stream row 數量。現有 table parser、width 及 cell rules 會在每次更新時套用。
+如果可見 buffer 中有欄位數不符的 row，panel 會暫時回退為 raw；該 row
+滾出 buffer 後會恢復 table。SSH table stream 要把 alias prefix 納入來源
+欄位，例如 `SERVER`；alias 仍按配置順序排列，SSH failure 使用現有
+synthetic failure row。
+
+```bash
+PANEL_TITLES[0]="Live Services"
+PANEL_COMMANDS[0]="tail -f /tmp/services.tsv"
+PANEL_STREAM[0]=1
+PANEL_TABLE_COLUMNS[0]="SERVICE COUNT STATUS"
+PANEL_TABLE_LAYOUT[0]="table"
+PANEL_X[0]=1
+PANEL_Y[0]=1
+PANEL_WIDTHS[0]=48
+PANEL_HEIGHTS[0]=8
+```
 
 Raw panel 若設定 `PANEL_WARN_RULES`、`PANEL_ERROR_RULES` 或 `PANEL_INFO_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
 
@@ -269,7 +290,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 - 初始畫面先顯示邊框、標題及 `Loading...`；完成的面板會逐一替換內容。
 - 面板標題置中顯示；標題過長時會按面板可用寬度截斷。
 - raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示字段名稱/字段值 block，且不增加獨立表格列頭。
-- stream raw panel 會在命令仍然運行時以事件驅動方式更新，只保留最近的可見內容高度行數；命令退出後按 `REFRESH_INTERVAL` 秒重啟。
+- stream raw 及 table panel 會在命令仍然運行時以事件驅動方式更新，只保留最近的可見內容高度行數；命令退出後按 `REFRESH_INTERVAL` 秒重啟。
 - 空結果顯示 `No data`。資料按面板高度裁剪，不會自動滾動。
 - cell 寬度是固定的。超寬數字全部顯示為 `#`；超寬文字在最後保留 `.`，例如寬度 8 的文字可能顯示 `abcdefg.`。
 - warning cell 是黑字黃底；error cell 及失敗面板內容是白字紅底。`NO_COLOR` 只關閉 ANSI 顏色。

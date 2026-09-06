@@ -124,7 +124,7 @@ the dashboard pauses until the terminal is large enough.
 
 | Variable | Example | Description |
 | --- | --- | --- |
-| `PANEL_STREAM[i]` | `1` | Enables continuous raw output for panel `i`; valid values are `0` and `1`, and the default is snapshot mode. The rolling buffer is the panel's visible content height. |
+| `PANEL_STREAM[i]` | `1` | Enables continuous raw or `table` output for panel `i`; valid values are `0` and `1`, and the default is snapshot mode. The rolling buffer is derived from the panel's effective height. |
 
 ### 4.3 Raw panels
 
@@ -134,8 +134,8 @@ Set `PANEL_STREAM[i]=1` to run a raw panel as a continuous stream. LHC reads
 complete newline-terminated lines while the command is still running and keeps
 the most recent `PANEL_EFFECTIVE_HEIGHTS[i] - 2` lines, so no separate stream
 line-count setting is required. The same setting works for local and raw SSH
-panels; stream table and transpose panels are rejected. When the command exits,
-the final buffer remains visible and the panel is restarted after
+panels. Table stream panels are described below; transpose stream panels remain
+unsupported. When the command exits, the final buffer remains visible and the panel is restarted after
 `REFRESH_INTERVAL` seconds. A producer that buffers stdout may need a
 line-buffering option such as `stdbuf -oL`.
 
@@ -182,6 +182,28 @@ Rules:
 - In `table` layout, `PANEL_TABLE_WIDTHS[i]` contains one positive width per source column. If only the final width is omitted, it fills all remaining content width. If the list is omitted entirely, widths are divided equally.
 - LHC inserts a fixed one-character gap between columns. Configured widths plus gaps must fit `PANEL_WIDTHS[i] - 2`.
 - Numbers are right-aligned; headers and text are left-aligned. A number may have an optional minus sign, integer digits, and fractional digits, such as `-2`, `0`, or `12.50`.
+
+A `table` panel may also set `PANEL_STREAM[i]=1`. Each complete newline-
+terminated output line is appended as a new row, and only the newest rows that
+fit below the rendered header are retained. No separate stream row-count
+setting is required. The existing table parser, widths, and cell rules are
+applied on every update. If a visible row has the wrong field count, the panel
+temporarily falls back to raw output until that row rolls out of the buffer.
+For SSH table streams, include the alias prefix as a source column such as
+`SERVER`; aliases remain in configured order and SSH failures use the existing
+synthetic failure row.
+
+```bash
+PANEL_TITLES[0]="Live Services"
+PANEL_COMMANDS[0]="tail -f /tmp/services.tsv"
+PANEL_STREAM[0]=1
+PANEL_TABLE_COLUMNS[0]="SERVICE COUNT STATUS"
+PANEL_TABLE_LAYOUT[0]="table"
+PANEL_X[0]=1
+PANEL_Y[0]=1
+PANEL_WIDTHS[0]=48
+PANEL_HEIGHTS[0]=8
+```
 
 If `PANEL_WARN_RULES`, `PANEL_ERROR_RULES`, or `PANEL_INFO_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
 
@@ -283,7 +305,7 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
 - The initial screen draws borders, titles, and `Loading...`; completed panels replace their content progressively.
 - Panel titles are centered and clipped to the available title width when necessary.
 - Raw panels show text, table panels show a header and data rows, and transpose panels show field-name/value blocks without a separate table-header row.
-- Stream raw panels update while their command is still running and retain only
+- Stream raw and table panels update while their command is still running and retain only
   the most recent visible content-height lines. Updates are event-driven;
   `REFRESH_INTERVAL` controls only when an exited command is restarted. A
   stream command that exits is restarted after `REFRESH_INTERVAL` seconds.
