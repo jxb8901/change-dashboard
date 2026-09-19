@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-20 V5.3: Bound stream shutdown, track real child ownership, recycle
+#   completed jobs, and keep keyboard handling live during continuous streams.
 # - 2026-09-06 V5.2: Add continuous raw/table local and SSH stream panels with
 #   height-bounded ring buffers, event-driven redraws, and clean termination.
 # - 2026-09-06 V5.1: Accept integer or percentage panel geometry, resolve
@@ -58,6 +60,13 @@ PANEL_COMMAND_JOB_COUNT=0
 STREAM_REFRESH_PENDING=0
 STREAM_REFRESH_PID=""
 AUTO_PANEL_HEIGHT_INDEX=""
+CLEANUP_IN_PROGRESS=0
+LHC_OWNER_PID="$$"
+JOB_TERM_GRACE_ATTEMPTS=10
+JOB_KILL_GRACE_ATTEMPTS=10
+JOB_GRACE_SLEEP=0.05
+STREAM_EVENT_SLEEP=0.05
+SSH_CONTROL_PERSIST_SECONDS=30
 
 declare -a SSH_SERVERS=()
 declare -a PANEL_TITLES=()
@@ -95,6 +104,11 @@ declare -a PREVIOUS_FRAME_STYLES=()
 declare -a CURRENT_FRAME_INDEX=()
 declare -a PREVIOUS_FRAME_INDEX=()
 declare -a PANEL_COMMAND_PIDS=()
+declare -a PANEL_COMMAND_WRAPPER_STARTS=()
+declare -a PANEL_COMMAND_CHILD_PID_FILES=()
+declare -a PANEL_COMMAND_CHILD_IDENTITY_FILES=()
+declare -a PANEL_COMMAND_COLLECTOR_PID_FILES=()
+declare -a PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=()
 declare -a PANEL_COMMAND_OUTPUT_FILES=()
 declare -a PANEL_COMMAND_STATUS_FILES=()
 declare -a PANEL_COMMAND_COLLECTED=()
@@ -112,6 +126,7 @@ declare -a PANEL_COMMAND_LAST_STATUSES=()
 declare -a PANEL_COMMAND_COUNTS=()
 declare -a PANEL_COMMAND_COMPLETED_COUNTS=()
 declare -a PANEL_COMMAND_ACTIVE=()
+declare -a PANEL_COMMAND_STATES=()
 declare -a PANEL_NEXT_RUN_SECONDS=()
 declare -a PANEL_COMMAND_START_JOBS=()
 PANEL_COMMAND_SCHEDULER_INITIALIZED=0
@@ -146,23 +161,244 @@ cleanup_terminal() {
   fi
 }
 
-cleanup_panel_commands() {
-  local index pid file
+get_process_identity() {
+  local pid="$1"
 
-  for index in "${!PANEL_COMMAND_PIDS[@]}"; do
-    pid="${PANEL_COMMAND_PIDS[$index]}"
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
+  ps -p "$pid" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//'
+}
+
+get_process_parent_pid() {
+  local pid="$1"
+
+  ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]'
+}
+
+process_is_running() {
+  local pid="$1" state
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$state" && "$state" != *Z* ]]
+}
+
+process_belongs_to() {
+  local pid="$1" expected_parent="$2" expected_identity="$3"
+  local actual_parent actual_identity
+
+  process_is_running "$pid" || return 1
+  actual_parent="$(get_process_parent_pid "$pid")"
+  [[ -n "$actual_parent" && "$actual_parent" == "$expected_parent" ]] || return 1
+  # During the short STARTING window the wrapper may have published its PID
+  # before ps can return the identity string. The live parent relationship is
+  # the safe fallback for that one window; once an identity is recorded it is
+  # always compared to prevent PID reuse from being signalled.
+  [[ -z "$expected_identity" ]] && return 0
+  actual_identity="$(get_process_identity "$pid")"
+  [[ "$actual_identity" == "$expected_identity" ]]
+}
+
+read_pid_file() {
+  local file="$1" pid=""
+
+  if [[ -s "$file" ]]; then
+    IFS= read -r pid <"$file" || true
+  fi
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  FUNCTION_RESULT="$pid"
+}
+
+get_owned_job_pid() {
+  local job="$1" role="$2"
+  local wrapper_pid="${PANEL_COMMAND_PIDS[$job]:-}"
+  local pid_file="" identity_file="" pid="" identity=""
+
+  case "$role" in
+    wrapper)
+      identity="${PANEL_COMMAND_WRAPPER_STARTS[$job]:-}"
+      if process_belongs_to "$wrapper_pid" "$LHC_OWNER_PID" "$identity"; then
+        FUNCTION_RESULT="$wrapper_pid"
+        return 0
+      fi
+      ;;
+    child)
+      pid_file="${PANEL_COMMAND_CHILD_PID_FILES[$job]:-}"
+      identity_file="${PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]:-}"
+      ;;
+    collector)
+      pid_file="${PANEL_COMMAND_COLLECTOR_PID_FILES[$job]:-}"
+      identity_file="${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]:-}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  [[ -n "$pid_file" && -s "$pid_file" ]] || return 1
+  read_pid_file "$pid_file" || return 1
+  pid="$FUNCTION_RESULT"
+  [[ -n "$identity_file" && -s "$identity_file" ]] || return 1
+  identity="$(<"$identity_file")"
+  if process_belongs_to "$pid" "$wrapper_pid" "$identity"; then
+    FUNCTION_RESULT="$pid"
+    return 0
+  fi
+  return 1
+}
+
+signal_owned_job_processes() {
+  local job="$1" signal="$2" include_wrapper="${3:-1}" role pid
+
+  for role in child collector; do
+    if get_owned_job_pid "$job" "$role"; then
+      pid="$FUNCTION_RESULT"
+      kill -"$signal" "$pid" 2>/dev/null || true
     fi
-    wait "$pid" 2>/dev/null || true
   done
+  if [[ "$include_wrapper" -eq 1 ]] && get_owned_job_pid "$job" wrapper; then
+    pid="$FUNCTION_RESULT"
+    kill -"$signal" "$pid" 2>/dev/null || true
+  fi
+}
 
-  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+job_has_owned_child_process() {
+  local job="$1" role
+
+  for role in child collector; do
+    if get_owned_job_pid "$job" "$role"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+job_has_owned_wrapper_process() {
+  get_owned_job_pid "$1" wrapper
+}
+
+wait_for_job_children() {
+  local attempts="$1" job active
+
+  for ((attempts = attempts; attempts > 0; attempts--)); do
+    active=0
+    for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+      [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
+      if job_has_owned_child_process "$job"; then
+        active=1
+        break
+      fi
+    done
+    (( active == 0 )) && return 0
+    sleep "$JOB_GRACE_SLEEP"
+  done
+  return 1
+}
+
+wait_for_job_wrappers() {
+  local attempts="$1" job active
+
+  for ((attempts = attempts; attempts > 0; attempts--)); do
+    active=0
+    for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+      [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
+      if job_has_owned_wrapper_process "$job"; then
+        active=1
+        break
+      fi
+    done
+    (( active == 0 )) && return 0
+    sleep "$JOB_GRACE_SLEEP"
+  done
+  return 1
+}
+
+reap_job_wrappers() {
+  local job pid
+
+  for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+    pid="${PANEL_COMMAND_PIDS[$job]:-}"
+    if [[ -n "$pid" ]] && ! process_is_running "$pid"; then
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+close_ssh_control_master() {
+  local index="$1" helper_pid attempts
+
+  (
     ssh -T \
       -o BatchMode=yes \
+      -o ConnectTimeout=1 \
       -o ControlPath="${SSH_CONTROL_PATHS[$index]}" \
       -O exit \
       "${SSH_CONTROL_TARGETS[$index]}" >/dev/null 2>&1 || true
+  ) &
+  helper_pid=$!
+  for ((attempts = JOB_TERM_GRACE_ATTEMPTS; attempts > 0; attempts--)); do
+    process_is_running "$helper_pid" || break
+    sleep "$JOB_GRACE_SLEEP"
+  done
+  if process_is_running "$helper_pid"; then
+    kill -KILL "$helper_pid" 2>/dev/null || true
+  fi
+  # Never turn the final reap into an unbounded wait. A normal child (or a
+  # zombie that has already exited) is safe to reap; an uninterruptible helper
+  # is left for the operating system rather than blocking dashboard shutdown.
+  if ! process_is_running "$helper_pid"; then
+    wait "$helper_pid" 2>/dev/null || true
+  fi
+}
+
+cleanup_panel_commands() {
+  local index job file
+
+  (( CLEANUP_IN_PROGRESS == 0 )) || return 0
+  CLEANUP_IN_PROGRESS=1
+
+  # Signal the real command and collector first while their wrapper still
+  # proves the parent/identity relationship. The wrapper trap is a bounded
+  # fallback for jobs that have not published their child PID yet.
+  for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+    [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
+    signal_owned_job_processes "$job" TERM 0 2>/dev/null || true
+    if ! job_has_owned_child_process "$job"; then
+      if get_owned_job_pid "$job" wrapper; then
+        kill -TERM "$FUNCTION_RESULT" 2>/dev/null || true
+      fi
+    fi
+  done
+  wait_for_job_children "$JOB_TERM_GRACE_ATTEMPTS" || true
+
+  # A command that ignores TERM receives KILL before its wrapper is stopped.
+  # This keeps the recorded parent relationship valid and avoids signalling a
+  # reused PID after the wrapper has exited.
+  for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+    [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
+    signal_owned_job_processes "$job" KILL 0 2>/dev/null || true
+  done
+  wait_for_job_children "$JOB_KILL_GRACE_ATTEMPTS" || true
+
+  # All known children have had a bounded TERM/KILL opportunity. Stop and reap
+  # the wrappers without an unbounded wait.
+  for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+    [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
+    if get_owned_job_pid "$job" wrapper; then
+      kill -TERM "$FUNCTION_RESULT" 2>/dev/null || true
+    fi
+  done
+  wait_for_job_wrappers "$JOB_TERM_GRACE_ATTEMPTS" || true
+  for job in "${!PANEL_COMMAND_PIDS[@]}"; do
+    [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
+    if get_owned_job_pid "$job" wrapper; then
+      kill -KILL "$FUNCTION_RESULT" 2>/dev/null || true
+    fi
+  done
+  wait_for_job_wrappers "$JOB_KILL_GRACE_ATTEMPTS" || true
+  reap_job_wrappers
+
+  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+    close_ssh_control_master "$index"
   done
 
   for index in "${!PANEL_COMMAND_OUTPUT_FILES[@]}"; do
@@ -187,6 +423,26 @@ cleanup_panel_commands() {
     [[ -n "$file" ]] && rm -f "$file"
   done
 
+  for index in "${!PANEL_COMMAND_CHILD_PID_FILES[@]}"; do
+    file="${PANEL_COMMAND_CHILD_PID_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_CHILD_IDENTITY_FILES[@]}"; do
+    file="${PANEL_COMMAND_CHILD_IDENTITY_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_COLLECTOR_PID_FILES[@]}"; do
+    file="${PANEL_COMMAND_COLLECTOR_PID_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[@]}"; do
+    file="${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
   for index in "${!PANEL_COMMAND_FIFO_FILES[@]}"; do
     file="${PANEL_COMMAND_FIFO_FILES[$index]:-}"
     [[ -n "$file" ]] && rm -f "$file"
@@ -198,6 +454,11 @@ cleanup_panel_commands() {
   fi
 
   PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_WRAPPER_STARTS=()
+  PANEL_COMMAND_CHILD_PID_FILES=()
+  PANEL_COMMAND_CHILD_IDENTITY_FILES=()
+  PANEL_COMMAND_COLLECTOR_PID_FILES=()
+  PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=()
   PANEL_COMMAND_OUTPUT_FILES=()
   PANEL_COMMAND_STATUS_FILES=()
   PANEL_COMMAND_COLLECTED=()
@@ -215,12 +476,14 @@ cleanup_panel_commands() {
   PANEL_COMMAND_COUNTS=()
   PANEL_COMMAND_COMPLETED_COUNTS=()
   PANEL_COMMAND_ACTIVE=()
+  PANEL_COMMAND_STATES=()
   PANEL_NEXT_RUN_SECONDS=()
   PANEL_COMMAND_START_JOBS=()
   SSH_CONTROL_TARGETS=()
   SSH_CONTROL_PATHS=()
   PANEL_COMMAND_JOB_COUNT=0
   PANEL_COMMAND_SCHEDULER_INITIALIZED=0
+  CLEANUP_IN_PROGRESS=0
 }
 
 handle_stream_refresh() {
@@ -1630,7 +1893,7 @@ aggregate_ssh_stream_output() {
     done
   fi
 
-  for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
     [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
     alias="${PANEL_COMMAND_ALIASES[$job]}"
@@ -1688,7 +1951,7 @@ refresh_stream_panels() {
     [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 ]] || continue
     changed=0
 
-    for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
       [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
       [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
       output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
@@ -1708,7 +1971,7 @@ refresh_stream_panels() {
     if has_array_index PANEL_SSH_ALIASES "$panel_index"; then
       aggregate_ssh_stream_output "$panel_index"
     else
-      for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+      for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
         [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
         [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
         PANEL_OUTPUTS[$panel_index]="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
@@ -1724,10 +1987,15 @@ refresh_stream_panels() {
 
 run_panel_commands() {
   local index alias target job panel_index status_file
-  local completed total now
+  local completed total now completed_panels=""
 
   if (( PANEL_COMMAND_SCHEDULER_INITIALIZED == 0 )); then
     PANEL_COMMAND_PIDS=()
+    PANEL_COMMAND_WRAPPER_STARTS=()
+    PANEL_COMMAND_CHILD_PID_FILES=()
+    PANEL_COMMAND_CHILD_IDENTITY_FILES=()
+    PANEL_COMMAND_COLLECTOR_PID_FILES=()
+    PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=()
     PANEL_COMMAND_OUTPUT_FILES=()
     PANEL_COMMAND_STATUS_FILES=()
     PANEL_COMMAND_COLLECTED=()
@@ -1745,6 +2013,7 @@ run_panel_commands() {
     PANEL_COMMAND_COUNTS=()
     PANEL_COMMAND_COMPLETED_COUNTS=()
     PANEL_COMMAND_ACTIVE=()
+    PANEL_COMMAND_STATES=()
     PANEL_NEXT_RUN_SECONDS=()
     PANEL_COMMAND_START_JOBS=()
     PANEL_COMMAND_JOB_COUNT=0
@@ -1795,7 +2064,9 @@ run_panel_commands() {
     status_file="${PANEL_COMMAND_STATUS_FILES[$job]}"
     [[ -s "$status_file" ]] || continue
 
+    PANEL_COMMAND_STATES[$job]="EXITED"
     wait "${PANEL_COMMAND_PIDS[$job]}" 2>/dev/null || true
+    PANEL_COMMAND_STATES[$job]="REAPED"
     PANEL_COMMAND_EXIT_STATUSES[$job]="$(<"$status_file")"
     PANEL_COMMAND_COLLECTED[$job]=1
     panel_index="${PANEL_COMMAND_PANEL_INDEXES[$job]}"
@@ -1803,12 +2074,17 @@ run_panel_commands() {
     PANEL_COMMAND_COMPLETED_COUNTS[$panel_index]="$completed"
     total="${PANEL_COMMAND_COUNTS[$panel_index]}"
     if (( completed == total )); then
-      finalize_panel_command_output "$panel_index"
-      PANEL_COMMAND_ACTIVE[$panel_index]=0
-      PANEL_NEXT_RUN_SECONDS[$panel_index]=$((SECONDS + REFRESH_INTERVAL))
-      cleanup_panel_result_files "$panel_index"
-      render_dashboard
+      completed_panels="${completed_panels} ${panel_index}"
     fi
+  done
+
+  for panel_index in $completed_panels; do
+    finalize_panel_command_output "$panel_index"
+    PANEL_COMMAND_ACTIVE[$panel_index]=0
+    PANEL_NEXT_RUN_SECONDS[$panel_index]=$((SECONDS + REFRESH_INTERVAL))
+    cleanup_panel_result_files "$panel_index"
+    compact_completed_panel_jobs "$panel_index"
+    render_dashboard
   done
 
   refresh_stream_panels
@@ -1827,10 +2103,99 @@ cleanup_panel_result_files() {
       "${PANEL_COMMAND_STATUS_FILES[$job]:-}" \
       "${PANEL_COMMAND_INPUT_FILES[$job]:-}" \
       "${PANEL_COMMAND_ERROR_FILES[$job]:-}" \
-      "${PANEL_COMMAND_FIFO_FILES[$job]:-}"; do
+      "${PANEL_COMMAND_FIFO_FILES[$job]:-}" \
+      "${PANEL_COMMAND_CHILD_PID_FILES[$job]:-}" \
+      "${PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]:-}" \
+      "${PANEL_COMMAND_COLLECTOR_PID_FILES[$job]:-}" \
+      "${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]:-}"; do
       [[ -n "$file" ]] && rm -f "$file"
     done
   done
+}
+
+compact_completed_panel_jobs() {
+  local panel_index="$1" job new_job=0
+  local -a new_pids=() new_wrapper_starts=() new_child_pid_files=()
+  local -a new_child_identity_files=() new_collector_pid_files=()
+  local -a new_collector_identity_files=() new_output_files=()
+  local -a new_status_files=() new_collected=() new_panel_indexes=()
+  local -a new_aliases=() new_targets=() new_input_files=() new_error_files=()
+  local -a new_exit_statuses=() new_control_paths=() new_streams=()
+  local -a new_fifo_files=() new_last_outputs=() new_last_statuses=()
+  local -a new_states=()
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] && continue
+    new_pids[$new_job]="${PANEL_COMMAND_PIDS[$job]:-}"
+    new_wrapper_starts[$new_job]="${PANEL_COMMAND_WRAPPER_STARTS[$job]:-}"
+    new_child_pid_files[$new_job]="${PANEL_COMMAND_CHILD_PID_FILES[$job]:-}"
+    new_child_identity_files[$new_job]="${PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]:-}"
+    new_collector_pid_files[$new_job]="${PANEL_COMMAND_COLLECTOR_PID_FILES[$job]:-}"
+    new_collector_identity_files[$new_job]="${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]:-}"
+    new_output_files[$new_job]="${PANEL_COMMAND_OUTPUT_FILES[$job]:-}"
+    new_status_files[$new_job]="${PANEL_COMMAND_STATUS_FILES[$job]:-}"
+    new_collected[$new_job]="${PANEL_COMMAND_COLLECTED[$job]:-}"
+    new_panel_indexes[$new_job]="${PANEL_COMMAND_PANEL_INDEXES[$job]:-}"
+    new_aliases[$new_job]="${PANEL_COMMAND_ALIASES[$job]:-}"
+    new_targets[$new_job]="${PANEL_COMMAND_TARGETS[$job]:-}"
+    new_input_files[$new_job]="${PANEL_COMMAND_INPUT_FILES[$job]:-}"
+    new_error_files[$new_job]="${PANEL_COMMAND_ERROR_FILES[$job]:-}"
+    new_exit_statuses[$new_job]="${PANEL_COMMAND_EXIT_STATUSES[$job]:-}"
+    new_control_paths[$new_job]="${PANEL_COMMAND_CONTROL_PATHS[$job]:-}"
+    new_streams[$new_job]="${PANEL_COMMAND_STREAMS[$job]:-}"
+    new_fifo_files[$new_job]="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
+    new_last_outputs[$new_job]="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
+    new_last_statuses[$new_job]="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
+    new_states[$new_job]="${PANEL_COMMAND_STATES[$job]:-}"
+    new_job=$((new_job + 1))
+  done
+
+  if (( new_job == 0 )); then
+    PANEL_COMMAND_PIDS=()
+    PANEL_COMMAND_WRAPPER_STARTS=()
+    PANEL_COMMAND_CHILD_PID_FILES=()
+    PANEL_COMMAND_CHILD_IDENTITY_FILES=()
+    PANEL_COMMAND_COLLECTOR_PID_FILES=()
+    PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=()
+    PANEL_COMMAND_OUTPUT_FILES=()
+    PANEL_COMMAND_STATUS_FILES=()
+    PANEL_COMMAND_COLLECTED=()
+    PANEL_COMMAND_PANEL_INDEXES=()
+    PANEL_COMMAND_ALIASES=()
+    PANEL_COMMAND_TARGETS=()
+    PANEL_COMMAND_INPUT_FILES=()
+    PANEL_COMMAND_ERROR_FILES=()
+    PANEL_COMMAND_EXIT_STATUSES=()
+    PANEL_COMMAND_CONTROL_PATHS=()
+    PANEL_COMMAND_STREAMS=()
+    PANEL_COMMAND_FIFO_FILES=()
+    PANEL_COMMAND_LAST_OUTPUTS=()
+    PANEL_COMMAND_LAST_STATUSES=()
+    PANEL_COMMAND_STATES=()
+  else
+    PANEL_COMMAND_PIDS=("${new_pids[@]}")
+    PANEL_COMMAND_WRAPPER_STARTS=("${new_wrapper_starts[@]}")
+    PANEL_COMMAND_CHILD_PID_FILES=("${new_child_pid_files[@]}")
+    PANEL_COMMAND_CHILD_IDENTITY_FILES=("${new_child_identity_files[@]}")
+    PANEL_COMMAND_COLLECTOR_PID_FILES=("${new_collector_pid_files[@]}")
+    PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=("${new_collector_identity_files[@]}")
+    PANEL_COMMAND_OUTPUT_FILES=("${new_output_files[@]}")
+    PANEL_COMMAND_STATUS_FILES=("${new_status_files[@]}")
+    PANEL_COMMAND_COLLECTED=("${new_collected[@]}")
+    PANEL_COMMAND_PANEL_INDEXES=("${new_panel_indexes[@]}")
+    PANEL_COMMAND_ALIASES=("${new_aliases[@]}")
+    PANEL_COMMAND_TARGETS=("${new_targets[@]}")
+    PANEL_COMMAND_INPUT_FILES=("${new_input_files[@]}")
+    PANEL_COMMAND_ERROR_FILES=("${new_error_files[@]}")
+    PANEL_COMMAND_EXIT_STATUSES=("${new_exit_statuses[@]}")
+    PANEL_COMMAND_CONTROL_PATHS=("${new_control_paths[@]}")
+    PANEL_COMMAND_STREAMS=("${new_streams[@]}")
+    PANEL_COMMAND_FIFO_FILES=("${new_fifo_files[@]}")
+    PANEL_COMMAND_LAST_OUTPUTS=("${new_last_outputs[@]}")
+    PANEL_COMMAND_LAST_STATUSES=("${new_last_statuses[@]}")
+    PANEL_COMMAND_STATES=("${new_states[@]}")
+  fi
+  PANEL_COMMAND_JOB_COUNT=$new_job
 }
 
 get_ssh_control_path() {
@@ -1857,6 +2222,10 @@ start_panel_command_job() {
   local input_file="$PANEL_COMMAND_TEMP_DIR/input.$job"
   local error_file="$PANEL_COMMAND_TEMP_DIR/error.$job"
   local fifo_file="$PANEL_COMMAND_TEMP_DIR/fifo.$job"
+  local child_pid_file="$PANEL_COMMAND_TEMP_DIR/child.$job"
+  local child_identity_file="$PANEL_COMMAND_TEMP_DIR/child-identity.$job"
+  local collector_pid_file="$PANEL_COMMAND_TEMP_DIR/collector.$job"
+  local collector_identity_file="$PANEL_COMMAND_TEMP_DIR/collector-identity.$job"
   local control_path=""
   local stream_mode="${PANEL_STREAM[$panel_index]:-0}"
   local stream_capacity=""
@@ -1873,6 +2242,11 @@ start_panel_command_job() {
 
   PANEL_COMMAND_JOB_COUNT=$((PANEL_COMMAND_JOB_COUNT + 1))
   PANEL_COMMAND_PANEL_INDEXES[$job]="$panel_index"
+  PANEL_COMMAND_WRAPPER_STARTS[$job]=""
+  PANEL_COMMAND_CHILD_PID_FILES[$job]="$child_pid_file"
+  PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]="$child_identity_file"
+  PANEL_COMMAND_COLLECTOR_PID_FILES[$job]="$collector_pid_file"
+  PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]="$collector_identity_file"
   PANEL_COMMAND_ALIASES[$job]="$alias"
   PANEL_COMMAND_TARGETS[$job]="$target"
   PANEL_COMMAND_OUTPUT_FILES[$job]="$output_file"
@@ -1883,8 +2257,13 @@ start_panel_command_job() {
   PANEL_COMMAND_FIFO_FILES[$job]=""
   PANEL_COMMAND_LAST_OUTPUTS[$job]=""
   PANEL_COMMAND_LAST_STATUSES[$job]=""
+  PANEL_COMMAND_STATES[$job]="STARTING"
   : >"$status_file"
   : >"$error_file"
+  : >"$child_pid_file"
+  : >"$child_identity_file"
+  : >"$collector_pid_file"
+  : >"$collector_identity_file"
 
   if [[ "$stream_mode" == "1" ]]; then
     PANEL_COMMAND_FIFO_FILES[$job]="$fifo_file"
@@ -1900,12 +2279,31 @@ start_panel_command_job() {
 
   (
     local child_pid="" collector_pid="" exit_status output_target refresh_pid="${STREAM_REFRESH_PID:-}"
-    trap 'if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; fi; if [[ -n "$collector_pid" ]] && kill -0 "$collector_pid" 2>/dev/null; then kill "$collector_pid" 2>/dev/null || true; fi; wait "$child_pid" 2>/dev/null || true; wait "$collector_pid" 2>/dev/null || true; exit 143' TERM INT
+
+    terminate_job_process() {
+      local process_pid="$1" attempt
+      [[ -n "$process_pid" ]] || return 0
+      kill -TERM "$process_pid" 2>/dev/null || true
+      for ((attempt = 0; attempt < JOB_TERM_GRACE_ATTEMPTS; attempt++)); do
+        kill -0 "$process_pid" 2>/dev/null || return 0
+        sleep "$JOB_GRACE_SLEEP"
+      done
+      kill -KILL "$process_pid" 2>/dev/null || true
+    }
+
+    handle_job_signal() {
+      terminate_job_process "$child_pid"
+      terminate_job_process "$collector_pid"
+      exit 143
+    }
+    trap handle_job_signal TERM INT
 
     output_target="$output_file"
     if [[ "$stream_mode" == "1" ]]; then
       stream_collect "$fifo_file" "$output_file" "$stream_capacity" "$refresh_pid" &
       collector_pid=$!
+      printf '%s\n' "$collector_pid" >"$collector_pid_file"
+      get_process_identity "$collector_pid" >"$collector_identity_file"
       output_target="$fifo_file"
     fi
 
@@ -1915,13 +2313,15 @@ start_panel_command_job() {
         -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=yes \
         -o ControlMaster=auto \
-        -o ControlPersist=yes \
+        -o ControlPersist="${SSH_CONTROL_PERSIST_SECONDS}" \
         -o ControlPath="$control_path" \
         "$target" bash -s <"$input_file" >"$output_target" 2>"$error_file" &
     else
       bash -c "${PANEL_COMMANDS[$panel_index]}" >"$output_target" 2>"$error_file" &
     fi
     child_pid=$!
+    printf '%s\n' "$child_pid" >"$child_pid_file"
+    get_process_identity "$child_pid" >"$child_identity_file"
     wait "$child_pid"
     exit_status=$?
     if [[ "$stream_mode" == "1" ]]; then
@@ -1934,6 +2334,8 @@ start_panel_command_job() {
     fi
   ) &
   PANEL_COMMAND_PIDS[$job]=$!
+  PANEL_COMMAND_WRAPPER_STARTS[$job]="$(get_process_identity "${PANEL_COMMAND_PIDS[$job]}")"
+  PANEL_COMMAND_STATES[$job]="RUNNING"
 }
 
 finalize_panel_command_output() {
@@ -1944,8 +2346,8 @@ finalize_panel_command_output() {
     return
   fi
 
-  for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
-    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]}" == "$panel_index" ]] || continue
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
     output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
     if [[ "$exit_status" -eq 0 ]]; then
@@ -1984,8 +2386,8 @@ aggregate_ssh_panel_output() {
     done
   fi
 
-  for ((job = PANEL_COMMAND_START_JOBS[panel_index]; job < PANEL_COMMAND_JOB_COUNT; job++)); do
-    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]}" == "$panel_index" ]] || continue
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
     alias="${PANEL_COMMAND_ALIASES[$job]}"
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
     output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
@@ -2451,11 +2853,16 @@ run_dashboard_loop() {
 
     run_panel_commands
 
-    # A stream collector interrupts the keyboard wait through SIGUSR1. The
-    # snapshot comparison still happens in run_panel_commands, where all
-    # rendering is serialized in the main shell.
+    # A stream collector interrupts the keyboard wait through SIGUSR1. Consume
+    # the coalesced notification with a non-blocking keyboard check, then
+    # briefly yield before the next scheduler tick. The continue is therefore
+    # never a path that bypasses input handling or creates a hot loop.
     if (( STREAM_REFRESH_PENDING == 1 )); then
       STREAM_REFRESH_PENDING=0
+      if wait_for_quit_or_timeout 0; then
+        return 0
+      fi
+      sleep "$STREAM_EVENT_SLEEP"
       continue
     fi
 

@@ -35,3 +35,6 @@ The `v5/` directory defines SSH multiplexing, contains/not-contains rules,
 automatic sizing for the final panel and rightmost table field, and responsive
 percentage-based panel geometry. V5.2 also defines height-bounded continuous
 raw/table stream panels for local and SSH commands, with event-driven redraws.
+V5.3 adds bounded TERM/KILL shutdown, active PID ownership checks,
+completed-job compaction, responsive keyboard handling, and bounded SSH
+control-master persistence.

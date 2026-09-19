@@ -26,3 +26,15 @@
   are rejected. Each complete newline-terminated output line wakes the main
   renderer immediately; `REFRESH_INTERVAL` only controls restart after the
   command exits.
+- V5.3 gives every active command job an explicit lifecycle and records the
+  wrapper, command, and stream collector identities. Completed jobs are
+  reaped and removed from scheduler state, so repeated refreshes do not grow
+  historical PID arrays.
+- Shutdown is bounded: LHC sends `TERM`, waits briefly, sends `KILL` to
+  TERM-resistant children, then stops and reaps wrappers. SSH control masters
+  use bounded `ControlPersist=30` and receive an explicit `-O exit` request.
+  Only a live process with the recorded parent and identity is eligible for a
+  cleanup signal.
+- `q` and `Ctrl-C` remain connected to the keyboard wait even when continuous
+  stream events are arriving. `Ctrl-Z` is documented Unix suspension behavior
+  and is not a cleanup path.

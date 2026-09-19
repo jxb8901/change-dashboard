@@ -127,7 +127,7 @@ assert_contains "$SSH_LOG_CONTENT" "-o BatchMode=yes" "BatchMode SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o ConnectTimeout=10" "connect timeout SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o StrictHostKeyChecking=yes" "host key SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o ControlMaster=auto" "SSH control master option"
-assert_contains "$SSH_LOG_CONTENT" "-o ControlPersist=yes" "SSH control persist option"
+assert_contains "$SSH_LOG_CONTENT" "-o ControlPersist=30" "bounded SSH control persist option"
 assert_contains "$SSH_LOG_CONTENT" "-o ControlPath=" "SSH control path option"
 assert_contains "$SSH_LOG_CONTENT" "bash -s" "remote Bash invocation"
 

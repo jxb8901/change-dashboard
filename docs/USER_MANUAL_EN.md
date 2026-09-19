@@ -20,7 +20,7 @@ LHC requires Bash (including Bash 3.2) and an interactive terminal; SSH panels a
 NO_COLOR=1 ./bin/lhc example/fpp.conf
 ```
 
-Press `q` to exit the dashboard. `Ctrl+C` also exits. On normal exit, `q`, an interrupt, or a runtime failure, LHC stops running child commands, removes temporary files, and restores the cursor and terminal attributes.
+Press `q` to exit the dashboard. `Ctrl+C` also exits. On normal exit, `q`, an interrupt, or a runtime failure, LHC stops running child commands, removes temporary files, and restores the cursor and terminal attributes. Active commands and stream collectors receive a bounded `TERM` grace period and then `KILL` if needed; SSH control masters are explicitly closed. `Ctrl-Z` only suspends the foreground Unix job and does not run cleanup, so use `q` or `Ctrl-C` to leave the dashboard.
 
 When no file is supplied, LHC uses `example/sample.conf` relative to the project root containing the script.
 
@@ -272,7 +272,7 @@ Each registry record is `alias|target`:
 - A target must be non-empty and contain no whitespace or `|`, and must not start with `-`. Put complex port, identity, ProxyJump, and similar settings in `~/.ssh/config`, then use the SSH config alias as the target.
 - `PANEL_SSH_ALIASES[i]` is a whitespace-separated list of unique registry aliases. Without it, the panel command runs locally.
 - SSH uses `ssh -T`, `BatchMode=yes`, `ConnectTimeout=10`, `StrictHostKeyChecking=yes`, and executes `PANEL_COMMANDS[i]` remotely through `bash -s`.
-- During one LHC run, the same SSH target reuses one underlying OpenSSH connection with `ControlMaster`/`ControlPersist`; each command still uses an independent session/channel. Connections are closed when LHC exits and are not reused by a later LHC launch.
+- During one LHC run, the same SSH target reuses one underlying OpenSSH connection with `ControlMaster`/`ControlPersist=30`; each command still uses an independent session/channel. Connections are explicitly closed when LHC exits and are not reused by a later LHC launch. The 30-second persistence bound limits the lifetime of a master after abnormal termination.
 - `ConnectTimeout=10` limits connection establishment only; there is no additional timeout after the remote command starts. Prepare keys/agent access and `known_hosts` first, because LHC will not prompt for a password or host-key confirmation.
 
 For an SSH panel, the first configured column is a synthetic server-identity field named `SERVER`; it is not emitted by the remote command. The remote command should output one value for each remaining configured data field. With the example above, each remote line should have three fields:
@@ -309,6 +309,10 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
   the most recent visible content-height lines. Updates are event-driven;
   `REFRESH_INTERVAL` controls only when an exited command is restarted. A
   stream command that exits is restarted after `REFRESH_INTERVAL` seconds.
+- Completed refresh jobs are removed from active scheduler state. This keeps
+  long-running dashboards from accumulating historical job PIDs. During
+  continuous output, stream notifications are coalesced but do not bypass the
+  keyboard wait, so `q` remains responsive.
 - Empty results display `No data`. Content is clipped to panel height and does not scroll automatically.
 - Cell widths are fixed. A numeric value that is too wide becomes all `#` characters; an overlong text value keeps a trailing `.` (for example, `abcdefg.` in an eight-character cell).
 - Warning cells use black text on yellow; error cells and failed-panel content use white text on red. `NO_COLOR` only disables ANSI colors.
@@ -378,8 +382,10 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 LHC remains compatible with Bash 3.2 and does not depend on associative arrays or `wait -n`. After changing the script or configuration, run:
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh
 ./tests/test_v4_ssh.sh
+bash tests/test_v5_stream.sh
+bash tests/test_v5_shutdown.sh
 ```
 
 The test uses fake SSH. It does not prove that production hosts, credentials, host keys, or remote commands work; verify those with real SSH targets before deployment.

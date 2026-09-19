@@ -20,7 +20,7 @@ LHC（Local Change Dashboard）是一個以 Bash 編寫的終端機儀表板，�
 NO_COLOR=1 ./bin/lhc example/fpp.conf
 ```
 
-在儀表板中按 `q` 離開；按 `Ctrl+C` 也會離開。正常離開、`q`、中斷或執行失敗時，LHC 會停止仍在執行的子命令、清理暫存檔、恢復游標及終端機顏色。
+在儀表板中按 `q` 離開；按 `Ctrl+C` 也會離開。正常離開、`q`、中斷或執行失敗時，LHC 會停止仍在執行的子命令、清理暫存檔、恢復游標及終端機顏色。活動中的命令及 stream collector 會先收到有界的 `TERM` 寬限，仍不退出時再以 `KILL` 終止；SSH control master 也會明確關閉。`Ctrl-Z` 只是 Unix 暫停前景 job，不會執行清理；請用 `q` 或 `Ctrl-C` 離開 dashboard。
 
 不指定檔案時，預設使用 `example/sample.conf`（相對於腳本所在的專案根目錄）。
 
@@ -257,7 +257,7 @@ Registry record 必須是 `alias|target`：
 - target 不可為空、不可含空白或 `|`，亦不能以 `-` 開頭。複雜的 port、identity、ProxyJump 等設定應放在 `~/.ssh/config`，再以 SSH config alias 作為 target。
 - `PANEL_SSH_ALIASES[i]` 是空白分隔且不可重複的 registry alias。面板未設定此欄位時，命令在本機執行。
 - SSH 使用 `ssh -T`、`BatchMode=yes`、`ConnectTimeout=10`、`StrictHostKeyChecking=yes`，並以 `bash -s` 在遠端執行 `PANEL_COMMANDS[i]`。
-- 同一次 LHC 執行期間，相同 SSH target 會透過 `ControlMaster`/`ControlPersist` 重用一條底層 OpenSSH 連線；每個命令仍使用獨立的 session/channel。LHC 結束時會關閉連線，下一次啟動不會重用。
+- 同一次 LHC 執行期間，相同 SSH target 會透過 `ControlMaster`/`ControlPersist=30` 重用一條底層 OpenSSH 連線；每個命令仍使用獨立的 session/channel。LHC 結束時會明確關閉連線，下一次啟動不會重用；若異常終止，master 最多按有界 persistence 保留 30 秒。
 - `ConnectTimeout=10` 只限制建立 SSH 連線的時間；成功連線後的遠端命令沒有額外 timeout。請預先準備 key/agent 及 `known_hosts`，否則不會互動式要求密碼或確認 host key。
 
 SSH 面板的第一個配置欄位是名為 `SERVER` 的合成伺服器識別字段，不由遠端命令輸出；遠端命令只應為其餘配置的數據字段各輸出一個值。例如上述設定中，每行應輸出三個欄位：
@@ -291,6 +291,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 - 面板標題置中顯示；標題過長時會按面板可用寬度截斷。
 - raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示字段名稱/字段值 block，且不增加獨立表格列頭。
 - stream raw 及 table panel 會在命令仍然運行時以事件驅動方式更新，只保留最近的可見內容高度行數；命令退出後按 `REFRESH_INTERVAL` 秒重啟。
+- 已完成的 refresh job 會從活動 scheduler state 移除，長時間運行不會無限累積歷史 PID。連續輸出事件會合併處理，但不會跳過鍵盤等待，因此 `q` 仍可快速離開。
 - 空結果顯示 `No data`。資料按面板高度裁剪，不會自動滾動。
 - cell 寬度是固定的。超寬數字全部顯示為 `#`；超寬文字在最後保留 `.`，例如寬度 8 的文字可能顯示 `abcdefg.`。
 - warning cell 是黑字黃底；error cell 及失敗面板內容是白字紅底。`NO_COLOR` 只關閉 ANSI 顏色。
@@ -359,8 +360,10 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 LHC 保持 Bash 3.2 相容性，不依賴 associative arrays 或 `wait -n`。修改腳本或配置後可執行：
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh
 ./tests/test_v4_ssh.sh
+bash tests/test_v5_stream.sh
+bash tests/test_v5_shutdown.sh
 ```
 
 測試使用 fake SSH，不代表實際部署主機、憑證、host key 或遠端命令已驗證；正式使用前仍須以實際 SSH 目標測試。

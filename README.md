@@ -35,7 +35,7 @@ Run the V3 UX example:
 ./bin/lhc example/v3-ux.conf
 ```
 
-Run the V5.2 percentage-layout example:
+Run the V5.3/V5.2 percentage-layout example:
 
 ```bash
 ./bin/lhc example/v5-percentage.conf
@@ -54,10 +54,20 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.2 multi-server SSH execution, partial refresh, continuous raw/table stream
-panels with event-driven redraws, fixed-width tables, multi-row transpose
-layout, automatic sizing, and percentage-based responsive panel geometry are
-implemented.
+V5.3 includes reliable stream shutdown and process lifecycle handling on top of
+the V5.2 multi-server SSH execution, partial refresh, continuous raw/table
+stream panels with event-driven redraws, fixed-width tables, multi-row
+transpose layout, automatic sizing, and percentage-based responsive panel
+geometry.
+
+During shutdown LHC gives active local/SSH commands and stream collectors a
+short TERM grace period, escalates to KILL when necessary, reaps wrappers
+within a bound, and closes SSH control masters. Completed refresh jobs are
+removed from active scheduler state. SSH multiplex persistence is bounded to
+30 seconds so an abnormal termination does not leave a master indefinitely.
+
+Press `q` or `Ctrl-C` for normal shutdown. `Ctrl-Z` suspends a foreground Unix
+job and cannot run cleanup; use `q` or `Ctrl-C` to leave the dashboard cleanly.
 
 The dashboard remains compatible with V1 raw-output configs. It accepts a Bash
 source config file, validates panel layout and optional table rules, runs local
@@ -100,4 +110,10 @@ Run the V5 raw-stream regression test without real SSH servers:
 
 ```bash
 bash tests/test_v5_stream.sh
+```
+
+Run the V5.3 shutdown and process-lifecycle regression test:
+
+```bash
+bash tests/test_v5_shutdown.sh
 ```
