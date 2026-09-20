@@ -35,7 +35,7 @@ Run the V3 UX example:
 ./bin/lhc example/v3-ux.conf
 ```
 
-Run the V5.3/V5.2 percentage-layout example:
+Run the V5.4/V5.3 percentage-layout example:
 
 ```bash
 ./bin/lhc example/v5-percentage.conf
@@ -54,8 +54,9 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.3 includes reliable stream shutdown and process lifecycle handling on top of
-the V5.2 multi-server SSH execution, partial refresh, continuous raw/table
+V5.4 includes explicit SSH polling-master lifecycle and reliable stream
+shutdown/process handling on top of the V5.2 multi-server SSH execution,
+partial refresh, continuous raw/table
 stream panels with event-driven redraws, fixed-width tables, multi-row
 transpose layout, automatic sizing, and percentage-based responsive panel
 geometry.
@@ -63,8 +64,12 @@ geometry.
 During shutdown LHC gives active local/SSH commands and stream collectors a
 short TERM grace period, escalates to KILL when necessary, reaps wrappers
 within a bound, and closes SSH control masters. Completed refresh jobs are
-removed from active scheduler state. SSH multiplex persistence is bounded to
-30 seconds so an abnormal termination does not leave a master indefinitely.
+removed from active scheduler state. SSH polling masters are created explicitly
+per target with bounded `ControlPersist=30`; polling commands use independent
+channels over that master, while continuous streams use dedicated
+non-multiplexed connections. LHC checks master readiness before polling,
+recreates stale/dead masters, and retries a failed polling transport once.
+An abnormal termination therefore cannot leave a master indefinitely.
 
 Press `q` or `Ctrl-C` for normal shutdown. `Ctrl-Z` suspends a foreground Unix
 job and cannot run cleanup; use `q` or `Ctrl-C` to leave the dashboard cleanly.
@@ -97,7 +102,8 @@ configured field name with its value and do not add a separate table-header row.
 Servers within a panel run concurrently and are aggregated in configured alias
 order. SSH uses `BatchMode=yes`, `ConnectTimeout=10`, and
 `StrictHostKeyChecking=yes`; configure keys, known hosts, ports, identities,
-and jump hosts before starting LHC. See
+and jump hosts before starting LHC. Polling commands share one explicit master
+per target; stream commands do not share that master. See
 [`docs/v4/01_SSH_Design.md`](docs/v4/01_SSH_Design.md) for the complete contract.
 
 Run the V4 regression test without real SSH servers:
@@ -116,4 +122,10 @@ Run the V5.3 shutdown and process-lifecycle regression test:
 
 ```bash
 bash tests/test_v5_shutdown.sh
+```
+
+Run the V5.4 SSH master lifecycle regression test:
+
+```bash
+bash tests/test_v6_ssh_lifecycle.sh
 ```

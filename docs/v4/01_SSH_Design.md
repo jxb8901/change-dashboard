@@ -14,9 +14,10 @@ LHC will support running a panel command on zero or more SSH servers.
 - Every result includes the server alias in its first column.
 - Other panels retain the existing concurrent and progressive rendering
   behavior.
-- During one LHC process, the same SSH target reuses one OpenSSH transport
-  through connection multiplexing; each command still uses an independent SSH
-  session/channel.
+- During one LHC process, the same SSH target reuses one explicit OpenSSH
+  polling master; each polling command still uses an independent SSH
+  session/channel. Continuous stream commands use dedicated non-multiplexed
+  connections and never consume the polling master's session capacity.
 - The implementation must remain compatible with Bash 3.2 and must not depend
   on associative arrays or `wait -n`.
 
@@ -153,31 +154,43 @@ The remote job executes the configured `PANEL_COMMANDS[index]` string using
 Bash on the destination host. The command is quoted as data before being passed
 to the remote Bash process so local shell expansion cannot alter it.
 
-SSH uses non-interactive settings equivalent to:
+Before a polling command starts, LHC checks the target's control socket with
+`ssh -O check`. If no ready master exists, it creates one explicitly and waits
+for it to become ready. The master uses non-interactive settings equivalent to:
 
 ```text
 BatchMode=yes
 ConnectTimeout=10
 StrictHostKeyChecking=yes
-ControlMaster=auto
-ControlPersist=yes
+ControlMaster=yes
+ControlPersist=30
 ControlPath=<process-temporary-directory>/control.<target-index>
 ```
 
-The control path is allocated once for each distinct `ssh-target` and is reused
-by all panels and refreshes in the same LHC process. This keeps the underlying
-SSH connection alive while preserving independent stdout, stderr, exit status,
-and command concurrency. Different target strings use different control
-paths, even if they may ultimately resolve to the same host. The temporary
-control sockets and master connections are closed when LHC exits; they are not
-shared across LHC launches.
+Polling channels use the same target-specific path with
+`ControlMaster=no` and `ControlPersist=no`. The control path is allocated once
+for each distinct `ssh-target` and is reused by all polling panels and
+refreshes in the same LHC process. Different target strings use different
+control paths, even if they may ultimately resolve to the same host.
+
+Stream commands use a separate connection with `ControlMaster=no`,
+`ControlPersist=no`, and `ControlPath=none`. If a polling command reports a
+transport failure and the readiness check confirms that its master is dead,
+LHC recreates the master and retries that command once. A healthy master does
+not cause a failed remote command to be retried.
+
+The temporary control sockets and master connections are closed when LHC exits;
+they are not shared across LHC launches. The bounded persistence value is
+configurable through `SSH_CONTROL_PERSIST_SECONDS` from 1 to 3600 seconds;
+the default is 30 seconds. `SSH_CONNECT_TIMEOUT_SECONDS` is configurable from
+1 to 300 seconds and defaults to 10.
 
 The dashboard therefore never prompts for a password, key passphrase, or host
 key confirmation. Authentication, SSH agent access, and `known_hosts` entries
 must be prepared before LHC starts.
 
-The 10-second value limits connection establishment only. V4 does not add a
-runtime limit for a successfully started remote command.
+The connection-timeout value limits connection establishment only. LHC does
+not add a runtime limit for a successfully started remote command.
 
 ### 3.3 Cleanup
 

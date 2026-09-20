@@ -1,7 +1,14 @@
 # V5 Requirements
 
-- SSH multiplexing keeps one OpenSSH transport per target during one LHC
-  process while commands retain independent sessions/channels.
+- V5.4 creates one explicit, bounded SSH polling master per target. Polling
+  commands use independent non-master channels over that control path, while
+  continuous SSH streams use dedicated non-multiplexed connections. LHC checks
+  readiness before use, recreates stale/dead masters, and retries a transport
+  failure at most once.
+
+- SSH polling commands keep one explicit OpenSSH transport per target during
+  one LHC process while retaining independent sessions/channels; streams use
+  dedicated connections.
 - `field:~keyword` and `field:!~keyword` warning/error rules use actual
   `PANEL_TABLE_COLUMNS` field names.
 - `PANEL_INFO_RULES` uses the same rule syntax and displays matching cells or
@@ -32,7 +39,8 @@
   historical PID arrays.
 - Shutdown is bounded: LHC sends `TERM`, waits briefly, sends `KILL` to
   TERM-resistant children, then stops and reaps wrappers. SSH control masters
-  use bounded `ControlPersist=30` and receive an explicit `-O exit` request.
+  use bounded `ControlPersist=30`, are explicitly closed with `-O exit`, and
+  are never used by stream connections.
   Only a live process with the recorded parent and identity is eligible for a
   cleanup signal.
 - `q` and `Ctrl-C` remain connected to the keyboard wait even when continuous

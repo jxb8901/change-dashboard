@@ -14,6 +14,11 @@ assert_equal() {
   [[ "$actual" == "$expected" ]] || fail_test "$description: expected [$expected], got [$actual]"
 }
 
+assert_not_contains() {
+  local content="$1" unexpected="$2" description="$3"
+  [[ "$content" != *"$unexpected"* ]] || fail_test "$description: found [$unexpected]"
+}
+
 (
   source "$TEST_ROOT/bin/lhc"
 
@@ -202,6 +207,10 @@ export PATH
   EXPECTED=$'A a-1\nA a-2\nB b-1\nB b-2\nFAIL SSH_FAILED (exit 255)'
   assert_equal "$EXPECTED" "${PANEL_OUTPUTS[0]}" "SSH stream alias order and failure output"
   assert_equal "failed" "${PANEL_RENDER_MODES[0]}" "SSH stream failure mode"
+  SSH_LOG_CONTENT="$(<"$FAKE_SSH_LOG")"
+  assert_not_contains "$SSH_LOG_CONTENT" "master " "SSH stream must not create a polling master"
+  assert_not_contains "$SSH_LOG_CONTENT" "channel " "SSH stream must not use a polling channel"
+  assert_equal "3" "$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "dedicated" { count += 1 } END { print count + 0 }')" "dedicated SSH stream connections"
   COMMAND_TEMP_DIR="$PANEL_COMMAND_TEMP_DIR"
   cleanup_panel_commands
   [[ ! -e "$COMMAND_TEMP_DIR" ]] || fail_test "SSH stream cleanup left temp directory"

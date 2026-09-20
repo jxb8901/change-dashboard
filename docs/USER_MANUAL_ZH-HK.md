@@ -257,8 +257,8 @@ Registry record 必須是 `alias|target`：
 - target 不可為空、不可含空白或 `|`，亦不能以 `-` 開頭。複雜的 port、identity、ProxyJump 等設定應放在 `~/.ssh/config`，再以 SSH config alias 作為 target。
 - `PANEL_SSH_ALIASES[i]` 是空白分隔且不可重複的 registry alias。面板未設定此欄位時，命令在本機執行。
 - SSH 使用 `ssh -T`、`BatchMode=yes`、`ConnectTimeout=10`、`StrictHostKeyChecking=yes`，並以 `bash -s` 在遠端執行 `PANEL_COMMANDS[i]`。
-- 同一次 LHC 執行期間，相同 SSH target 會透過 `ControlMaster`/`ControlPersist=30` 重用一條底層 OpenSSH 連線；每個命令仍使用獨立的 session/channel。LHC 結束時會明確關閉連線，下一次啟動不會重用；若異常終止，master 最多按有界 persistence 保留 30 秒。
-- `ConnectTimeout=10` 只限制建立 SSH 連線的時間；成功連線後的遠端命令沒有額外 timeout。請預先準備 key/agent 及 `known_hosts`，否則不會互動式要求密碼或確認 host key。
+- 同一次 LHC 執行期間，相同 SSH target 的 polling 命令會共用一條明確建立、具有限制的 master（預設 `ControlPersist=30`），每個命令仍使用獨立的 session/channel。LHC 使用前會檢查 master 是否 ready；發現 stale/dead master 時會重建，transport failure 最多重試一次。Continuous stream 會使用獨立、非 multiplexed connection，不會消耗 polling master 的 session capacity。LHC 結束時會明確關閉連線，下一次啟動不會重用。
+- `SSH_CONTROL_PERSIST_SECONDS` 可設為 1 至 3600 秒，`SSH_CONNECT_TIMEOUT_SECONDS` 可設為 1 至 300 秒，預設分別是 `30` 及 `10`。連線 timeout 只限制建立 SSH 連線的時間；成功連線後的遠端命令沒有額外 timeout。請預先準備 key/agent 及 `known_hosts`，否則不會互動式要求密碼或確認 host key。
 
 SSH 面板的第一個配置欄位是名為 `SERVER` 的合成伺服器識別字段，不由遠端命令輸出；遠端命令只應為其餘配置的數據字段各輸出一個值。例如上述設定中，每行應輸出三個欄位：
 
@@ -360,10 +360,11 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 LHC 保持 Bash 3.2 相容性，不依賴 associative arrays 或 `wait -n`。修改腳本或配置後可執行：
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh
 ./tests/test_v4_ssh.sh
 bash tests/test_v5_stream.sh
 bash tests/test_v5_shutdown.sh
+bash tests/test_v6_ssh_lifecycle.sh
 ```
 
 測試使用 fake SSH，不代表實際部署主機、憑證、host key 或遠端命令已驗證；正式使用前仍須以實際 SSH 目標測試。

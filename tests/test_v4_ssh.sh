@@ -126,7 +126,8 @@ SSH_LOG_CONTENT="$(<"$FAKE_SSH_LOG")"
 assert_contains "$SSH_LOG_CONTENT" "-o BatchMode=yes" "BatchMode SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o ConnectTimeout=10" "connect timeout SSH option"
 assert_contains "$SSH_LOG_CONTENT" "-o StrictHostKeyChecking=yes" "host key SSH option"
-assert_contains "$SSH_LOG_CONTENT" "-o ControlMaster=auto" "SSH control master option"
+assert_contains "$SSH_LOG_CONTENT" "-o ControlMaster=yes" "SSH polling master creation option"
+assert_contains "$SSH_LOG_CONTENT" "-o ControlMaster=no" "SSH polling channel option"
 assert_contains "$SSH_LOG_CONTENT" "-o ControlPersist=30" "bounded SSH control persist option"
 assert_contains "$SSH_LOG_CONTENT" "-o ControlPath=" "SSH control path option"
 assert_contains "$SSH_LOG_CONTENT" "bash -s" "remote Bash invocation"
@@ -134,7 +135,7 @@ assert_contains "$SSH_LOG_CONTENT" "bash -s" "remote Bash invocation"
 MASTER_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "master" { count += 1 } END { print count + 0 }')"
 CHANNEL_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "channel" { count += 1 } END { print count + 0 }')"
 assert_equal "5" "$MASTER_COUNT" "one SSH master per target"
-assert_equal "3" "$CHANNEL_COUNT" "additional SSH commands use logical channels"
+assert_equal "8" "$CHANNEL_COUNT" "polling commands use logical channels"
 
 for panel_index in "${PANEL_ORDER[@]}"; do
   PANEL_NEXT_RUN_SECONDS[$panel_index]=0
@@ -147,7 +148,7 @@ SSH_LOG_CONTENT="$(<"$FAKE_SSH_LOG")"
 MASTER_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "master" { count += 1 } END { print count + 0 }')"
 CHANNEL_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "channel" { count += 1 } END { print count + 0 }')"
 assert_equal "5" "$MASTER_COUNT" "SSH masters persist across refreshes"
-assert_equal "11" "$CHANNEL_COUNT" "refreshes use new logical channels"
+assert_equal "16" "$CHANNEL_COUNT" "refreshes use new logical channels"
 
 COMMAND_TEMP_DIR="$PANEL_COMMAND_TEMP_DIR"
 cleanup_panel_commands

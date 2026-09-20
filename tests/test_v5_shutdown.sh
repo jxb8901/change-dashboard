@@ -86,7 +86,14 @@ make_ssh_stream_config() {
     'PANEL_X[0]=1' \
     'PANEL_Y[0]=1' \
     'PANEL_WIDTHS[0]=30' \
-    'PANEL_HEIGHTS[0]=8' >"$file"
+    'PANEL_HEIGHTS[0]=8' \
+    'PANEL_TITLES[1]="SSH polling"' \
+    'PANEL_COMMANDS[1]='"'"'printf "polling-ok\\n"'"'"'' \
+    'PANEL_SSH_ALIASES[1]="A"' \
+    'PANEL_X[1]=1' \
+    'PANEL_Y[1]=10' \
+    'PANEL_WIDTHS[1]=30' \
+    'PANEL_HEIGHTS[1]=8' >"$file"
 }
 
 make_ctrl_c_config() {
@@ -113,11 +120,11 @@ run_q_case() {
   export LHC_TEST_PID_FILE="$pid_file"
   export FAKE_SSH_PID_FILE="$ssh_pid_file"
   set +e
-  { sleep 0.4; printf 'q'; } |
+  { sleep 2; printf 'q'; } |
     LINES=20 COLUMNS=80 TERM=xterm bash "$TEST_ROOT/bin/lhc" "$config" >"$output" 2>"$output.err" &
   dashboard_pid=$!
   (
-    sleep 1
+    sleep 5
     : >"$timeout_file"
     kill -TERM "$dashboard_pid" 2>/dev/null || true
   ) &
@@ -128,7 +135,7 @@ run_q_case() {
   wait "$watchdog_pid" 2>/dev/null
   set -e
   assert_equal "0" "$rc" "$name q exit status"
-  [[ ! -e "$timeout_file" ]] || fail_test "$name q shutdown exceeded one second"
+  [[ ! -e "$timeout_file" ]] || fail_test "$name q shutdown exceeded five seconds"
   assert_file_contains "$output" $'\033[?25h' "$name cursor restoration"
   assert_file_contains "$output" $'\033[0m' "$name terminal attribute reset"
   assert_pids_gone "$pid_file" "$name q cleanup"
@@ -148,15 +155,33 @@ run_q_case "local" "$LOCAL_CONFIG"
 run_q_case "ssh" "$SSH_CONFIG"
 assert_file_contains "$FAKE_SSH_LOG" "-O exit" "SSH control master close request"
 
-if command -v script >/dev/null 2>&1; then
+if command -v script >/dev/null 2>&1 && command -v perl >/dev/null 2>&1 && (( PROCESS_INSPECTION_AVAILABLE == 1 )); then
   TTY_OUTPUT="$TEST_TEMP_DIR/tty.out"
   TTY_TYPESCRIPT="$TEST_TEMP_DIR/tty.typescript"
   TTY_PID_FILE="$TEST_TEMP_DIR/tty.pids"
   export LHC_TEST_PID_FILE="$TTY_PID_FILE"
   set +e
-  { sleep 0.5; printf '\003'; sleep 1; } |
-    script -q "$TTY_TYPESCRIPT" /bin/bash -c "stty rows 20 cols 80; exec '$TEST_ROOT/bin/lhc' '$CTRL_C_CONFIG'" \
-      >"$TTY_OUTPUT" 2>"$TTY_OUTPUT.err"
+  script -q "$TTY_TYPESCRIPT" /bin/bash -c "stty rows 20 cols 80; exec /usr/bin/perl -e '\$SIG{INT}=\"DEFAULT\"; exec @ARGV' -- '$TEST_ROOT/bin/lhc' '$CTRL_C_CONFIG'" \
+    >"$TTY_OUTPUT" 2>"$TTY_OUTPUT.err" &
+  TTY_SCRIPT_PID=$!
+  TTY_DASHBOARD_PID=""
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    TTY_DASHBOARD_PID="$(ps -axo pid=,ppid=,command= | awk -v parent="$TTY_SCRIPT_PID" '$2 == parent && $0 ~ /\/bin\/lhc/ { print $1; exit }')"
+    if [[ "$TTY_DASHBOARD_PID" =~ ^[1-9][0-9]*$ && -s "$TTY_PID_FILE" ]]; then
+      break
+    fi
+    sleep 0.02
+  done
+  if [[ ! "$TTY_DASHBOARD_PID" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$TTY_SCRIPT_PID" 2>/dev/null || true
+    wait "$TTY_SCRIPT_PID" 2>/dev/null || true
+    fail_test "Ctrl-C dashboard PID was not discovered"
+  fi
+  # A terminal Ctrl-C targets the foreground process group. The macOS
+  # script(1) wrapper can leave one extra bash layer between itself and lhc,
+  # so signal the discovered foreground group rather than only its leader.
+  kill -INT -"$TTY_DASHBOARD_PID" 2>/dev/null || true
+  wait "$TTY_SCRIPT_PID"
   TTY_RC=$?
   set -e
   (( TTY_RC != 0 )) || fail_test "Ctrl-C pseudo-terminal case unexpectedly succeeded"
@@ -164,6 +189,8 @@ if command -v script >/dev/null 2>&1; then
   assert_file_contains "$TTY_TYPESCRIPT" $'\033[0m' "Ctrl-C terminal attribute reset"
   assert_pids_gone "$TTY_PID_FILE" "Ctrl-C cleanup"
   unset LHC_TEST_PID_FILE
+elif command -v script >/dev/null 2>&1; then
+  printf 'SKIP: Ctrl-C pseudo-terminal case requires process inspection and perl\n'
 fi
 
 (

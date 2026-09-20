@@ -272,8 +272,8 @@ Each registry record is `alias|target`:
 - A target must be non-empty and contain no whitespace or `|`, and must not start with `-`. Put complex port, identity, ProxyJump, and similar settings in `~/.ssh/config`, then use the SSH config alias as the target.
 - `PANEL_SSH_ALIASES[i]` is a whitespace-separated list of unique registry aliases. Without it, the panel command runs locally.
 - SSH uses `ssh -T`, `BatchMode=yes`, `ConnectTimeout=10`, `StrictHostKeyChecking=yes`, and executes `PANEL_COMMANDS[i]` remotely through `bash -s`.
-- During one LHC run, the same SSH target reuses one underlying OpenSSH connection with `ControlMaster`/`ControlPersist=30`; each command still uses an independent session/channel. Connections are explicitly closed when LHC exits and are not reused by a later LHC launch. The 30-second persistence bound limits the lifetime of a master after abnormal termination.
-- `ConnectTimeout=10` limits connection establishment only; there is no additional timeout after the remote command starts. Prepare keys/agent access and `known_hosts` first, because LHC will not prompt for a password or host-key confirmation.
+- During one LHC run, polling commands for the same SSH target share one explicit master with bounded `ControlPersist=30`; each command still uses an independent session/channel. LHC checks readiness before polling, recreates a stale/dead master, and retries a transport failure once. Continuous streams use dedicated non-multiplexed connections and do not consume the polling master's session capacity. Connections are explicitly closed when LHC exits and are not reused by a later LHC launch.
+- `SSH_CONTROL_PERSIST_SECONDS` may override the persistence bound from 1 to 3600 seconds, and `SSH_CONNECT_TIMEOUT_SECONDS` may override the connection timeout from 1 to 300 seconds. Defaults are `30` and `10`. The connection timeout limits establishment only; there is no additional timeout after the remote command starts. Prepare keys/agent access and `known_hosts` first, because LHC will not prompt for a password or host-key confirmation.
 
 For an SSH panel, the first configured column is a synthetic server-identity field named `SERVER`; it is not emitted by the remote command. The remote command should output one value for each remaining configured data field. With the example above, each remote line should have three fields:
 
@@ -375,17 +375,18 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 | `Command failed` | Run the command directly and check permissions, PATH, and exit status; LHC does not put stderr in the display. |
 | An SSH row is `SSH_FAILED` | Check registry aliases, `~/.ssh/config`, key/agent access, `known_hosts`, and the target host; strict host-key policy must succeed. |
 | No colors appear | Ensure `NO_COLOR` is unset or empty and use an ANSI-capable terminal. |
-| A remote command runs too long | LHC has only a 10-second SSH connection timeout, not a post-connection command timeout; add a timeout to the remote check itself. |
+| A remote command runs too long | LHC has only an SSH connection timeout, not a post-connection command timeout; configure `SSH_CONNECT_TIMEOUT_SECONDS` if needed and add a timeout to the remote check itself. |
 
 ## 8. Testing and compatibility
 
 LHC remains compatible with Bash 3.2 and does not depend on associative arrays or `wait -n`. After changing the script or configuration, run:
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh
 ./tests/test_v4_ssh.sh
 bash tests/test_v5_stream.sh
 bash tests/test_v5_shutdown.sh
+bash tests/test_v6_ssh_lifecycle.sh
 ```
 
 The test uses fake SSH. It does not prove that production hosts, credentials, host keys, or remote commands work; verify those with real SSH targets before deployment.

@@ -13,14 +13,24 @@ fi
 target=""
 operation=""
 control_path=""
+control_master=""
+master_request=0
 while (( $# > 0 )); do
   case "$1" in
+    -M|-MNf)
+      master_request=1
+      shift
+      ;;
+    -N|-f)
+      shift
+      ;;
     -T)
       shift
       ;;
     -o)
       (( $# >= 2 )) || exit 64
       case "$2" in
+        ControlMaster=*) control_master="${2#ControlMaster=}" ;;
         ControlPath=*) control_path="${2#ControlPath=}" ;;
       esac
       shift 2
@@ -43,14 +53,31 @@ if [[ "$operation" == "exit" ]]; then
   [[ -n "$control_path" ]] && rm -rf "${control_path}.fake-state"
   exit 0
 fi
+if [[ "$operation" == "check" ]]; then
+  if [[ -n "$control_path" && -d "${control_path}.fake-state" ]]; then
+    [[ -n "$FAKE_SSH_LOG" ]] && printf 'check %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+    exit 0
+  fi
+  exit 255
+fi
+if (( master_request == 1 )); then
+  [[ -n "$control_path" ]] || exit 64
+  mkdir -p "${control_path}.fake-state" 2>/dev/null || exit 255
+  [[ -n "$FAKE_SSH_LOG" ]] && printf 'master %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+  exit 0
+fi
 [[ "${1:-}" == "bash" && "${2:-}" == "-s" ]] || exit 64
 
-if [[ -n "$FAKE_SSH_LOG" && -n "$control_path" ]]; then
-  if mkdir "${control_path}.fake-state" 2>/dev/null; then
-    printf 'master %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
-  else
-    printf 'channel %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+if [[ "$control_master" == "no" && "$control_path" != "none" ]]; then
+  [[ -d "${control_path}.fake-state" ]] || exit 255
+  [[ -n "$FAKE_SSH_LOG" ]] && printf 'channel %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+  if [[ -n "${FAKE_SSH_DROP_FIRST_CHANNEL_FILE:-}" && ! -e "$FAKE_SSH_DROP_FIRST_CHANNEL_FILE" ]]; then
+    : >"$FAKE_SSH_DROP_FIRST_CHANNEL_FILE"
+    rm -rf "${control_path}.fake-state"
+    exit 255
   fi
+else
+  [[ -n "$FAKE_SSH_LOG" ]] && printf 'dedicated %s\n' "$target" >>"$FAKE_SSH_LOG"
 fi
 
 if [[ "$target" == "fail" ]]; then
@@ -58,4 +85,18 @@ if [[ "$target" == "fail" ]]; then
 fi
 
 export FAKE_SSH_TARGET="$target"
-bash -s
+remote_pid=""
+forward_signal() {
+  if [[ -n "$remote_pid" ]]; then
+    kill -TERM "$remote_pid" 2>/dev/null || true
+    kill -KILL "$remote_pid" 2>/dev/null || true
+  fi
+  exit 143
+}
+trap forward_signal TERM INT
+bash -s <&0 &
+remote_pid=$!
+wait "$remote_pid"
+exit_status=$?
+trap - TERM INT
+exit "$exit_status"
