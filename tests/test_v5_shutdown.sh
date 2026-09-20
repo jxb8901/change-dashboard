@@ -7,6 +7,8 @@ TEST_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc-v5-shutdown.XXXXXX")" || exit 1
 FAKE_SSH_LOG="$TEST_TEMP_DIR/ssh.log"
 export FAKE_SSH_LOG
 export PATH="$TEST_ROOT/tests/fixtures:$PATH"
+PROCESS_INSPECTION_AVAILABLE=1
+ps -p "$$" -o pid= >/dev/null 2>&1 || PROCESS_INSPECTION_AVAILABLE=0
 
 fail_test() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -21,6 +23,32 @@ assert_equal() {
 assert_file_contains() {
   local file="$1" expected="$2" description="$3"
   grep -Fq -- "$expected" "$file" || fail_test "$description: missing [$expected]"
+}
+
+assert_pids_gone() {
+  local pid_file="$1" description="$2" pid_record pid remaining_pid alive attempt
+
+  [[ -s "$pid_file" ]] || fail_test "$description: no process PIDs were recorded"
+  # Some managed sandboxes deny process-table access even for known PIDs. The
+  # production cleanup still exercises its ownership checks; on a normal host
+  # this assertion verifies every recorded child, wrapper, and fake-SSH PID.
+  (( PROCESS_INSPECTION_AVAILABLE == 1 )) || return 0
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    alive=0
+    remaining_pid=""
+    while IFS= read -r pid_record; do
+      [[ -n "$pid_record" ]] || continue
+      pid="${pid_record##*:}"
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        remaining_pid="$pid_record"
+        break
+      fi
+    done <"$pid_file"
+    (( alive == 0 )) && return 0
+    sleep 0.01
+  done
+  fail_test "$description: process $remaining_pid remains"
 }
 
 cleanup_test() {
@@ -38,7 +66,7 @@ make_local_stream_config() {
     'REFRESH_INTERVAL=1' \
     'PANEL_TITLES[0]="Local stream"' \
     'PANEL_STREAM[0]=1' \
-    "PANEL_COMMANDS[0]='while true; do printf \"local-tick\\n\"; sleep 0.01; done'" \
+    "PANEL_COMMANDS[0]='printf \"child:%s\\n\" \"\$\$\" >> \"\$LHC_TEST_PID_FILE\"; printf \"wrapper:%s\\n\" \"\$PPID\" >> \"\$LHC_TEST_PID_FILE\"; while true; do printf \"local-tick\\n\"; sleep 0.005; done'" \
     'PANEL_X[0]=1' \
     'PANEL_Y[0]=1' \
     'PANEL_WIDTHS[0]=30' \
@@ -53,7 +81,7 @@ make_ssh_stream_config() {
     'SSH_SERVERS[0]="A|a"' \
     'PANEL_TITLES[0]="SSH stream"' \
     'PANEL_STREAM[0]=1' \
-    'PANEL_COMMANDS[0]='"'"'while true; do printf "ssh-tick\\n"; sleep 0.01; done'"'"'' \
+    'PANEL_COMMANDS[0]='"'"'printf "remote:%s\\n" "$$" >> "$LHC_TEST_PID_FILE"; printf "fake-ssh:%s\\n" "$PPID" >> "$LHC_TEST_PID_FILE"; while true; do printf "ssh-tick\\n"; sleep 0.005; done'"'"'' \
     'PANEL_SSH_ALIASES[0]="A"' \
     'PANEL_X[0]=1' \
     'PANEL_Y[0]=1' \
@@ -61,24 +89,61 @@ make_ssh_stream_config() {
     'PANEL_HEIGHTS[0]=8' >"$file"
 }
 
+make_ctrl_c_config() {
+  local file="$1"
+
+  printf '%s\n' \
+    'REFRESH_INTERVAL=1' \
+    'PANEL_TITLES[0]="Ctrl-C command"' \
+    'PANEL_STREAM[0]=0' \
+    "PANEL_COMMANDS[0]='printf \"child:%s\\n\" \"\$\$\" >> \"\$LHC_TEST_PID_FILE\"; printf \"wrapper:%s\\n\" \"\$PPID\" >> \"\$LHC_TEST_PID_FILE\"; while true; do printf \"interrupt-tick\\n\"; sleep 0.05; done'" \
+    'PANEL_X[0]=1' \
+    'PANEL_Y[0]=1' \
+    'PANEL_WIDTHS[0]=30' \
+    'PANEL_HEIGHTS[0]=8' >"$file"
+}
+
 run_q_case() {
-  local name="$1" config="$2" output="$TEST_TEMP_DIR/$1.out" rc
-  SECONDS=0
+  local name="$1" config="$2" output="$TEST_TEMP_DIR/$1.out"
+  local pid_file="$TEST_TEMP_DIR/$1.pids"
+  local ssh_pid_file="$TEST_TEMP_DIR/$1.ssh-pids"
+  local timeout_file="$TEST_TEMP_DIR/$1.timeout"
+  local dashboard_pid watchdog_pid rc
+  rm -f "$pid_file" "$ssh_pid_file" "$timeout_file"
+  export LHC_TEST_PID_FILE="$pid_file"
+  export FAKE_SSH_PID_FILE="$ssh_pid_file"
   set +e
-  { sleep 0.2; printf 'q'; } |
-    LINES=20 COLUMNS=80 TERM=xterm bash "$TEST_ROOT/bin/lhc" "$config" >"$output" 2>"$output.err"
+  { sleep 0.4; printf 'q'; } |
+    LINES=20 COLUMNS=80 TERM=xterm bash "$TEST_ROOT/bin/lhc" "$config" >"$output" 2>"$output.err" &
+  dashboard_pid=$!
+  (
+    sleep 1
+    : >"$timeout_file"
+    kill -TERM "$dashboard_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+  wait "$dashboard_pid"
   rc=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null
   set -e
   assert_equal "0" "$rc" "$name q exit status"
-  (( SECONDS <= 1 )) || fail_test "$name q shutdown exceeded one second: ${SECONDS}s"
+  [[ ! -e "$timeout_file" ]] || fail_test "$name q shutdown exceeded one second"
   assert_file_contains "$output" $'\033[?25h' "$name cursor restoration"
   assert_file_contains "$output" $'\033[0m' "$name terminal attribute reset"
+  assert_pids_gone "$pid_file" "$name q cleanup"
+  if [[ "$name" == "ssh" ]]; then
+    assert_pids_gone "$ssh_pid_file" "$name fake-SSH cleanup"
+  fi
+  unset LHC_TEST_PID_FILE FAKE_SSH_PID_FILE
 }
 
 LOCAL_CONFIG="$TEST_TEMP_DIR/local.conf"
 SSH_CONFIG="$TEST_TEMP_DIR/ssh.conf"
+CTRL_C_CONFIG="$TEST_TEMP_DIR/ctrl-c.conf"
 make_local_stream_config "$LOCAL_CONFIG"
 make_ssh_stream_config "$SSH_CONFIG"
+make_ctrl_c_config "$CTRL_C_CONFIG"
 run_q_case "local" "$LOCAL_CONFIG"
 run_q_case "ssh" "$SSH_CONFIG"
 assert_file_contains "$FAKE_SSH_LOG" "-O exit" "SSH control master close request"
@@ -86,15 +151,19 @@ assert_file_contains "$FAKE_SSH_LOG" "-O exit" "SSH control master close request
 if command -v script >/dev/null 2>&1; then
   TTY_OUTPUT="$TEST_TEMP_DIR/tty.out"
   TTY_TYPESCRIPT="$TEST_TEMP_DIR/tty.typescript"
+  TTY_PID_FILE="$TEST_TEMP_DIR/tty.pids"
+  export LHC_TEST_PID_FILE="$TTY_PID_FILE"
   set +e
   { sleep 0.5; printf '\003'; sleep 1; } |
-    script -q "$TTY_TYPESCRIPT" /bin/bash -c "stty rows 20 cols 80; exec '$TEST_ROOT/bin/lhc' '$LOCAL_CONFIG'" \
+    script -q "$TTY_TYPESCRIPT" /bin/bash -c "stty rows 20 cols 80; exec '$TEST_ROOT/bin/lhc' '$CTRL_C_CONFIG'" \
       >"$TTY_OUTPUT" 2>"$TTY_OUTPUT.err"
   TTY_RC=$?
   set -e
   (( TTY_RC != 0 )) || fail_test "Ctrl-C pseudo-terminal case unexpectedly succeeded"
   assert_file_contains "$TTY_TYPESCRIPT" $'\033[?25h' "Ctrl-C cursor restoration"
   assert_file_contains "$TTY_TYPESCRIPT" $'\033[0m' "Ctrl-C terminal attribute reset"
+  assert_pids_gone "$TTY_PID_FILE" "Ctrl-C cleanup"
+  unset LHC_TEST_PID_FILE
 fi
 
 (

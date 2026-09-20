@@ -5,6 +5,10 @@ set -u
 if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
   printf '%s\n' "$*" >>"$FAKE_SSH_LOG"
 fi
+if [[ -n "${FAKE_SSH_PID_FILE:-}" ]]; then
+  printf 'fake-ssh:%s\n' "$$" >>"$FAKE_SSH_PID_FILE"
+  printf 'wrapper:%s\n' "$PPID" >>"$FAKE_SSH_PID_FILE"
+fi
 
 target=""
 operation=""

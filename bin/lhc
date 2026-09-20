@@ -61,6 +61,7 @@ STREAM_REFRESH_PENDING=0
 STREAM_REFRESH_PID=""
 AUTO_PANEL_HEIGHT_INDEX=""
 CLEANUP_IN_PROGRESS=0
+SHUTDOWN_IN_PROGRESS=0
 LHC_OWNER_PID="$$"
 JOB_TERM_GRACE_ATTEMPTS=10
 JOB_KILL_GRACE_ATTEMPTS=10
@@ -150,6 +151,8 @@ setup_terminal() {
 }
 
 cleanup_terminal() {
+  SHUTDOWN_IN_PROGRESS=1
+  trap ':' USR1 2>/dev/null || true
   cleanup_panel_commands
   if [[ "$TERMINAL_ACTIVE" -eq 1 ]]; then
     # Show the cursor again before returning control to the shell.
@@ -489,6 +492,7 @@ cleanup_panel_commands() {
 handle_stream_refresh() {
   # Signals only wake the main event loop. Terminal drawing remains in the
   # main shell so a burst of stream output cannot interleave ANSI sequences.
+  (( SHUTDOWN_IN_PROGRESS == 1 )) && return 0
   STREAM_REFRESH_PENDING=1
 }
 
@@ -2768,15 +2772,6 @@ wait_for_quit_or_timeout() {
     [[ "$key" == "q" ]]
     return
   fi
-
-  # A stream refresh signal can interrupt the blocking read. Check stdin once
-  # more without blocking so a q that arrived with the signal is handled
-  # before the event loop starts another refresh cycle.
-  if IFS= read -rsn1 -t 0 key; then
-    [[ "$key" == "q" ]]
-    return
-  fi
-
   return 1
 }
 
@@ -2853,16 +2848,15 @@ run_dashboard_loop() {
 
     run_panel_commands
 
-    # A stream collector interrupts the keyboard wait through SIGUSR1. Consume
-    # the coalesced notification with a non-blocking keyboard check, then
-    # briefly yield before the next scheduler tick. The continue is therefore
-    # never a path that bypasses input handling or creates a hot loop.
+    # A stream collector interrupts the keyboard wait through SIGUSR1. Use a
+    # short positive-timeout read here: Bash read -t 0 only probes for input
+    # and does not consume the waiting character, which can starve q while a
+    # stream keeps asserting STREAM_REFRESH_PENDING.
     if (( STREAM_REFRESH_PENDING == 1 )); then
       STREAM_REFRESH_PENDING=0
-      if wait_for_quit_or_timeout 0; then
+      if wait_for_quit_or_timeout "$STREAM_EVENT_SLEEP"; then
         return 0
       fi
-      sleep "$STREAM_EVENT_SLEEP"
       continue
     fi
 
