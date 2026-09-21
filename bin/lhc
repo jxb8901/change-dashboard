@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.7: Recover SSH polling targets whose STARTING worker dies
+#   before publishing a terminal state, and sanitize command output before it
+#   reaches raw, table, transpose, local, or SSH render paths.
 # - 2026-09-21 V5.6: Render completed snapshot panels through panel-local
 #   frame diffs, preserving full-dashboard redraws for startup, resize, and
 #   forced layout changes.
@@ -1522,6 +1525,117 @@ repeat_char() {
   FUNCTION_RESULT="$output"
 }
 
+sanitize_terminal_output() {
+  local text="$1"
+  local result="" char next csi_char i=0 j length=${#text}
+  local esc=$'\033' bell=$'\007' csi=$'\233' osc=$'\235'
+  local terminated
+
+  # Command output is data, not terminal control input. Remove CSI/OSC
+  # sequences (including clear-screen, cursor, title, and color controls),
+  # normalize tabs to one space, remove carriage returns, and discard all
+  # remaining C0 controls except newline. The parser is deliberately written
+  # with Bash 3.2 string operations so local and SSH output behave identically
+  # on the macOS system shell.
+  while (( i < length )); do
+    char="${text:i:1}"
+    if [[ "$char" == "$esc" ]]; then
+      next="${text:i+1:1}"
+      if [[ "$next" == "[" ]]; then
+        j=$((i + 2))
+        terminated=0
+        while (( j < length )); do
+          csi_char="${text:j:1}"
+          if [[ "$csi_char" =~ ^[@-~]$ ]]; then
+            i=$((j + 1))
+            terminated=1
+            break
+          fi
+          j=$((j + 1))
+        done
+        (( terminated == 1 )) || i="$length"
+        continue
+      fi
+      if [[ "$next" == "]" ]]; then
+        j=$((i + 2))
+        terminated=0
+        while (( j < length )); do
+          csi_char="${text:j:1}"
+          if [[ "$csi_char" == "$bell" ]]; then
+            i=$((j + 1))
+            terminated=1
+            break
+          fi
+          if [[ "$csi_char" == "$esc" && "${text:j+1:1}" == "\\" ]]; then
+            i=$((j + 2))
+            terminated=1
+            break
+          fi
+          j=$((j + 1))
+        done
+        (( terminated == 1 )) || i="$length"
+        continue
+      fi
+      # Neutralize other two-byte ESC sequences such as save/restore cursor.
+      i=$((i + 2))
+      continue
+    fi
+
+    if [[ "$char" == "$csi" ]]; then
+      j=$((i + 1))
+      terminated=0
+      while (( j < length )); do
+        csi_char="${text:j:1}"
+        if [[ "$csi_char" =~ ^[@-~]$ ]]; then
+          i=$((j + 1))
+          terminated=1
+          break
+        fi
+        j=$((j + 1))
+      done
+      (( terminated == 1 )) || i="$length"
+      continue
+    fi
+
+    if [[ "$char" == "$osc" ]]; then
+      j=$((i + 1))
+      terminated=0
+      while (( j < length )); do
+        csi_char="${text:j:1}"
+        if [[ "$csi_char" == "$bell" ]]; then
+          i=$((j + 1))
+          terminated=1
+          break
+        fi
+        if [[ "$csi_char" == "$esc" && "${text:j+1:1}" == "\\" ]]; then
+          i=$((j + 2))
+          terminated=1
+          break
+        fi
+        j=$((j + 1))
+      done
+      (( terminated == 1 )) || i="$length"
+      continue
+    fi
+
+    case "$char" in
+      $'\n') result="${result}${char}" ;;
+      $'\t') result="${result} " ;;
+      $'\r') ;;
+      *)
+        if [[ "$char" =~ ^[[:cntrl:]]$ ]]; then
+          :
+        else
+          result="${result}${char}"
+        fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  FUNCTION_RESULT="$result"
+}
+
 clip_text() {
   local text="$1"
   local width="$2"
@@ -2251,6 +2365,8 @@ aggregate_ssh_stream_output() {
     alias="${PANEL_COMMAND_ALIASES[$job]}"
     status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
     output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+    sanitize_terminal_output "$output"
+    output="$FUNCTION_RESULT"
 
     if (( table_mode == 1 )); then
       if [[ -n "$status" && "$status" -ne 0 ]]; then
@@ -2305,6 +2421,7 @@ read_stream_snapshot() {
   local output_file="$1"
 
   FUNCTION_RESULT="$(<"$output_file")"
+  sanitize_terminal_output "$FUNCTION_RESULT"
 }
 
 refresh_stream_panels() {
@@ -2862,6 +2979,24 @@ start_ssh_master_worker() {
   get_process_identity "$worker_pid" >"${control_path}.worker-identity"
 }
 
+recover_stale_ssh_master_start() {
+  local control_path="$1"
+
+  # A failed ownership proof must never turn into a signal. Remove only the
+  # LHC-owned publication files and lock, then let the normal STALE path
+  # create one replacement worker. This also handles a worker killed between
+  # publishing STARTING and publishing READY.
+  rm -f \
+    "${control_path}.worker-pid" \
+    "${control_path}.worker-identity" \
+    "${control_path}.master-pid" \
+    "${control_path}.master-identity" \
+    "${control_path}.recover" \
+    "${control_path}.retry-after"
+  rm -rf "${control_path}.lock"
+  write_ssh_master_state "$control_path" STALE
+}
+
 service_ssh_polling_masters() {
   local index target control_path state recover_requested
 
@@ -2876,8 +3011,32 @@ service_ssh_polling_masters() {
     [[ -e "${control_path}.recover" ]] && recover_requested=1
 
     case "$state" in
-      READY|STARTING)
+      READY)
         continue
+        ;;
+      STARTING)
+        if get_owned_ssh_master_pid "$index" worker; then
+          continue
+        fi
+        # The worker can exit just after the master becomes usable and just
+        # before it publishes READY. Promote that verified control connection
+        # instead of creating a duplicate master.
+        if ssh_polling_master_ready "$target" "$control_path"; then
+          rm -f \
+            "${control_path}.worker-pid" \
+            "${control_path}.worker-identity" \
+            "${control_path}.master-pid" \
+            "${control_path}.master-identity" \
+            "${control_path}.recover" \
+            "${control_path}.retry-after"
+          rm -rf "${control_path}.lock"
+          write_ssh_master_state "$control_path" READY
+          SSH_CONTROL_STATES[$index]="READY"
+          continue
+        fi
+        recover_stale_ssh_master_start "$control_path"
+        state=STALE
+        SSH_CONTROL_STATES[$index]="${state}"
         ;;
       FAILED)
         (( recover_requested == 1 )) || ssh_master_retry_due "$control_path" || continue
@@ -3184,6 +3343,8 @@ aggregate_ssh_panel_output() {
     alias="${PANEL_COMMAND_ALIASES[$job]}"
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
     output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+    sanitize_terminal_output "$output"
+    output="$FUNCTION_RESULT"
 
     if (( table_mode == 1 )); then
       if [[ "$exit_status" -ne 0 ]]; then
@@ -3259,6 +3420,8 @@ mark_ssh_failure_rows() {
 prepare_panel_output() {
   local index="$1"
 
+  sanitize_terminal_output "${PANEL_OUTPUTS[$index]:-}"
+  PANEL_OUTPUTS[$index]="$FUNCTION_RESULT"
   PANEL_RENDER_MODES[$index]="raw"
   PANEL_STATUSES[$index]="OK"
 

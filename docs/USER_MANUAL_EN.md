@@ -71,6 +71,14 @@ The final panel may omit `PANEL_HEIGHTS[i]`; LHC uses the maximum height from
 `PANEL_Y[i]` to the row above the footer. Other panels must define height.
 The automatic height is recalculated after terminal resize.
 
+Command stdout is treated as display data before it reaches any raw, table, or
+transpose renderer, including local and SSH aggregation. CSI and OSC terminal
+control sequences are removed, tabs become one space, carriage returns are
+removed, and other C0 controls are discarded except newline. Plain ASCII is
+unchanged. Cell sizing remains based on Bash character counts rather than
+terminal-cell wcwidth; CJK and emoji may therefore occupy more cells than LHC
+allocates, so use ASCII values when exact table alignment is required.
+
 `PANEL_X`, `PANEL_Y`, `PANEL_WIDTHS`, and `PANEL_HEIGHTS` also accept a
 percentage such as `50%`. X and width percentages use terminal columns; Y and
 height percentages use the terminal rows excluding the footer. `0%` means the
@@ -402,13 +410,15 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 LHC remains compatible with Bash 3.2 and does not depend on associative arrays or `wait -n`. After changing the script or configuration, run:
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh tests/test_v7_scheduler_timeout.sh tests/test_v8_dirty_snapshot.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh tests/test_v7_scheduler_timeout.sh tests/test_v8_dirty_snapshot.sh tests/test_v9_ssh_starting_recovery.sh tests/test_v10_output_sanitization.sh
 ./tests/test_v4_ssh.sh
 bash tests/test_v5_stream.sh
 bash tests/test_v5_shutdown.sh
 bash tests/test_v6_ssh_lifecycle.sh
 bash tests/test_v7_scheduler_timeout.sh
 bash tests/test_v8_dirty_snapshot.sh
+bash tests/test_v9_ssh_starting_recovery.sh
+bash tests/test_v10_output_sanitization.sh
 ```
 
 The test uses fake SSH. It does not prove that production hosts, credentials, host keys, or remote commands work; verify those with real SSH targets before deployment.

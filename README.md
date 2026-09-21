@@ -54,7 +54,7 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.5 includes asynchronous per-target SSH polling-master lifecycle and reliable stream
+V5.7 includes asynchronous per-target SSH polling-master lifecycle and reliable stream
 shutdown/process handling on top of the V5.2 multi-server SSH execution,
 partial refresh, continuous raw/table
 stream panels with event-driven redraws, fixed-width tables, multi-row
@@ -73,6 +73,15 @@ connections. LHC checks master readiness before polling, recreates stale/dead
 masters with one worker per target, backs off failed targets, and retries a
 failed polling transport once.
 An abnormal termination therefore cannot leave a master indefinitely.
+
+If an SSH polling worker dies while its target is still STARTING, LHC verifies
+worker ownership, removes only its stale PID/identity metadata and lock, and
+creates one replacement worker. Command output is sanitized before rendering:
+CSI/OSC terminal controls are removed, tabs become one space, carriage returns
+are removed, and other C0 controls are discarded except newline. Cell sizing
+still uses Bash character counts rather than terminal-cell wcwidth, so CJK
+and emoji can require extra width in aligned tables; use ASCII fields when
+exact alignment is required.
 
 Press `q` or `Ctrl-C` for normal shutdown. `Ctrl-Z` suspends a foreground Unix
 job and cannot run cleanup; use `q` or `Ctrl-C` to leave the dashboard cleanly.
@@ -131,4 +140,6 @@ Run the V5.5 SSH master lifecycle regression test:
 
 ```bash
 bash tests/test_v6_ssh_lifecycle.sh
+bash tests/test_v9_ssh_starting_recovery.sh
+bash tests/test_v10_output_sanitization.sh
 ```

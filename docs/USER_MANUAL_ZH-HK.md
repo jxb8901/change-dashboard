@@ -69,6 +69,13 @@ PANEL_HEIGHTS[0]=8
 
 `PANEL_X`、`PANEL_Y`、`PANEL_WIDTHS` 及 `PANEL_HEIGHTS` 亦接受例如 `50%` 的百分比。X 及 width 百分比按終端機欄數計算；Y 及 height 百分比按扣除 footer 的可用行數計算。位置使用 `0%` 代表最左或最上邊界。百分比會向下取整，並在每次 resize 後根據原始配置重新計算。單一 panel 內可以混用整數及百分比；換算後仍須符合原有最小尺寸及邊界檢查。
 
+命令 stdout 在進入 raw、table 或 transpose renderer 前會先視為顯示資料
+處理，local 及 SSH aggregation 使用同一規則：移除 CSI/OSC 終端控制序列，
+tab 轉為一個空格、移除 carriage return，其他 C0 control 只保留 newline。
+普通 ASCII 不會改變。欄寬仍按 Bash 字元數而不是 terminal-cell wcwidth
+計算，因此 CJK 及 emoji 可能佔用多個終端機格；需要精確對齊表格時請使用
+ASCII 值。
+
 ## 4. 配置參考
 
 ### 4.1 全域設定
@@ -376,13 +383,15 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 LHC 保持 Bash 3.2 相容性，不依賴 associative arrays 或 `wait -n`。修改腳本或配置後可執行：
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh tests/test_v7_scheduler_timeout.sh tests/test_v8_dirty_snapshot.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh tests/test_v7_scheduler_timeout.sh tests/test_v8_dirty_snapshot.sh tests/test_v9_ssh_starting_recovery.sh tests/test_v10_output_sanitization.sh
 ./tests/test_v4_ssh.sh
 bash tests/test_v5_stream.sh
 bash tests/test_v5_shutdown.sh
 bash tests/test_v6_ssh_lifecycle.sh
 bash tests/test_v7_scheduler_timeout.sh
 bash tests/test_v8_dirty_snapshot.sh
+bash tests/test_v9_ssh_starting_recovery.sh
+bash tests/test_v10_output_sanitization.sh
 ```
 
 測試使用 fake SSH，不代表實際部署主機、憑證、host key 或遠端命令已驗證；正式使用前仍須以實際 SSH 目標測試。
