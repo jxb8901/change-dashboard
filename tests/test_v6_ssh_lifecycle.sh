@@ -38,6 +38,11 @@ assert_equal() {
   if validate_config >/dev/null 2>&1; then
     fail_test "oversized SSH_CONNECT_TIMEOUT_SECONDS was accepted"
   fi
+  SSH_CONNECT_TIMEOUT_SECONDS=10
+  SSH_MASTER_RETRY_BACKOFF_SECONDS=0
+  if validate_config >/dev/null 2>&1; then
+    fail_test "zero SSH_MASTER_RETRY_BACKOFF_SECONDS was accepted"
+  fi
 )
 
 wait_for_panel() {
@@ -50,6 +55,64 @@ wait_for_panel() {
   done
   fail_test "panel $panel_index did not finish"
 }
+
+RESPONSIVE_FILE="$TEST_TEMP_DIR/local-responsive"
+export RESPONSIVE_FILE
+export FAKE_SSH_MASTER_DELAY_SECONDS=3
+export FAKE_SSH_MASTER_FAIL_TARGET=down
+(
+  source "$TEST_ROOT/bin/lhc"
+  SSH_SERVERS=("DOWN|down")
+  PANEL_TITLES[0]='Local while master starts'
+  PANEL_COMMANDS[0]='printf "local-ready\\n" > "$RESPONSIVE_FILE"'
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=32; PANEL_HEIGHTS[0]=8
+  PANEL_TITLES[1]='Unreachable SSH'
+  PANEL_COMMANDS[1]='printf "unreachable\\n"'
+  PANEL_SSH_ALIASES[1]='DOWN'
+  PANEL_X[1]=35; PANEL_Y[1]=1; PANEL_WIDTHS[1]=32; PANEL_HEIGHTS[1]=8
+
+  validate_config || fail_test "slow-master configuration was rejected"
+  TERMINAL_ROWS=20; TERMINAL_COLS=100; resolve_panel_dimensions
+  initialize_loading_dashboard
+  render_dashboard() { :; }
+  start_time="$SECONDS"
+  run_panel_commands || fail_test "slow-master scheduler failed"
+  elapsed=$((SECONDS - start_time))
+  (( elapsed < 2 )) || fail_test "slow SSH master blocked scheduler for \${elapsed}s"
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    [[ -s "$RESPONSIVE_FILE" ]] && break
+    sleep 0.02
+  done
+  [[ -s "$RESPONSIVE_FILE" ]] || fail_test "local panel did not run while SSH master was starting"
+  cleanup_panel_commands
+)
+unset FAKE_SSH_MASTER_DELAY_SECONDS FAKE_SSH_MASTER_FAIL_TARGET RESPONSIVE_FILE
+
+(
+  BACKOFF_LOG="$TEST_TEMP_DIR/backoff.log"
+  export FAKE_SSH_LOG="$BACKOFF_LOG"
+  export FAKE_SSH_MASTER_FAIL_TARGET=down
+  source "$TEST_ROOT/bin/lhc"
+  SSH_SERVERS=("DOWN|down")
+  PANEL_TITLES[0]='Failed-master backoff'
+  PANEL_COMMANDS[0]='printf "unreachable\\n"'
+  PANEL_SSH_ALIASES[0]='DOWN'
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=32; PANEL_HEIGHTS[0]=8
+  SSH_MASTER_RETRY_BACKOFF_SECONDS=30
+
+  validate_config || fail_test "backoff configuration was rejected"
+  TERMINAL_ROWS=20; TERMINAL_COLS=80; resolve_panel_dimensions
+  initialize_loading_dashboard
+  render_dashboard() { :; }
+  wait_for_panel 0
+  FIRST_MASTER_COUNT="$(awk '$1 == "-MNf" { count += 1 } END { print count + 0 }' "$BACKOFF_LOG")"
+  PANEL_NEXT_RUN_SECONDS[0]=0
+  wait_for_panel 0
+  SECOND_MASTER_COUNT="$(awk '$1 == "-MNf" { count += 1 } END { print count + 0 }' "$BACKOFF_LOG")"
+  assert_equal "1" "$FIRST_MASTER_COUNT" "failed target master creation"
+  assert_equal "1" "$SECOND_MASTER_COUNT" "failed target retry backoff"
+  cleanup_panel_commands
+)
 
 (
   source "$TEST_ROOT/bin/lhc"

@@ -139,9 +139,11 @@ The command scheduler uses flat jobs with independent panel timers:
 
 Each panel starts when its own timer is due. This preserves panel-level
 concurrency while also allowing the servers within a panel to run in parallel.
-Using flat jobs also allows the main process to track and clean up every SSH
-process directly. A slow panel remains active until its jobs finish, but does
-not prevent another panel whose timer is due from starting or rendering.
+Using flat jobs also allows the main process to track and clean up every
+command wrapper and its actual SSH channel directly. A per-target master
+worker is tracked separately from those command jobs. A slow panel remains
+active until its jobs finish, but does not prevent another panel whose timer is
+due from starting or rendering.
 
 A local panel is ready when its single job finishes. An SSH panel is ready only
 when every job belonging to that panel has finished. The dashboard renders the
@@ -155,8 +157,12 @@ Bash on the destination host. The command is quoted as data before being passed
 to the remote Bash process so local shell expansion cannot alter it.
 
 Before a polling command starts, LHC checks the target's control socket with
-`ssh -O check`. If no ready master exists, it creates one explicitly and waits
-for it to become ready. The master uses non-interactive settings equivalent to:
+`ssh -O check`. If no ready master exists, the main scheduler queues that
+target and returns immediately. A single per-target background worker acquires
+an LHC-owned `mkdir` lock, creates the master, and publishes `STARTING`,
+`READY`, or `FAILED` state. The command wrapper waits for that state in its
+own background job, so slow or unreachable targets do not block local panels or
+keyboard input. The master uses non-interactive settings equivalent to:
 
 ```text
 BatchMode=yes
@@ -176,14 +182,17 @@ control paths, even if they may ultimately resolve to the same host.
 Stream commands use a separate connection with `ControlMaster=no`,
 `ControlPersist=no`, and `ControlPath=none`. If a polling command reports a
 transport failure and the readiness check confirms that its master is dead,
-LHC recreates the master and retries that command once. A healthy master does
-not cause a failed remote command to be retried.
+the wrapper requests asynchronous per-target recovery and retries that command
+once after the new master is ready. A healthy master does not cause a failed
+remote command to be retried.
 
 The temporary control sockets and master connections are closed when LHC exits;
 they are not shared across LHC launches. The bounded persistence value is
 configurable through `SSH_CONTROL_PERSIST_SECONDS` from 1 to 3600 seconds;
 the default is 30 seconds. `SSH_CONNECT_TIMEOUT_SECONDS` is configurable from
-1 to 300 seconds and defaults to 10.
+1 to 300 seconds and defaults to 10. `SSH_MASTER_RETRY_BACKOFF_SECONDS` is
+configurable from 1 to 300 seconds and defaults to 5; it prevents a failed
+target from being retried on every scheduler tick.
 
 The dashboard therefore never prompts for a password, key passphrase, or host
 key confirmation. Authentication, SSH agent access, and `known_hosts` entries

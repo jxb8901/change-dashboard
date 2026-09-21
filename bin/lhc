@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-21 V5.5: Establish SSH polling masters asynchronously per target,
+#   keep the scheduler responsive during slow connections, and make command
+#   wrappers own the actual SSH process for reliable cleanup.
 # - 2026-09-20 V5.4: Make SSH polling masters explicit and bounded, isolate
 #   continuous streams from multiplexing, and recover once from stale or dead
 #   polling transports.
@@ -72,6 +75,7 @@ JOB_GRACE_SLEEP=0.05
 STREAM_EVENT_SLEEP=0.05
 SSH_CONTROL_PERSIST_SECONDS=30
 SSH_CONNECT_TIMEOUT_SECONDS=10
+SSH_MASTER_RETRY_BACKOFF_SECONDS=5
 
 declare -a SSH_SERVERS=()
 declare -a PANEL_TITLES=()
@@ -245,8 +249,12 @@ get_owned_job_pid() {
   [[ -n "$pid_file" && -s "$pid_file" ]] || return 1
   read_pid_file "$pid_file" || return 1
   pid="$FUNCTION_RESULT"
-  [[ -n "$identity_file" && -s "$identity_file" ]] || return 1
-  identity="$(<"$identity_file")"
+  if [[ -n "$identity_file" && -s "$identity_file" ]]; then
+    identity="$(<"$identity_file")"
+  fi
+  # A process can publish its PID before macOS exposes its ps identity. The
+  # exact wrapper/child parent relationship is still safe during that short
+  # window; process_belongs_to compares the identity whenever it is present.
   if process_belongs_to "$pid" "$wrapper_pid" "$identity"; then
     FUNCTION_RESULT="$pid"
     return 0
@@ -361,6 +369,90 @@ close_ssh_control_master() {
   SSH_CONTROL_STATES[$index]="CLOSED"
 }
 
+get_owned_ssh_master_pid() {
+  local index="$1" role="$2" control_path worker_pid pid identity
+
+  control_path="${SSH_CONTROL_PATHS[$index]:-}"
+  [[ -n "$control_path" ]] || return 1
+  if [[ "$role" == "worker" ]]; then
+    read_pid_file "${control_path}.worker-pid" || return 1
+    worker_pid="$FUNCTION_RESULT"
+    identity=""
+    [[ -s "${control_path}.worker-identity" ]] && identity="$(<"${control_path}.worker-identity")"
+    process_belongs_to "$worker_pid" "$LHC_OWNER_PID" "$identity" || return 1
+    FUNCTION_RESULT="$worker_pid"
+    return 0
+  fi
+
+  get_owned_ssh_master_pid "$index" worker || return 1
+  worker_pid="$FUNCTION_RESULT"
+  read_pid_file "${control_path}.master-pid" || return 1
+  pid="$FUNCTION_RESULT"
+  identity=""
+  [[ -s "${control_path}.master-identity" ]] && identity="$(<"${control_path}.master-identity")"
+  process_belongs_to "$pid" "$worker_pid" "$identity" || return 1
+  FUNCTION_RESULT="$pid"
+}
+
+signal_ssh_master_workers() {
+  local signal="$1" index pid
+
+  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+    if get_owned_ssh_master_pid "$index" master; then
+      pid="$FUNCTION_RESULT"
+      kill -"$signal" "$pid" 2>/dev/null || true
+    fi
+    if get_owned_ssh_master_pid "$index" worker; then
+      pid="$FUNCTION_RESULT"
+      kill -"$signal" "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+wait_for_ssh_master_workers() {
+  local attempts="$1" index active
+
+  for ((attempts = attempts; attempts > 0; attempts--)); do
+    active=0
+    for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+      if get_owned_ssh_master_pid "$index" master ||
+        get_owned_ssh_master_pid "$index" worker; then
+        active=1
+        break
+      fi
+    done
+    (( active == 0 )) && return 0
+    sleep "$JOB_GRACE_SLEEP"
+  done
+  return 1
+}
+
+cleanup_ssh_master_workers() {
+  local index control_path worker_pid
+
+  signal_ssh_master_workers TERM
+  wait_for_ssh_master_workers "$JOB_TERM_GRACE_ATTEMPTS" || true
+  signal_ssh_master_workers KILL
+  wait_for_ssh_master_workers "$JOB_KILL_GRACE_ATTEMPTS" || true
+  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+    control_path="${SSH_CONTROL_PATHS[$index]}"
+    if read_pid_file "${control_path}.worker-pid"; then
+      worker_pid="$FUNCTION_RESULT"
+      if ! process_is_running "$worker_pid"; then
+        wait "$worker_pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f \
+      "${control_path}.worker-pid" \
+      "${control_path}.worker-identity" \
+      "${control_path}.master-pid" \
+      "${control_path}.master-identity" \
+      "${control_path}.recover" \
+      "${control_path}.retry-after"
+    rm -rf "${control_path}.lock"
+  done
+}
+
 cleanup_panel_commands() {
   local index job file
 
@@ -408,8 +500,10 @@ cleanup_panel_commands() {
   wait_for_job_wrappers "$JOB_KILL_GRACE_ATTEMPTS" || true
   reap_job_wrappers
 
+  cleanup_ssh_master_workers
   for index in "${!SSH_CONTROL_TARGETS[@]}"; do
     close_ssh_control_master "$index"
+    rm -f "${SSH_CONTROL_PATHS[$index]}.state"
   done
 
   for index in "${!PANEL_COMMAND_OUTPUT_FILES[@]}"; do
@@ -544,6 +638,11 @@ validate_ssh_transport_config() {
     error "SSH_CONNECT_TIMEOUT_SECONDS must be an integer from 1 to 300"
     return 1
   fi
+  if ! is_positive_integer "$SSH_MASTER_RETRY_BACKOFF_SECONDS" ||
+    (( SSH_MASTER_RETRY_BACKOFF_SECONDS > 300 )); then
+    error "SSH_MASTER_RETRY_BACKOFF_SECONDS must be an integer from 1 to 300"
+    return 1
+  fi
 }
 
 load_config() {
@@ -557,6 +656,7 @@ load_config() {
   REFRESH_INTERVAL=2
   SSH_CONTROL_PERSIST_SECONDS=30
   SSH_CONNECT_TIMEOUT_SECONDS=10
+  SSH_MASTER_RETRY_BACKOFF_SECONDS=5
   LAYOUT_ERROR=""
   PANEL_COUNT=0
   SSH_SERVERS=()
@@ -2084,6 +2184,11 @@ run_panel_commands() {
     fi
   done
 
+  # Master creation is serviced after all due panels have been queued. The
+  # worker is per target and runs in the background, so a slow or unreachable
+  # target cannot block local panels, other SSH targets, or keyboard input.
+  service_ssh_polling_masters
+
   refresh_stream_panels
 
   # Poll portable completion markers instead of wait -n, which is unavailable
@@ -2242,6 +2347,7 @@ get_ssh_control_path() {
   SSH_CONTROL_TARGETS[$index]="$target"
   SSH_CONTROL_PATHS[$index]="$PANEL_COMMAND_TEMP_DIR/control.$index"
   SSH_CONTROL_STATES[$index]="NEW"
+  printf '%s\n' "NEW" >"${SSH_CONTROL_PATHS[$index]}.state"
   FUNCTION_RESULT="${SSH_CONTROL_PATHS[$index]}"
 }
 
@@ -2268,21 +2374,99 @@ ssh_polling_master_ready() {
     "$target" >/dev/null 2>&1
 }
 
-ensure_ssh_polling_master() {
-  local target="$1" control_path="$2" index attempt
+write_ssh_master_state() {
+  local control_path="$1" state="$2" state_file="${control_path}.state"
+  local temporary_file="${state_file}.tmp.$$"
 
-  get_ssh_control_index "$target" || return 1
-  index="$FUNCTION_RESULT"
-  if ssh_polling_master_ready "$target" "$control_path"; then
-    SSH_CONTROL_STATES[$index]="READY"
-    return 0
+  [[ -d "${control_path%/*}" ]] || return 0
+  printf '%s\n' "$state" >"$temporary_file"
+  mv -f "$temporary_file" "$state_file"
+}
+
+read_ssh_master_state() {
+  local control_path="$1" state="NEW"
+
+  if [[ -s "${control_path}.state" ]]; then
+    IFS= read -r state <"${control_path}.state" || true
   fi
+  FUNCTION_RESULT="$state"
+}
 
-  SSH_CONTROL_STATES[$index]="STALE"
+ssh_master_retry_due() {
+  local control_path="$1" retry_after now
+
+  [[ -s "${control_path}.retry-after" ]] || return 0
+  IFS= read -r retry_after <"${control_path}.retry-after" || true
+  [[ "$retry_after" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  (( now >= retry_after ))
+}
+
+write_ssh_master_retry_after() {
+  local control_path="$1" now
+
+  [[ -d "${control_path%/*}" ]] || return 0
+  now="$(date +%s)"
+  if [[ "$now" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$((now + SSH_MASTER_RETRY_BACKOFF_SECONDS))" \
+      >"${control_path}.retry-after"
+  fi
+}
+
+queue_ssh_polling_master() {
+  local control_path="$1" state
+
+  read_ssh_master_state "$control_path"
+  state="$FUNCTION_RESULT"
+  if [[ "$state" == "CLOSED" ]]; then
+    write_ssh_master_state "$control_path" NEW
+  fi
+}
+
+request_ssh_master_recovery() {
+  local target="$1" control_path="$2"
+
+  ssh_polling_master_ready "$target" "$control_path" && return 0
   # The path is allocated inside this LHC-owned temporary directory. Removing
   # it is safe after -O check has established that no usable master remains.
   rm -f "$control_path"
-  for ((attempt = 1; attempt <= 2; attempt++)); do
+  write_ssh_master_state "$control_path" STALE
+  : >"${control_path}.recover"
+}
+
+wait_for_ssh_polling_master() {
+  local control_path="$1" state attempts max_attempts
+
+  max_attempts=$(( (SSH_CONNECT_TIMEOUT_SECONDS + 2) * 20 ))
+  for ((attempts = 0; attempts < max_attempts; attempts++)); do
+    read_ssh_master_state "$control_path"
+    state="$FUNCTION_RESULT"
+    case "$state" in
+      READY)
+        return 0
+        ;;
+      FAILED|CLOSED)
+        return 1
+        ;;
+    esac
+    sleep 0.05
+  done
+  return 1
+}
+
+start_ssh_master_worker() {
+  local target="$1" control_path="$2" worker_pid
+
+  (
+    local master_pid="" master_exit_status
+
+    terminate_master_worker() {
+      [[ -n "$master_pid" ]] && kill -TERM "$master_pid" 2>/dev/null || true
+      exit 143
+    }
+    trap terminate_master_worker TERM INT
+
     ssh -MNf \
       -o BatchMode=yes \
       -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
@@ -2290,66 +2474,127 @@ ensure_ssh_polling_master() {
       -o ControlMaster=yes \
       -o ControlPersist="$SSH_CONTROL_PERSIST_SECONDS" \
       -o ControlPath="$control_path" \
-      "$target" >/dev/null 2>&1 || true
-    if ssh_polling_master_ready "$target" "$control_path"; then
-      SSH_CONTROL_STATES[$index]="READY"
-      return 0
-    fi
-    rm -f "$control_path"
-  done
+      "$target" >/dev/null 2>&1 &
+    master_pid=$!
+    printf '%s\n' "$master_pid" >"${control_path}.master-pid"
+    get_process_identity "$master_pid" >"${control_path}.master-identity"
+    wait "$master_pid"
+    master_exit_status=$?
+    master_pid=""
+    rm -f "${control_path}.master-pid" "${control_path}.master-identity"
 
-  SSH_CONTROL_STATES[$index]="FAILED"
-  return 1
+    if (( master_exit_status == 0 )) && ssh_polling_master_ready "$target" "$control_path"; then
+      write_ssh_master_state "$control_path" READY
+      rm -f "${control_path}.recover" "${control_path}.retry-after"
+    else
+      rm -f "$control_path"
+      write_ssh_master_state "$control_path" FAILED
+      write_ssh_master_retry_after "$control_path"
+    fi
+    rm -rf "${control_path}.lock"
+    trap - TERM INT
+  ) &
+  worker_pid=$!
+  printf '%s\n' "$worker_pid" >"${control_path}.worker-pid"
+  get_process_identity "$worker_pid" >"${control_path}.worker-identity"
+}
+
+service_ssh_polling_masters() {
+  local index target control_path state recover_requested
+
+  (( SHUTDOWN_IN_PROGRESS == 0 )) || return 0
+  for index in "${!SSH_CONTROL_TARGETS[@]}"; do
+    target="${SSH_CONTROL_TARGETS[$index]}"
+    control_path="${SSH_CONTROL_PATHS[$index]}"
+    read_ssh_master_state "$control_path"
+    state="$FUNCTION_RESULT"
+    SSH_CONTROL_STATES[$index]="$state"
+    recover_requested=0
+    [[ -e "${control_path}.recover" ]] && recover_requested=1
+
+    case "$state" in
+      READY|STARTING)
+        continue
+        ;;
+      FAILED)
+        (( recover_requested == 1 )) || ssh_master_retry_due "$control_path" || continue
+        ;;
+      NEW|STALE)
+        ;;
+      CLOSED)
+        continue
+        ;;
+      *)
+        write_ssh_master_state "$control_path" NEW
+        ;;
+    esac
+
+    mkdir "${control_path}.lock" 2>/dev/null || continue
+    write_ssh_master_state "$control_path" STARTING
+    SSH_CONTROL_STATES[$index]="STARTING"
+    start_ssh_master_worker "$target" "$control_path"
+  done
+}
+
+launch_ssh_command() {
+  local target="$1" input_file="$2" output_file="$3" error_file="$4"
+  local child_pid_file="$5" child_identity_file="$6" control_path="$7"
+  local launched_pid
+
+  if [[ "$control_path" == "none" ]]; then
+    ssh -T \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
+      -o StrictHostKeyChecking=yes \
+      -o ControlMaster=no \
+      -o ControlPersist=no \
+      -o ControlPath=none \
+      "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file" &
+  else
+    ssh -T \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
+      -o StrictHostKeyChecking=yes \
+      -o ControlMaster=no \
+      -o ControlPersist=no \
+      -o ControlPath="$control_path" \
+      "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file" &
+  fi
+  launched_pid=$!
+  child_pid="$launched_pid"
+  printf '%s\n' "$launched_pid" >"$child_pid_file"
+  get_process_identity "$launched_pid" >"$child_identity_file"
+  wait "$launched_pid"
+  FUNCTION_RESULT=$?
 }
 
 run_ssh_polling_command() {
   local target="$1" control_path="$2" input_file="$3"
-  local output_file="$4" error_file="$5" exit_status
+  local output_file="$4" error_file="$5" child_pid_file="$6"
+  local child_identity_file="$7" exit_status
 
-  ssh -T \
-    -o BatchMode=yes \
-    -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
-    -o StrictHostKeyChecking=yes \
-    -o ControlMaster=no \
-    -o ControlPersist=no \
-    -o ControlPath="$control_path" \
-    "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file"
-  exit_status=$?
-  (( exit_status == 0 )) && return 0
+  launch_ssh_command "$target" "$input_file" "$output_file" "$error_file" \
+    "$child_pid_file" "$child_identity_file" "$control_path"
+  exit_status="$FUNCTION_RESULT"
+  (( exit_status == 0 )) && { FUNCTION_RESULT=0; return 0; }
 
   # A command failure with a healthy master is a remote-command failure, not
   # a transport failure. Only recreate/retry when the control socket itself
   # is no longer usable, and never retry more than once.
-  ssh_polling_master_ready "$target" "$control_path" && return "$exit_status"
-  if ! ensure_ssh_polling_master "$target" "$control_path"; then
-    return "$exit_status"
+  if ssh_polling_master_ready "$target" "$control_path"; then
+    FUNCTION_RESULT="$exit_status"
+    return 0
+  fi
+  request_ssh_master_recovery "$target" "$control_path"
+  if ! wait_for_ssh_polling_master "$control_path"; then
+    FUNCTION_RESULT="$exit_status"
+    return 0
   fi
   : >"$output_file"
   : >"$error_file"
-  ssh -T \
-    -o BatchMode=yes \
-    -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
-    -o StrictHostKeyChecking=yes \
-    -o ControlMaster=no \
-    -o ControlPersist=no \
-    -o ControlPath="$control_path" \
-    "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file"
-}
-
-run_ssh_stream_command() {
-  local target="$1" input_file="$2" output_file="$3" error_file="$4"
-
-  # A stream owns its connection. In particular, do not pass the polling
-  # ControlPath: a long-lived stream must not consume the polling master's
-  # server-side MaxSessions quota.
-  ssh -T \
-    -o BatchMode=yes \
-    -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
-    -o StrictHostKeyChecking=yes \
-    -o ControlMaster=no \
-    -o ControlPersist=no \
-    -o ControlPath=none \
-    "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file"
+  launch_ssh_command "$target" "$input_file" "$output_file" "$error_file" \
+    "$child_pid_file" "$child_identity_file" "$control_path"
+  FUNCTION_RESULT="$FUNCTION_RESULT"
 }
 
 start_panel_command_job() {
@@ -2367,7 +2612,6 @@ start_panel_command_job() {
   local control_path=""
   local stream_mode="${PANEL_STREAM[$panel_index]:-0}"
   local stream_capacity=""
-  local ssh_master_ready=1
 
   if [[ "$stream_mode" == "1" ]]; then
     get_stream_capacity "$panel_index"
@@ -2404,9 +2648,9 @@ start_panel_command_job() {
   : >"$collector_pid_file"
   : >"$collector_identity_file"
 
-  if [[ "$stream_mode" == "1" ]]; then
-    PANEL_COMMAND_FIFO_FILES[$job]="$fifo_file"
-  fi
+    if [[ "$stream_mode" == "1" ]]; then
+      PANEL_COMMAND_FIFO_FILES[$job]="$fifo_file"
+    fi
 
   if [[ -n "$alias" ]]; then
     PANEL_COMMAND_INPUT_FILES[$job]="$input_file"
@@ -2415,7 +2659,7 @@ start_panel_command_job() {
       get_ssh_control_path "$target"
       control_path="$FUNCTION_RESULT"
       PANEL_COMMAND_CONTROL_PATHS[$job]="$control_path"
-      ensure_ssh_polling_master "$target" "$control_path" || ssh_master_ready=0
+      queue_ssh_polling_master "$control_path"
     fi
   fi
 
@@ -2450,20 +2694,30 @@ start_panel_command_job() {
     fi
 
     if [[ -n "$alias" && "$stream_mode" == "1" ]]; then
-      run_ssh_stream_command "$target" "$input_file" "$output_target" "$error_file" &
-    elif [[ -n "$alias" && "$ssh_master_ready" == "1" ]]; then
-      run_ssh_polling_command "$target" "$control_path" "$input_file" \
-        "$output_target" "$error_file" &
+      # This wrapper launches the actual SSH process. Keeping the launch in
+      # the wrapper makes the PID file point at ssh itself, so shutdown can
+      # signal the real connection rather than an asynchronous shell helper.
+      launch_ssh_command "$target" "$input_file" "$output_target" "$error_file" \
+        "$child_pid_file" "$child_identity_file" none
+      exit_status="$FUNCTION_RESULT"
     elif [[ -n "$alias" ]]; then
-      bash -c 'exit 255' >"$output_target" 2>"$error_file" &
+      if wait_for_ssh_polling_master "$control_path"; then
+        run_ssh_polling_command "$target" "$control_path" "$input_file" \
+          "$output_target" "$error_file" "$child_pid_file" "$child_identity_file"
+        exit_status="$FUNCTION_RESULT"
+      else
+        exit_status=255
+        : >"$output_target"
+        : >"$error_file"
+      fi
     else
       bash -c "${PANEL_COMMANDS[$panel_index]}" >"$output_target" 2>"$error_file" &
+      child_pid=$!
+      printf '%s\n' "$child_pid" >"$child_pid_file"
+      get_process_identity "$child_pid" >"$child_identity_file"
+      wait "$child_pid"
+      exit_status=$?
     fi
-    child_pid=$!
-    printf '%s\n' "$child_pid" >"$child_pid_file"
-    get_process_identity "$child_pid" >"$child_identity_file"
-    wait "$child_pid"
-    exit_status=$?
     if [[ "$stream_mode" == "1" ]]; then
       wait "$collector_pid" 2>/dev/null || true
     fi

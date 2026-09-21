@@ -81,15 +81,36 @@ make_ssh_stream_config() {
     'SSH_SERVERS[0]="A|a"' \
     'PANEL_TITLES[0]="SSH stream"' \
     'PANEL_STREAM[0]=1' \
-    'PANEL_COMMANDS[0]='"'"'printf "remote:%s\\n" "$$" >> "$LHC_TEST_PID_FILE"; printf "fake-ssh:%s\\n" "$PPID" >> "$LHC_TEST_PID_FILE"; while true; do printf "ssh-tick\\n"; sleep 0.005; done'"'"'' \
+    'PANEL_COMMANDS[0]='"'"'printf "remote:%s\\n" "$$" >> "$LHC_TEST_PID_FILE"; printf "fake-ssh:%s\\n" "$PPID" >> "$LHC_TEST_PID_FILE"; while true; do sleep 1; done'"'"'' \
     'PANEL_SSH_ALIASES[0]="A"' \
     'PANEL_X[0]=1' \
     'PANEL_Y[0]=1' \
     'PANEL_WIDTHS[0]=30' \
     'PANEL_HEIGHTS[0]=8' \
     'PANEL_TITLES[1]="SSH polling"' \
-    'PANEL_COMMANDS[1]='"'"'printf "polling-ok\\n"'"'"'' \
+    'PANEL_COMMANDS[1]='"'"'printf "polling:%s\\n" "$$" >> "$LHC_TEST_PID_FILE"; while true; do sleep 1; done'"'"'' \
     'PANEL_SSH_ALIASES[1]="A"' \
+    'PANEL_X[1]=1' \
+    'PANEL_Y[1]=10' \
+    'PANEL_WIDTHS[1]=30' \
+    'PANEL_HEIGHTS[1]=8' >"$file"
+}
+
+make_slow_ssh_config() {
+  local file="$1"
+
+  printf '%s\n' \
+    'REFRESH_INTERVAL=1' \
+    'PANEL_TITLES[0]="Local while SSH starts"' \
+    "PANEL_COMMANDS[0]='printf \"local:%s\\n\" \"\$\$\" >> \"\$LHC_TEST_PID_FILE\"'" \
+    'PANEL_X[0]=1' \
+    'PANEL_Y[0]=1' \
+    'PANEL_WIDTHS[0]=30' \
+    'PANEL_HEIGHTS[0]=8' \
+    'SSH_SERVERS[1]="DOWN|down"' \
+    'PANEL_TITLES[1]="Slow SSH"' \
+    'PANEL_COMMANDS[1]='"'"'printf "unreachable\\n"'"'"'' \
+    'PANEL_SSH_ALIASES[1]="DOWN"' \
     'PANEL_X[1]=1' \
     'PANEL_Y[1]=10' \
     'PANEL_WIDTHS[1]=30' \
@@ -139,7 +160,7 @@ run_q_case() {
   assert_file_contains "$output" $'\033[?25h' "$name cursor restoration"
   assert_file_contains "$output" $'\033[0m' "$name terminal attribute reset"
   assert_pids_gone "$pid_file" "$name q cleanup"
-  if [[ "$name" == "ssh" ]]; then
+  if [[ "$name" == "ssh" || "$name" == "silent-ssh" || "$name" == "slow-ssh" ]]; then
     assert_pids_gone "$ssh_pid_file" "$name fake-SSH cleanup"
   fi
   unset LHC_TEST_PID_FILE FAKE_SSH_PID_FILE
@@ -147,12 +168,18 @@ run_q_case() {
 
 LOCAL_CONFIG="$TEST_TEMP_DIR/local.conf"
 SSH_CONFIG="$TEST_TEMP_DIR/ssh.conf"
+SLOW_SSH_CONFIG="$TEST_TEMP_DIR/slow-ssh.conf"
 CTRL_C_CONFIG="$TEST_TEMP_DIR/ctrl-c.conf"
 make_local_stream_config "$LOCAL_CONFIG"
 make_ssh_stream_config "$SSH_CONFIG"
+make_slow_ssh_config "$SLOW_SSH_CONFIG"
 make_ctrl_c_config "$CTRL_C_CONFIG"
 run_q_case "local" "$LOCAL_CONFIG"
 run_q_case "ssh" "$SSH_CONFIG"
+export FAKE_SSH_MASTER_DELAY_SECONDS=3
+export FAKE_SSH_MASTER_FAIL_TARGET=down
+run_q_case "slow-ssh" "$SLOW_SSH_CONFIG"
+unset FAKE_SSH_MASTER_DELAY_SECONDS FAKE_SSH_MASTER_FAIL_TARGET
 assert_file_contains "$FAKE_SSH_LOG" "-O exit" "SSH control master close request"
 
 if command -v script >/dev/null 2>&1 && command -v perl >/dev/null 2>&1 && (( PROCESS_INSPECTION_AVAILABLE == 1 )); then

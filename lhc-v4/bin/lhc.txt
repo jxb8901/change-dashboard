@@ -1,0 +1,1731 @@
+#!/usr/bin/env bash
+# Author: Jeffrey + ChatGPT
+# Changelog:
+# - 2026-08-13 V4.7: Allow local and SSH transpose panels to render multiple
+#   source rows through the same key/value block renderer.
+# - 2026-08-01 V4.6: Add per-panel multi-server SSH execution, deterministic
+#   aggregation with server aliases, and multi-row transpose rendering.
+# - 2026-07-06 V4.5: Mark overflowing numbers with # and truncate overflowing
+#   text with a trailing dot.
+# - 2026-07-06 V4.4: Refresh each panel as soon as its command completes.
+# - 2026-07-06 V4.3: Render the dashboard skeleton immediately while the first
+#   panel data is loading.
+# - 2026-07-06 V4.2: Run panel commands concurrently and collect their results
+#   in deterministic panel order.
+# - 2026-07-06 V4.1: Optimize threshold comparisons, command substitutions,
+#   frame diff lookups, and parsed table data access.
+# - 2026-07-05 V4: Add a fixed one-character gap between table columns.
+# - 2026-07-05 V3: Add partial refresh, background highlighting, fixed column
+#   widths, transpose layout, empty-state rendering, and resize recovery.
+# - 2026-07-04 V2: Add table parsing and configurable warning/error rules.
+# - 2026-07-04 V1: Add the local synchronous terminal dashboard.
+
+set -u
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_CONFIG="$ROOT_DIR/example/sample.conf"
+TERMINAL_ACTIVE=0
+REFRESH_INTERVAL=2
+TABLE_COLUMN_GAP=1
+PANEL_COUNT=0
+TERMINAL_ROWS=0
+TERMINAL_COLS=0
+REQUIRED_ROWS=0
+REQUIRED_COLS=0
+REQUIRED_TERMINAL_ROWS=0
+CONDITION_OPERATOR=""
+CONDITION_VALUE=""
+NUMERIC_COMPARE=0
+FRAME_KEY_INDEX=0
+RESIZE_PENDING=0
+DASHBOARD_PAUSED=0
+FORCE_FULL_REDRAW=1
+RESOLVED_WIDTHS=""
+FUNCTION_RESULT=""
+PANEL_COMMAND_TEMP_DIR=""
+PANEL_COMMAND_JOB_COUNT=0
+
+declare -a SSH_SERVERS=()
+declare -a PANEL_TITLES=()
+declare -a PANEL_COMMANDS=()
+declare -a PANEL_SSH_ALIASES=()
+declare -a PANEL_X=()
+declare -a PANEL_Y=()
+declare -a PANEL_WIDTHS=()
+declare -a PANEL_HEIGHTS=()
+declare -a PANEL_ORDER=()
+declare -a PANEL_OUTPUTS=()
+declare -a PANEL_TABLE_COLUMNS=()
+declare -a PANEL_WARN_RULES=()
+declare -a PANEL_ERROR_RULES=()
+declare -a PANEL_TABLE_LAYOUT=()
+declare -a PANEL_TABLE_WIDTHS=()
+declare -a PANEL_RENDER_MODES=()
+declare -a PANEL_STATUSES=()
+declare -a PANEL_TABLE_HEADERS=()
+declare -a PANEL_TABLE_ROWS=()
+declare -a PANEL_TABLE_CELL_STATUSES=()
+declare -a PANEL_SSH_FAILURE_ROWS=()
+declare -a CURRENT_FRAME_KEYS=()
+declare -a CURRENT_FRAME_TEXT=()
+declare -a CURRENT_FRAME_STYLES=()
+declare -a PREVIOUS_FRAME_KEYS=()
+declare -a PREVIOUS_FRAME_TEXT=()
+declare -a PREVIOUS_FRAME_STYLES=()
+declare -a CURRENT_FRAME_INDEX=()
+declare -a PREVIOUS_FRAME_INDEX=()
+declare -a PANEL_COMMAND_PIDS=()
+declare -a PANEL_COMMAND_OUTPUT_FILES=()
+declare -a PANEL_COMMAND_STATUS_FILES=()
+declare -a PANEL_COMMAND_COLLECTED=()
+declare -a PANEL_COMMAND_PANEL_INDEXES=()
+declare -a PANEL_COMMAND_ALIASES=()
+declare -a PANEL_COMMAND_TARGETS=()
+declare -a PANEL_COMMAND_INPUT_FILES=()
+declare -a PANEL_COMMAND_ERROR_FILES=()
+declare -a PANEL_COMMAND_EXIT_STATUSES=()
+declare -a PANEL_COMMAND_COUNTS=()
+declare -a PANEL_COMMAND_COMPLETED_COUNTS=()
+
+usage() {
+  printf 'Usage: %s [config-file]\n' "${0##*/}"
+  printf '\n'
+  printf 'Starts the local and SSH change dashboard.\n'
+  printf 'Default config: %s\n' "$DEFAULT_CONFIG"
+  printf '\n'
+  printf 'Options:\n'
+  printf '  -h, --help, --usage  Show this help and exit.\n'
+}
+
+setup_terminal() {
+  TERMINAL_ACTIVE=1
+  # Hide the cursor while the dashboard owns the terminal.
+  printf '\033[?25l'
+}
+
+cleanup_terminal() {
+  cleanup_panel_commands
+  if [[ "$TERMINAL_ACTIVE" -eq 1 ]]; then
+    # Show the cursor again before returning control to the shell.
+    printf '\033[?25h'
+    # Reset terminal text attributes such as color or bold.
+    printf '\033[0m'
+    printf '\n'
+    TERMINAL_ACTIVE=0
+  fi
+}
+
+cleanup_panel_commands() {
+  local index pid file
+
+  for index in "${!PANEL_COMMAND_PIDS[@]}"; do
+    pid="${PANEL_COMMAND_PIDS[$index]}"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+
+  for index in "${!PANEL_COMMAND_OUTPUT_FILES[@]}"; do
+    file="${PANEL_COMMAND_OUTPUT_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_STATUS_FILES[@]}"; do
+    file="${PANEL_COMMAND_STATUS_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_INPUT_FILES[@]}"; do
+    file="${PANEL_COMMAND_INPUT_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  for index in "${!PANEL_COMMAND_ERROR_FILES[@]}"; do
+    file="${PANEL_COMMAND_ERROR_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
+  if [[ -n "$PANEL_COMMAND_TEMP_DIR" ]]; then
+    rmdir "$PANEL_COMMAND_TEMP_DIR" 2>/dev/null || true
+    PANEL_COMMAND_TEMP_DIR=""
+  fi
+
+  PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_OUTPUT_FILES=()
+  PANEL_COMMAND_STATUS_FILES=()
+  PANEL_COMMAND_COLLECTED=()
+  PANEL_COMMAND_PANEL_INDEXES=()
+  PANEL_COMMAND_ALIASES=()
+  PANEL_COMMAND_TARGETS=()
+  PANEL_COMMAND_INPUT_FILES=()
+  PANEL_COMMAND_ERROR_FILES=()
+  PANEL_COMMAND_EXIT_STATUSES=()
+  PANEL_COMMAND_COUNTS=()
+  PANEL_COMMAND_COMPLETED_COUNTS=()
+  PANEL_COMMAND_JOB_COUNT=0
+}
+
+handle_interrupt() {
+  cleanup_terminal
+  exit 130
+}
+
+handle_resize() {
+  RESIZE_PENDING=1
+}
+
+error() {
+  printf 'Error: %s\n' "$*" >&2
+}
+
+has_array_index() {
+  local array_name="$1"
+  local index="$2"
+
+  eval '[[ ${'"$array_name"'['"$index"']+set} ]]'
+}
+
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_non_negative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+load_config() {
+  local config_file="$1"
+
+  if [[ ! -f "$config_file" ]]; then
+    error "config file not found: $config_file"
+    return 1
+  fi
+
+  REFRESH_INTERVAL=2
+  PANEL_COUNT=0
+  SSH_SERVERS=()
+  PANEL_TITLES=()
+  PANEL_COMMANDS=()
+  PANEL_SSH_ALIASES=()
+  PANEL_X=()
+  PANEL_Y=()
+  PANEL_WIDTHS=()
+  PANEL_HEIGHTS=()
+  PANEL_ORDER=()
+  PANEL_OUTPUTS=()
+  PANEL_TABLE_COLUMNS=()
+  PANEL_WARN_RULES=()
+  PANEL_ERROR_RULES=()
+  PANEL_TABLE_LAYOUT=()
+  PANEL_TABLE_WIDTHS=()
+  PANEL_RENDER_MODES=()
+  PANEL_STATUSES=()
+  PANEL_TABLE_HEADERS=()
+  PANEL_TABLE_ROWS=()
+  PANEL_TABLE_CELL_STATUSES=()
+  PANEL_SSH_FAILURE_ROWS=()
+  CURRENT_FRAME_KEYS=()
+  CURRENT_FRAME_TEXT=()
+  CURRENT_FRAME_STYLES=()
+  PREVIOUS_FRAME_KEYS=()
+  PREVIOUS_FRAME_TEXT=()
+  PREVIOUS_FRAME_STYLES=()
+  CURRENT_FRAME_INDEX=()
+  PREVIOUS_FRAME_INDEX=()
+
+  # Config is trusted deployment input and may contain shell commands.
+  # shellcheck source=/dev/null
+  source "$config_file"
+
+  if ! is_positive_integer "$REFRESH_INTERVAL"; then
+    error "REFRESH_INTERVAL must be a positive integer"
+    return 1
+  fi
+
+  validate_config
+}
+
+validate_config() {
+  local index
+
+  if [[ "${#PANEL_TITLES[@]}" -eq 0 ]]; then
+    error "at least one panel must be configured"
+    return 1
+  fi
+
+  for index in "${!PANEL_TITLES[@]}"; do
+    validate_panel "$index" || return 1
+  done
+
+  validate_no_extra_panel_indexes PANEL_COMMANDS || return 1
+  validate_no_extra_panel_indexes PANEL_X || return 1
+  validate_no_extra_panel_indexes PANEL_Y || return 1
+  validate_no_extra_panel_indexes PANEL_WIDTHS || return 1
+  validate_no_extra_panel_indexes PANEL_HEIGHTS || return 1
+  validate_optional_panel_indexes PANEL_TABLE_COLUMNS || return 1
+  validate_optional_panel_indexes PANEL_WARN_RULES || return 1
+  validate_optional_panel_indexes PANEL_ERROR_RULES || return 1
+  validate_optional_panel_indexes PANEL_TABLE_LAYOUT || return 1
+  validate_optional_panel_indexes PANEL_TABLE_WIDTHS || return 1
+  validate_optional_panel_indexes PANEL_SSH_ALIASES || return 1
+
+  validate_table_configs || return 1
+  validate_ssh_configs || return 1
+
+  build_panel_model
+}
+
+validate_no_extra_panel_indexes() {
+  local array_name="$1"
+  local index
+
+  eval 'for index in "${!'"$array_name"'[@]}"; do
+    if ! has_array_index PANEL_TITLES "$index"; then
+      error "'"$array_name"'[$index] has no matching PANEL_TITLES[$index]"
+      return 1
+    fi
+  done'
+}
+
+validate_optional_panel_indexes() {
+  local array_name="$1"
+  local index
+
+  eval 'for index in "${!'"$array_name"'[@]}"; do
+    if ! has_array_index PANEL_TITLES "$index"; then
+      error "'"$array_name"'[$index] has no matching PANEL_TITLES[$index]"
+      return 1
+    fi
+  done'
+}
+
+validate_panel() {
+  local index="$1"
+
+  require_panel_field PANEL_TITLES "$index" || return 1
+  require_panel_field PANEL_COMMANDS "$index" || return 1
+  require_panel_field PANEL_X "$index" || return 1
+  require_panel_field PANEL_Y "$index" || return 1
+  require_panel_field PANEL_WIDTHS "$index" || return 1
+  require_panel_field PANEL_HEIGHTS "$index" || return 1
+
+  if [[ -z "${PANEL_TITLES[$index]}" ]]; then
+    error "PANEL_TITLES[$index] must not be empty"
+    return 1
+  fi
+
+  if [[ -z "${PANEL_COMMANDS[$index]}" ]]; then
+    error "PANEL_COMMANDS[$index] must not be empty"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_X[$index]}"; then
+    error "PANEL_X[$index] must be a positive integer"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_Y[$index]}"; then
+    error "PANEL_Y[$index] must be a positive integer"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_WIDTHS[$index]}"; then
+    error "PANEL_WIDTHS[$index] must be a positive integer"
+    return 1
+  fi
+
+  if (( PANEL_WIDTHS[index] < 4 )); then
+    error "PANEL_WIDTHS[$index] must be at least 4"
+    return 1
+  fi
+
+  if ! is_positive_integer "${PANEL_HEIGHTS[$index]}"; then
+    error "PANEL_HEIGHTS[$index] must be a positive integer"
+    return 1
+  fi
+
+  if (( PANEL_HEIGHTS[index] < 3 )); then
+    error "PANEL_HEIGHTS[$index] must be at least 3"
+    return 1
+  fi
+}
+
+validate_table_configs() {
+  local index
+
+  for index in "${!PANEL_TABLE_COLUMNS[@]}"; do
+    validate_table_columns "$index" || return 1
+    validate_rule_list "$index" "WARN" "${PANEL_WARN_RULES[$index]:-}" || return 1
+    validate_rule_list "$index" "ERROR" "${PANEL_ERROR_RULES[$index]:-}" || return 1
+    validate_table_layout "$index" || return 1
+  done
+
+  for index in "${!PANEL_WARN_RULES[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_WARN_RULES[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+
+  for index in "${!PANEL_ERROR_RULES[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_ERROR_RULES[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+
+
+  for index in "${!PANEL_TABLE_LAYOUT[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_TABLE_LAYOUT[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+
+  for index in "${!PANEL_TABLE_WIDTHS[@]}"; do
+    if ! has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      error "PANEL_TABLE_WIDTHS[$index] requires PANEL_TABLE_COLUMNS[$index]"
+      return 1
+    fi
+  done
+}
+
+validate_ssh_configs() {
+  local index record alias target aliases panel_alias seen_aliases=" " alias_count
+  local column_count column
+
+  for index in "${!SSH_SERVERS[@]}"; do
+    record="${SSH_SERVERS[$index]}"
+    if [[ "$record" != *"|"* ]]; then
+      error "SSH_SERVERS[$index] must use alias|target format"
+      return 1
+    fi
+
+    alias="${record%%|*}"
+    target="${record#*|}"
+    if [[ -z "$alias" || -z "$target" || "$target" == *"|"* ]]; then
+      error "SSH_SERVERS[$index] must contain one non-empty alias and target"
+      return 1
+    fi
+    if contains_whitespace "$alias" || contains_whitespace "$target"; then
+      error "SSH_SERVERS[$index] alias and target must not contain whitespace"
+      return 1
+    fi
+    if [[ ! "$alias" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+      error "SSH_SERVERS[$index] alias may contain only letters, numbers, dot, underscore, and dash"
+      return 1
+    fi
+    if [[ "$alias" == -* || "$target" == -* ]]; then
+      error "SSH_SERVERS[$index] alias and target must not start with dash"
+      return 1
+    fi
+    if [[ "$seen_aliases" == *" $alias "* ]]; then
+      error "duplicate SSH server alias: $alias"
+      return 1
+    fi
+    seen_aliases="${seen_aliases}${alias} "
+  done
+
+  for index in "${!PANEL_SSH_ALIASES[@]}"; do
+    aliases="${PANEL_SSH_ALIASES[$index]}"
+    if [[ -z "$aliases" ]]; then
+      error "PANEL_SSH_ALIASES[$index] must not be empty"
+      return 1
+    fi
+    if [[ "$aliases" =~ [^A-Za-z0-9_.[:space:]-] ]]; then
+      error "PANEL_SSH_ALIASES[$index] contains an invalid alias character"
+      return 1
+    fi
+
+    seen_aliases=" "
+    alias_count=0
+    for panel_alias in $aliases; do
+      if [[ "$seen_aliases" == *" $panel_alias "* ]]; then
+        error "duplicate SSH alias for panel $index: $panel_alias"
+        return 1
+      fi
+      resolve_ssh_target "$panel_alias"
+      if [[ -z "$FUNCTION_RESULT" ]]; then
+        error "unknown SSH alias for panel $index: $panel_alias"
+        return 1
+      fi
+      seen_aliases="${seen_aliases}${panel_alias} "
+      alias_count=$((alias_count + 1))
+    done
+    if (( alias_count == 0 )); then
+      error "PANEL_SSH_ALIASES[$index] must contain at least one alias"
+      return 1
+    fi
+
+    if has_array_index PANEL_TABLE_COLUMNS "$index"; then
+      column_count=0
+      for column in ${PANEL_TABLE_COLUMNS[$index]}; do
+        column_count=$((column_count + 1))
+      done
+      if (( column_count < 2 )); then
+        error "SSH table panel $index requires a server column and at least one command-output column"
+        return 1
+      fi
+    fi
+  done
+}
+
+contains_whitespace() {
+  [[ "$1" == *" "* || "$1" == *$'\t'* || "$1" == *$'\n'* || "$1" == *$'\r'* ]]
+}
+
+resolve_ssh_target() {
+  local target_alias="$1"
+  local index record alias
+
+  FUNCTION_RESULT=""
+  for index in "${!SSH_SERVERS[@]}"; do
+    record="${SSH_SERVERS[$index]}"
+    alias="${record%%|*}"
+    if [[ "$alias" == "$target_alias" ]]; then
+      FUNCTION_RESULT="${record#*|}"
+      return 0
+    fi
+  done
+}
+
+validate_table_layout() {
+  local index="$1"
+  local layout="${PANEL_TABLE_LAYOUT[$index]:-table}"
+  local widths="${PANEL_TABLE_WIDTHS[$index]:-}"
+  local expected=0
+  local count=0
+  local total=0
+  local width
+  local column
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local gap_total=0
+  local required_width=0
+
+  if [[ "$layout" != "table" && "$layout" != "transpose" ]]; then
+    error "PANEL_TABLE_LAYOUT[$index] must be table or transpose"
+    return 1
+  fi
+
+  if [[ "$layout" == "transpose" ]]; then
+    expected=2
+  else
+    for column in ${PANEL_TABLE_COLUMNS[$index]}; do
+      expected=$((expected + 1))
+    done
+  fi
+  gap_total=$(((expected - 1) * TABLE_COLUMN_GAP))
+
+  if [[ -z "$widths" ]]; then
+    if (( (content_width - gap_total) / expected < 1 )); then
+      error "panel $index is too narrow for $expected table columns"
+      return 1
+    fi
+    return 0
+  fi
+
+  for width in $widths; do
+    if ! is_positive_integer "$width"; then
+      error "PANEL_TABLE_WIDTHS[$index] values must be positive integers"
+      return 1
+    fi
+    count=$((count + 1))
+    total=$((total + width))
+  done
+
+  if (( count != expected )); then
+    error "PANEL_TABLE_WIDTHS[$index] requires $expected widths for $layout layout"
+    return 1
+  fi
+
+  required_width=$((total + gap_total))
+  if (( required_width > content_width )); then
+    error "PANEL_TABLE_WIDTHS[$index] requires $required_width columns including gaps, but panel content width is $content_width"
+    return 1
+  fi
+}
+
+validate_table_columns() {
+  local index="$1"
+  local columns="${PANEL_TABLE_COLUMNS[$index]}"
+  local column
+  local seen=" "
+
+  if [[ -z "$columns" ]]; then
+    error "PANEL_TABLE_COLUMNS[$index] must not be empty"
+    return 1
+  fi
+
+  for column in $columns; do
+    if [[ "$column" == *:* ]]; then
+      error "table column must not contain colon: $column"
+      return 1
+    fi
+
+    if [[ "$seen" == *" $column "* ]]; then
+      error "duplicate table column in PANEL_TABLE_COLUMNS[$index]: $column"
+      return 1
+    fi
+
+    seen="${seen}${column} "
+  done
+}
+
+validate_rule_list() {
+  local index="$1"
+  local severity="$2"
+  local rules="$3"
+  local rule
+  local column
+  local condition
+
+  for rule in $rules; do
+    if [[ "$rule" != *:* ]]; then
+      error "$severity rule must use column:condition format: $rule"
+      return 1
+    fi
+
+    column="${rule%%:*}"
+    condition="${rule#*:}"
+
+    if ! table_has_column "$index" "$column"; then
+      error "$severity rule references unknown column for panel $index: $column"
+      return 1
+    fi
+
+    if ! validate_condition "$condition"; then
+      error "$severity rule has invalid condition for panel $index: $condition"
+      return 1
+    fi
+  done
+}
+
+table_has_column() {
+  local index="$1"
+  local target="$2"
+  local column
+
+  for column in ${PANEL_TABLE_COLUMNS[$index]}; do
+    if [[ "$column" == "$target" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+validate_condition() {
+  local condition="$1"
+
+  parse_condition "$condition" || return 1
+  if [[ -z "$CONDITION_VALUE" ]]; then
+    return 1
+  fi
+
+  case "$CONDITION_OPERATOR" in
+    '>'|'>='|'<'|'<='|'=='|'!=')
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+parse_condition() {
+  local condition="$1"
+  local operator
+  local value
+
+  case "$condition" in
+    '>='*) operator='>='; value="${condition#>=}" ;;
+    '<='*) operator='<='; value="${condition#<=}" ;;
+    '=='*) operator='=='; value="${condition#==}" ;;
+    '!='*) operator='!='; value="${condition#!=}" ;;
+    '>'*) operator='>'; value="${condition#>}" ;;
+    '<'*) operator='<'; value="${condition#<}" ;;
+    *) return 1 ;;
+  esac
+
+  CONDITION_OPERATOR="$operator"
+  CONDITION_VALUE="$value"
+}
+
+require_panel_field() {
+  local array_name="$1"
+  local index="$2"
+
+  if ! has_array_index "$array_name" "$index"; then
+    error "$array_name[$index] is required"
+    return 1
+  fi
+}
+
+build_panel_model() {
+  local index
+
+  PANEL_ORDER=()
+  for index in "${!PANEL_TITLES[@]}"; do
+    if ! is_non_negative_integer "$index"; then
+      error "panel index must be a non-negative integer: $index"
+      return 1
+    fi
+    PANEL_ORDER+=("$index")
+  done
+
+  PANEL_COUNT="${#PANEL_ORDER[@]}"
+}
+
+calculate_required_terminal_size() {
+  local index
+  local panel_right
+  local panel_bottom
+
+  REQUIRED_COLS=0
+  REQUIRED_ROWS=0
+
+  for index in "${PANEL_ORDER[@]}"; do
+    panel_right=$((PANEL_X[index] + PANEL_WIDTHS[index] - 1))
+    panel_bottom=$((PANEL_Y[index] + PANEL_HEIGHTS[index] - 1))
+
+    if (( panel_right > REQUIRED_COLS )); then
+      REQUIRED_COLS="$panel_right"
+    fi
+
+    if (( panel_bottom > REQUIRED_ROWS )); then
+      REQUIRED_ROWS="$panel_bottom"
+    fi
+  done
+
+  # Reserve one row below the panels for the refresh and exit footer.
+  REQUIRED_TERMINAL_ROWS=$((REQUIRED_ROWS + 1))
+}
+
+read_terminal_size() {
+  local size
+
+  size="$(stty size 2>/dev/null || true)"
+  if [[ -n "$size" ]]; then
+    TERMINAL_ROWS="${size%% *}"
+    TERMINAL_COLS="${size##* }"
+  else
+    TERMINAL_ROWS="${LINES:-0}"
+    TERMINAL_COLS="${COLUMNS:-0}"
+  fi
+
+  if ! is_positive_integer "$TERMINAL_ROWS" || ! is_positive_integer "$TERMINAL_COLS"; then
+    error "unable to determine terminal size"
+    return 1
+  fi
+}
+
+validate_terminal_size() {
+  calculate_required_terminal_size
+  read_terminal_size || return 1
+
+  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
+    error "terminal too small: need ${REQUIRED_COLS}x${REQUIRED_TERMINAL_ROWS}, have ${TERMINAL_COLS}x${TERMINAL_ROWS}"
+    return 1
+  fi
+}
+
+move_cursor() {
+  local row="$1"
+  local col="$2"
+
+  # Move the cursor to the requested one-based terminal row and column.
+  printf '\033[%s;%sH' "$row" "$col"
+}
+
+repeat_char() {
+  local char="$1"
+  local count="$2"
+  local output=""
+
+  while (( count > 0 )); do
+    output="${output}${char}"
+    count=$((count - 1))
+  done
+
+  FUNCTION_RESULT="$output"
+}
+
+clip_text() {
+  local text="$1"
+  local width="$2"
+
+  FUNCTION_RESULT="${text:0:width}"
+}
+
+draw_panel_border() {
+  local x="$1"
+  local y="$2"
+  local width="$3"
+  local height="$4"
+  local row
+  local inner_width=$((width - 2))
+
+  # Move to the panel's top-left corner before drawing its top border.
+  move_cursor "$y" "$x"
+  repeat_char '-' "$inner_width"
+  printf '+%s+' "$FUNCTION_RESULT"
+
+  row=$((y + 1))
+  while (( row < y + height - 1 )); do
+    # Move to the left edge of this panel row.
+    move_cursor "$row" "$x"
+    printf '|'
+    # Move to the right edge of this panel row.
+    move_cursor "$row" "$((x + width - 1))"
+    printf '|'
+    row=$((row + 1))
+  done
+
+  # Move to the panel's bottom-left corner before drawing its bottom border.
+  move_cursor "$((y + height - 1))" "$x"
+  repeat_char '-' "$inner_width"
+  printf '+%s+' "$FUNCTION_RESULT"
+}
+
+status_sequence() {
+  FUNCTION_RESULT=""
+  [[ -n "${NO_COLOR:-}" ]] && return 0
+  case "$1" in
+    # Set white foreground text on a red background for errors and failures.
+    ERROR|FAILED) FUNCTION_RESULT=$'\033[37;41m' ;;
+    # Set black foreground text on a yellow background for warnings.
+    WARN) FUNCTION_RESULT=$'\033[30;43m' ;;
+  esac
+}
+
+format_cell() {
+  local text="$1"
+  local width="$2"
+  local alignment="${3:-left}"
+  local clipped="$text"
+
+  if (( ${#text} > width )); then
+    if is_number "$text"; then
+      repeat_char '#' "$width"
+      return
+    fi
+
+    if (( width <= 0 )); then
+      clipped=""
+    elif (( width == 1 )); then
+      clipped="."
+    else
+      clipped="${text:0:$((width - 1))}."
+    fi
+  fi
+
+  if [[ "$alignment" == "right" ]]; then
+    printf -v FUNCTION_RESULT '%*s' "$width" "$clipped"
+  else
+    printf -v FUNCTION_RESULT '%-*s' "$width" "$clipped"
+  fi
+}
+
+frame_add() {
+  local row="$1" col="$2" width="$3" text="$4"
+  local style="${5:-OK}" alignment="${6:-left}"
+  local position="${#CURRENT_FRAME_KEYS[@]}"
+
+  CURRENT_FRAME_KEYS[$position]="$row:$col:$width"
+  format_cell "$text" "$width" "$alignment"
+  CURRENT_FRAME_TEXT[$position]="$FUNCTION_RESULT"
+  CURRENT_FRAME_STYLES[$position]="$style"
+  frame_key_index "${CURRENT_FRAME_KEYS[$position]}"
+  CURRENT_FRAME_INDEX[$FRAME_KEY_INDEX]=$position
+}
+
+frame_key_index() {
+  local key="$1" row remainder col width base
+  row="${key%%:*}"
+  remainder="${key#*:}"
+  col="${remainder%%:*}"
+  width="${key##*:}"
+  base=$((REQUIRED_COLS + 1))
+  FRAME_KEY_INDEX=$((((row * base) + col) * base + width))
+}
+
+draw_frame_value() {
+  local key="$1" text="$2" style="$3"
+  local row="${key%%:*}" remainder="${key#*:}" sequence
+  local col="${remainder%%:*}"
+
+  # Move directly to the changed frame cell before repainting it.
+  move_cursor "$row" "$col"
+  status_sequence "$style"
+  sequence="$FUNCTION_RESULT"
+  if [[ -n "$sequence" ]]; then
+    # Apply the status style, print the cell, then reset all ANSI attributes.
+    printf '%s%s\033[0m' "$sequence" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+render_frame_diff() {
+  local i previous key lookup
+
+  for i in "${!PREVIOUS_FRAME_KEYS[@]}"; do
+    key="${PREVIOUS_FRAME_KEYS[$i]}"
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    if [[ -z "${CURRENT_FRAME_INDEX[$lookup]+set}" ]]; then
+      repeat_char ' ' "${key##*:}"
+      draw_frame_value "$key" "$FUNCTION_RESULT" OK
+    fi
+  done
+
+  for i in "${!CURRENT_FRAME_KEYS[@]}"; do
+    key="${CURRENT_FRAME_KEYS[$i]}"
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    previous="${PREVIOUS_FRAME_INDEX[$lookup]:-}"
+    if (( FORCE_FULL_REDRAW == 1 )) || [[ -z "${PREVIOUS_FRAME_INDEX[$lookup]+set}" ]] ||
+       [[ "${CURRENT_FRAME_TEXT[$i]}" != "${PREVIOUS_FRAME_TEXT[$previous]}" ]] ||
+       [[ "${CURRENT_FRAME_STYLES[$i]}" != "${PREVIOUS_FRAME_STYLES[$previous]}" ]]; then
+      draw_frame_value "$key" "${CURRENT_FRAME_TEXT[$i]}" "${CURRENT_FRAME_STYLES[$i]}"
+    fi
+  done
+
+  PREVIOUS_FRAME_KEYS=("${CURRENT_FRAME_KEYS[@]}")
+  PREVIOUS_FRAME_TEXT=("${CURRENT_FRAME_TEXT[@]}")
+  PREVIOUS_FRAME_STYLES=("${CURRENT_FRAME_STYLES[@]}")
+  PREVIOUS_FRAME_INDEX=()
+  for i in "${!PREVIOUS_FRAME_KEYS[@]}"; do
+    frame_key_index "${PREVIOUS_FRAME_KEYS[$i]}"
+    PREVIOUS_FRAME_INDEX[$FRAME_KEY_INDEX]=$i
+  done
+  FORCE_FULL_REDRAW=0
+}
+
+get_word_at_position() {
+  local words="$1" target="$2" position=0 word
+  FUNCTION_RESULT=""
+  for word in $words; do
+    if (( position == target )); then FUNCTION_RESULT="$word"; return; fi
+    position=$((position + 1))
+  done
+}
+
+get_line_at_position() {
+  local content="$1" target="$2" position=0 line
+  FUNCTION_RESULT=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( position == target )); then FUNCTION_RESULT="$line"; return; fi
+    position=$((position + 1))
+  done <<< "$content"
+}
+
+resolve_table_widths() {
+  local index="$1" layout="${PANEL_TABLE_LAYOUT[$1]:-table}"
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local count=0 width column result="" available_width
+
+  if [[ -n "${PANEL_TABLE_WIDTHS[$index]:-}" ]]; then
+    RESOLVED_WIDTHS="${PANEL_TABLE_WIDTHS[$index]}"
+    return
+  fi
+  if [[ "$layout" == "transpose" ]]; then
+    count=2
+  else
+    for column in ${PANEL_TABLE_COLUMNS[$index]}; do count=$((count + 1)); done
+  fi
+  available_width=$((content_width - (count - 1) * TABLE_COLUMN_GAP))
+  width=$((available_width / count))
+  while (( count > 0 )); do
+    result="${result}${width} "
+    count=$((count - 1))
+  done
+  RESOLVED_WIDTHS="${result% }"
+}
+
+build_raw_frame() {
+  local index="$1" row=0 line style=OK
+  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
+  local width=$((PANEL_WIDTHS[index] - 2)) height=$((PANEL_HEIGHTS[index] - 2))
+  local content="${PANEL_OUTPUTS[$index]:-No data}"
+
+  [[ "${PANEL_RENDER_MODES[$index]:-raw}" == "failed" ]] && style=ERROR
+  while (( row < height )); do
+    get_line_at_position "$content" "$row"
+    line="$FUNCTION_RESULT"
+    frame_add "$((y + row))" "$x" "$width" "$line" "$style"
+    row=$((row + 1))
+  done
+}
+
+build_table_frame() {
+  local index="$1" row=0 col width offset cell line status_line status alignment column_count=0
+  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local content_height=$((PANEL_HEIGHTS[index] - 2))
+
+  resolve_table_widths "$index"
+  for width in $RESOLVED_WIDTHS; do column_count=$((column_count + 1)); done
+  while (( row < content_height )); do
+    if (( row > 0 )) && [[ -z "${PANEL_TABLE_ROWS[$index]:-}" ]]; then
+      if (( row == 1 )); then
+        frame_add "$((y + row))" "$x" "$content_width" "No data" OK
+      else
+        frame_add "$((y + row))" "$x" "$content_width" "" OK
+      fi
+      row=$((row + 1))
+      continue
+    fi
+    offset=0
+    line=""
+    status_line=""
+    if (( row > 0 )); then
+      get_line_at_position "${PANEL_TABLE_ROWS[$index]:-}" "$((row - 1))"
+      line="$FUNCTION_RESULT"
+      get_table_status_line "$index" "$row"
+      status_line="$FUNCTION_RESULT"
+    fi
+    col=0
+    for width in $RESOLVED_WIDTHS; do
+      if (( row == 0 )); then
+        get_word_at_position "${PANEL_TABLE_HEADERS[$index]}" "$col"
+        cell="$FUNCTION_RESULT"
+        status=OK
+        alignment=left
+      else
+        get_word_at_position "$line" "$col"
+        cell="$FUNCTION_RESULT"
+        get_status_at_position "$status_line" "$col"
+        status="$FUNCTION_RESULT"
+        alignment=left
+        is_number "$cell" && alignment=right
+      fi
+      frame_add "$((y + row))" "$((x + offset))" "$width" "$cell" "$status" "$alignment"
+      offset=$((offset + width))
+      if (( col < column_count - 1 )); then
+        frame_add "$((y + row))" "$((x + offset))" "$TABLE_COLUMN_GAP" "" OK
+        offset=$((offset + TABLE_COLUMN_GAP))
+      fi
+      col=$((col + 1))
+    done
+    if (( offset < content_width )); then
+      frame_add "$((y + row))" "$((x + offset))" "$((content_width - offset))" "" OK
+    fi
+    row=$((row + 1))
+  done
+}
+
+build_transpose_frame() {
+  local index="$1" row=0 source_row=1 column_index column value status alignment line
+  local x=$((PANEL_X[index] + 1)) y=$((PANEL_Y[index] + 1))
+  local content_width=$((PANEL_WIDTHS[index] - 2))
+  local content_height=$((PANEL_HEIGHTS[index] - 2))
+  local source="${PANEL_TABLE_ROWS[$index]:-}"
+  local statuses=""
+  local key_width value_width
+
+  if [[ -z "$source" ]]; then
+    while (( row < content_height )); do
+      if (( row == 0 )); then
+        frame_add "$y" "$x" "$content_width" "No data" OK
+      else
+        frame_add "$((y + row))" "$x" "$content_width" "" OK
+      fi
+      row=$((row + 1))
+    done
+    return
+  else
+    resolve_table_widths "$index"
+    get_word_at_position "$RESOLVED_WIDTHS" 0
+    key_width="$FUNCTION_RESULT"
+    get_word_at_position "$RESOLVED_WIDTHS" 1
+    value_width="$FUNCTION_RESULT"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    get_table_status_line "$index" "$source_row"
+    statuses="$FUNCTION_RESULT"
+    column_index=0
+    for column in ${PANEL_TABLE_HEADERS[$index]}; do
+      (( row >= content_height )) && break 2
+      get_word_at_position "$line" "$column_index"
+      value="$FUNCTION_RESULT"
+      get_status_at_position "$statuses" "$column_index"
+      status="$FUNCTION_RESULT"
+      alignment=left
+      is_number "$value" && alignment=right
+      frame_add "$((y + row))" "$x" "$key_width" "$column" OK
+      frame_add "$((y + row))" "$((x + key_width))" "$TABLE_COLUMN_GAP" "" OK
+      frame_add "$((y + row))" "$((x + key_width + TABLE_COLUMN_GAP))" "$value_width" "$value" "$status" "$alignment"
+      if (( key_width + TABLE_COLUMN_GAP + value_width < content_width )); then
+        frame_add "$((y + row))" "$((x + key_width + TABLE_COLUMN_GAP + value_width))" "$((content_width - key_width - TABLE_COLUMN_GAP - value_width))" "" OK
+      fi
+      row=$((row + 1))
+      column_index=$((column_index + 1))
+    done
+    source_row=$((source_row + 1))
+  done <<< "$source"
+
+  while (( row < content_height )); do
+    frame_add "$((y + row))" "$x" "$content_width" "" OK
+    row=$((row + 1))
+  done
+}
+
+build_current_frame() {
+  local index
+  CURRENT_FRAME_KEYS=()
+  CURRENT_FRAME_TEXT=()
+  CURRENT_FRAME_STYLES=()
+  CURRENT_FRAME_INDEX=()
+  for index in "${PANEL_ORDER[@]}"; do
+    case "${PANEL_RENDER_MODES[$index]:-raw}" in
+      table) build_table_frame "$index" ;;
+      transpose) build_transpose_frame "$index" ;;
+      *) build_raw_frame "$index" ;;
+    esac
+  done
+}
+
+draw_static_dashboard() {
+  local index title title_text title_width inner_width left_fill
+  # Clear the terminal and return the cursor home for a forced full redraw.
+  printf '\033[2J\033[H'
+  for index in "${PANEL_ORDER[@]}"; do
+    draw_panel_border "${PANEL_X[$index]}" "${PANEL_Y[$index]}" "${PANEL_WIDTHS[$index]}" "${PANEL_HEIGHTS[$index]}"
+    inner_width=$((PANEL_WIDTHS[index] - 2))
+    title_width=$((inner_width - 2))
+    (( title_width < 0 )) && title_width=0
+    clip_text "${PANEL_TITLES[$index]}" "$title_width"
+    title_text="$FUNCTION_RESULT"
+    title=" ${title_text} "
+    left_fill=$(((inner_width - ${#title}) / 2))
+    # Move to the centered title position, leaving the remaining border dashes intact.
+    move_cursor "${PANEL_Y[$index]}" "$((PANEL_X[index] + 1 + left_fill))"
+    printf '%s' "$title"
+  done
+  # Move below the configured layout before drawing the static footer.
+  move_cursor "$((REQUIRED_ROWS + 1))" 1
+  printf 'Refresh: %ss | Press q to exit.' "$REFRESH_INTERVAL"
+}
+
+render_dashboard() {
+  if (( FORCE_FULL_REDRAW == 1 )); then
+    PREVIOUS_FRAME_KEYS=()
+    PREVIOUS_FRAME_TEXT=()
+    PREVIOUS_FRAME_STYLES=()
+    PREVIOUS_FRAME_INDEX=()
+    draw_static_dashboard
+  fi
+  build_current_frame
+  render_frame_diff
+  # Return the cursor to the footer after all changed cells are painted.
+  move_cursor "$((REQUIRED_ROWS + 1))" 1
+}
+
+initialize_loading_dashboard() {
+  local index
+
+  PANEL_OUTPUTS=()
+  PANEL_RENDER_MODES=()
+  PANEL_STATUSES=()
+  PANEL_TABLE_HEADERS=()
+  PANEL_TABLE_ROWS=()
+  PANEL_TABLE_CELL_STATUSES=()
+  PANEL_SSH_FAILURE_ROWS=()
+
+  for index in "${PANEL_ORDER[@]}"; do
+    PANEL_OUTPUTS[$index]="Loading..."
+    PANEL_RENDER_MODES[$index]="raw"
+    PANEL_STATUSES[$index]="OK"
+  done
+}
+
+run_panel_commands() {
+  local index alias target job panel_index status_file
+  local remaining made_progress completed total
+
+  PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_OUTPUT_FILES=()
+  PANEL_COMMAND_STATUS_FILES=()
+  PANEL_COMMAND_COLLECTED=()
+  PANEL_COMMAND_PANEL_INDEXES=()
+  PANEL_COMMAND_ALIASES=()
+  PANEL_COMMAND_TARGETS=()
+  PANEL_COMMAND_INPUT_FILES=()
+  PANEL_COMMAND_ERROR_FILES=()
+  PANEL_COMMAND_EXIT_STATUSES=()
+  PANEL_COMMAND_COUNTS=()
+  PANEL_COMMAND_COMPLETED_COUNTS=()
+  PANEL_COMMAND_JOB_COUNT=0
+
+  if [[ -z "$PANEL_COMMAND_TEMP_DIR" ]]; then
+    PANEL_COMMAND_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc.commands.XXXXXX")" || {
+      error "unable to create command output directory"
+      return 1
+    }
+  fi
+
+  # Flatten local panels and per-server SSH commands into independently tracked
+  # jobs. This keeps Bash 3.2 compatibility while allowing both levels to run
+  # concurrently.
+  for index in "${PANEL_ORDER[@]}"; do
+    PANEL_COMMAND_COUNTS[$index]=0
+    PANEL_COMMAND_COMPLETED_COUNTS[$index]=0
+    if has_array_index PANEL_SSH_ALIASES "$index"; then
+      for alias in ${PANEL_SSH_ALIASES[$index]}; do
+        resolve_ssh_target "$alias"
+        target="$FUNCTION_RESULT"
+        start_panel_command_job "$index" "$alias" "$target"
+        PANEL_COMMAND_COUNTS[$index]=$((PANEL_COMMAND_COUNTS[index] + 1))
+      done
+    else
+      start_panel_command_job "$index" "" ""
+      PANEL_COMMAND_COUNTS[$index]=1
+    fi
+  done
+
+  remaining="$PANEL_COMMAND_JOB_COUNT"
+  # Poll portable completion markers instead of wait -n, which is unavailable
+  # in the Bash version shipped with older macOS releases.
+  while (( remaining > 0 )); do
+    made_progress=0
+    for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+      [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 1 ]] && continue
+      status_file="${PANEL_COMMAND_STATUS_FILES[$job]}"
+      [[ -s "$status_file" ]] || continue
+
+      wait "${PANEL_COMMAND_PIDS[$job]}" 2>/dev/null || true
+      PANEL_COMMAND_EXIT_STATUSES[$job]="$(<"$status_file")"
+      PANEL_COMMAND_COLLECTED[$job]=1
+      remaining=$((remaining - 1))
+      made_progress=1
+      panel_index="${PANEL_COMMAND_PANEL_INDEXES[$job]}"
+      completed=$((PANEL_COMMAND_COMPLETED_COUNTS[panel_index] + 1))
+      PANEL_COMMAND_COMPLETED_COUNTS[$panel_index]="$completed"
+      total="${PANEL_COMMAND_COUNTS[$panel_index]}"
+      if (( completed == total )); then
+        finalize_panel_command_output "$panel_index"
+        render_dashboard
+      fi
+    done
+
+    if (( remaining > 0 && made_progress == 0 )); then
+      sleep 0.05
+    fi
+  done
+
+  PANEL_COMMAND_PIDS=()
+  PANEL_COMMAND_COLLECTED=()
+}
+
+start_panel_command_job() {
+  local panel_index="$1" alias="$2" target="$3"
+  local job="$PANEL_COMMAND_JOB_COUNT"
+  local output_file="$PANEL_COMMAND_TEMP_DIR/output.$job"
+  local status_file="$PANEL_COMMAND_TEMP_DIR/status.$job"
+  local input_file="$PANEL_COMMAND_TEMP_DIR/input.$job"
+  local error_file="$PANEL_COMMAND_TEMP_DIR/error.$job"
+
+  PANEL_COMMAND_JOB_COUNT=$((PANEL_COMMAND_JOB_COUNT + 1))
+  PANEL_COMMAND_PANEL_INDEXES[$job]="$panel_index"
+  PANEL_COMMAND_ALIASES[$job]="$alias"
+  PANEL_COMMAND_TARGETS[$job]="$target"
+  PANEL_COMMAND_OUTPUT_FILES[$job]="$output_file"
+  PANEL_COMMAND_STATUS_FILES[$job]="$status_file"
+  PANEL_COMMAND_ERROR_FILES[$job]="$error_file"
+  : >"$status_file"
+  : >"$error_file"
+
+  if [[ -n "$alias" ]]; then
+    PANEL_COMMAND_INPUT_FILES[$job]="$input_file"
+    printf '%s\n' "${PANEL_COMMANDS[$panel_index]}" >"$input_file"
+  fi
+
+  (
+    local child_pid="" exit_status
+    trap 'if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; exit 143' TERM INT
+    if [[ -n "$alias" ]]; then
+      ssh -T \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=yes \
+        "$target" bash -s <"$input_file" >"$output_file" 2>"$error_file" &
+    else
+      bash -c "${PANEL_COMMANDS[$panel_index]}" >"$output_file" 2>"$error_file" &
+    fi
+    child_pid=$!
+    wait "$child_pid"
+    exit_status=$?
+    trap - TERM INT
+    printf '%s\n' "$exit_status" >"$status_file"
+  ) &
+  PANEL_COMMAND_PIDS[$job]=$!
+}
+
+finalize_panel_command_output() {
+  local panel_index="$1" job exit_status output_file
+
+  if has_array_index PANEL_SSH_ALIASES "$panel_index"; then
+    aggregate_ssh_panel_output "$panel_index"
+    return
+  fi
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]}" == "$panel_index" ]] || continue
+    exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
+    output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
+    if [[ "$exit_status" -eq 0 ]]; then
+      PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      prepare_panel_output "$panel_index"
+    else
+      PANEL_OUTPUTS[$panel_index]="Command failed"
+      PANEL_RENDER_MODES[$panel_index]="failed"
+      PANEL_STATUSES[$panel_index]="FAILED"
+    fi
+    return
+  done
+}
+
+aggregate_ssh_panel_output() {
+  local panel_index="$1" job alias exit_status output line
+  local aggregate="" failed=0 row_number=0 failure_rows=" "
+  local table_mode=0 column_count=0 column
+
+  if has_array_index PANEL_TABLE_COLUMNS "$panel_index"; then
+    table_mode=1
+    for column in ${PANEL_TABLE_COLUMNS[$panel_index]}; do
+      column_count=$((column_count + 1))
+    done
+  fi
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]}" == "$panel_index" ]] || continue
+    alias="${PANEL_COMMAND_ALIASES[$job]}"
+    exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
+    output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+
+    if (( table_mode == 1 )); then
+      if [[ "$exit_status" -ne 0 ]]; then
+        build_ssh_synthetic_row "$alias" "SSH_FAILED" "$column_count"
+        aggregate="${aggregate}${FUNCTION_RESULT}"$'\n'
+        row_number=$((row_number + 1))
+        failure_rows="${failure_rows}${row_number} "
+        failed=1
+      elif [[ -z "$output" ]]; then
+        build_ssh_synthetic_row "$alias" "No_data" "$column_count"
+        aggregate="${aggregate}${FUNCTION_RESULT}"$'\n'
+        row_number=$((row_number + 1))
+      else
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          [[ -z "$line" ]] && continue
+          aggregate="${aggregate}${alias} ${line}"$'\n'
+          row_number=$((row_number + 1))
+        done <<< "$output"
+      fi
+    else
+      if [[ "$exit_status" -ne 0 ]]; then
+        aggregate="${aggregate}${alias} SSH_FAILED (exit ${exit_status})"$'\n'
+        failed=1
+      elif [[ -z "$output" ]]; then
+        aggregate="${aggregate}${alias} No data"$'\n'
+      else
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          aggregate="${aggregate}${alias} ${line}"$'\n'
+        done <<< "$output"
+      fi
+    fi
+  done
+
+  PANEL_OUTPUTS[$panel_index]="${aggregate%$'\n'}"
+  PANEL_SSH_FAILURE_ROWS[$panel_index]="${failure_rows% }"
+  prepare_panel_output "$panel_index"
+  if (( failed == 1 )) && [[ "${PANEL_RENDER_MODES[$panel_index]}" == "raw" ]]; then
+    PANEL_RENDER_MODES[$panel_index]="failed"
+    PANEL_STATUSES[$panel_index]="FAILED"
+  fi
+}
+
+build_ssh_synthetic_row() {
+  local alias="$1" marker="$2" column_count="$3" position=2 row
+
+  row="$alias $marker"
+  while (( position < column_count )); do
+    row="${row} -"
+    position=$((position + 1))
+  done
+  FUNCTION_RESULT="$row"
+}
+
+prepare_panel_output() {
+  local index="$1"
+
+  PANEL_RENDER_MODES[$index]="raw"
+  PANEL_STATUSES[$index]="OK"
+
+  if has_array_index PANEL_TABLE_COLUMNS "$index"; then
+    parse_table_output "$index" || return 0
+    evaluate_table_output "$index"
+  elif [[ -z "${PANEL_OUTPUTS[$index]}" ]]; then
+    PANEL_OUTPUTS[$index]="No data"
+  fi
+}
+
+parse_table_output() {
+  local index="$1"
+  local output="${PANEL_OUTPUTS[$index]}"
+  local columns="${PANEL_TABLE_COLUMNS[$index]}"
+  local column_count=0
+  local row_field_count
+  local line
+  local field
+  local table_rows=""
+
+  for line in $columns; do
+    column_count=$((column_count + 1))
+  done
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    row_field_count=0
+    for field in $line; do
+      row_field_count=$((row_field_count + 1))
+    done
+
+    if (( row_field_count != column_count )); then
+      PANEL_RENDER_MODES[$index]="raw"
+      PANEL_STATUSES[$index]="OK"
+      return 1
+    fi
+
+    table_rows="${table_rows}${line}"$'\n'
+  done <<< "$output"
+
+  PANEL_RENDER_MODES[$index]="${PANEL_TABLE_LAYOUT[$index]:-table}"
+  PANEL_TABLE_HEADERS[$index]="$columns"
+  PANEL_TABLE_ROWS[$index]="${table_rows%$'\n'}"
+}
+
+evaluate_table_output() {
+  local index="$1"
+  local line
+  local row=1
+  local col
+  local cell
+  local column
+  local cell_status
+  local status_line
+  local status_rows=""
+  local panel_status="OK"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    col=0
+    status_line=""
+    for cell in $line; do
+      if is_ssh_failure_row "$index" "$row"; then
+        cell_status="ERROR"
+      else
+        get_column_at_position "$index" "$col"
+        column="$FUNCTION_RESULT"
+        evaluate_cell "$index" "$column" "$cell"
+        cell_status="$FUNCTION_RESULT"
+      fi
+      status_line="${status_line}${cell_status} "
+      worst_status "$panel_status" "$cell_status"
+      panel_status="$FUNCTION_RESULT"
+      col=$((col + 1))
+    done
+
+    status_rows="${status_rows}${status_line% }"$'\n'
+    row=$((row + 1))
+  done <<< "${PANEL_TABLE_ROWS[$index]}"
+
+  PANEL_TABLE_CELL_STATUSES[$index]="${status_rows%$'\n'}"
+  PANEL_STATUSES[$index]="$panel_status"
+}
+
+is_ssh_failure_row() {
+  local index="$1" row="$2"
+  [[ " ${PANEL_SSH_FAILURE_ROWS[$index]:-} " == *" $row "* ]]
+}
+
+get_column_at_position() {
+  local index="$1"
+  local target="$2"
+  local position=0
+  local column
+
+  FUNCTION_RESULT=""
+  for column in ${PANEL_TABLE_COLUMNS[$index]}; do
+    if (( position == target )); then
+      FUNCTION_RESULT="$column"
+      return 0
+    fi
+    position=$((position + 1))
+  done
+}
+
+get_table_status_line() {
+  local index="$1"
+  local row="$2"
+  local current_row=1
+  local line
+
+  FUNCTION_RESULT=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( current_row == row )); then
+      FUNCTION_RESULT="$line"
+      return 0
+    fi
+    current_row=$((current_row + 1))
+  done <<< "${PANEL_TABLE_CELL_STATUSES[$index]:-}"
+}
+
+get_status_at_position() {
+  local status_line="$1"
+  local target="$2"
+  local position=0
+  local status
+
+  FUNCTION_RESULT="OK"
+  for status in $status_line; do
+    if (( position == target )); then
+      FUNCTION_RESULT="$status"
+      return 0
+    fi
+    position=$((position + 1))
+  done
+
+}
+
+evaluate_cell() {
+  local index="$1"
+  local column="$2"
+  local value="$3"
+
+  if rule_list_matches "$value" "$column" "${PANEL_ERROR_RULES[$index]:-}"; then
+    FUNCTION_RESULT="ERROR"
+    return 0
+  fi
+
+  if rule_list_matches "$value" "$column" "${PANEL_WARN_RULES[$index]:-}"; then
+    FUNCTION_RESULT="WARN"
+    return 0
+  fi
+
+  FUNCTION_RESULT="OK"
+}
+
+rule_list_matches() {
+  local value="$1"
+  local target_column="$2"
+  local rules="$3"
+  local rule
+  local column
+  local condition
+
+  for rule in $rules; do
+    column="${rule%%:*}"
+    condition="${rule#*:}"
+    if [[ "$column" == "$target_column" ]] && condition_matches "$value" "$condition"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+condition_matches() {
+  local value="$1"
+  local condition="$2"
+  local operator
+  local expected
+
+  parse_condition "$condition" || return 1
+  operator="$CONDITION_OPERATOR"
+  expected="$CONDITION_VALUE"
+
+  case "$operator" in
+    '=='|'!=')
+      if is_number "$value" && is_number "$expected"; then
+        compare_numbers "$value" "$operator" "$expected"
+      elif [[ "$operator" == '==' ]]; then
+        [[ "$value" == "$expected" ]]
+      else
+        [[ "$value" != "$expected" ]]
+      fi
+      ;;
+    '>'|'>='|'<'|'<=')
+      is_number "$value" && is_number "$expected" && compare_numbers "$value" "$operator" "$expected"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+is_number() {
+  [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+compare_numbers() {
+  local left="$1"
+  local operator="$2"
+  local right="$3"
+
+  compare_decimal_values "$left" "$right"
+  case "$operator" in
+    '>')  (( NUMERIC_COMPARE > 0 )) ;;
+    '>=') (( NUMERIC_COMPARE >= 0 )) ;;
+    '<')  (( NUMERIC_COMPARE < 0 )) ;;
+    '<=') (( NUMERIC_COMPARE <= 0 )) ;;
+    '==') (( NUMERIC_COMPARE == 0 )) ;;
+    '!=') (( NUMERIC_COMPARE != 0 )) ;;
+    *) return 1 ;;
+  esac
+}
+
+compare_decimal_values() {
+  local left="$1" right="$2" left_sign=1 right_sign=1
+  local left_integer left_fraction right_integer right_fraction length
+  local LC_ALL=C
+
+  [[ "$left" == -* ]] && left_sign=-1 && left="${left#-}"
+  [[ "$right" == -* ]] && right_sign=-1 && right="${right#-}"
+  left_integer="${left%%.*}"
+  right_integer="${right%%.*}"
+  [[ "$left" == *.* ]] && left_fraction="${left#*.}" || left_fraction=""
+  [[ "$right" == *.* ]] && right_fraction="${right#*.}" || right_fraction=""
+  while [[ "${left_integer#0}" != "$left_integer" ]]; do left_integer="${left_integer#0}"; done
+  while [[ "${right_integer#0}" != "$right_integer" ]]; do right_integer="${right_integer#0}"; done
+  [[ -n "$left_integer" ]] || left_integer=0
+  [[ -n "$right_integer" ]] || right_integer=0
+  [[ "$left_integer$left_fraction" =~ ^0+$ ]] && left_sign=1
+  [[ "$right_integer$right_fraction" =~ ^0+$ ]] && right_sign=1
+
+  if (( left_sign != right_sign )); then
+    NUMERIC_COMPARE=$left_sign
+    return
+  fi
+  if (( ${#left_integer} != ${#right_integer} )); then
+    (( ${#left_integer} > ${#right_integer} )) && NUMERIC_COMPARE=1 || NUMERIC_COMPARE=-1
+  elif [[ "$left_integer" == "$right_integer" ]]; then
+    length=${#left_fraction}
+    (( ${#right_fraction} > length )) && length=${#right_fraction}
+    while (( ${#left_fraction} < length )); do left_fraction="${left_fraction}0"; done
+    while (( ${#right_fraction} < length )); do right_fraction="${right_fraction}0"; done
+    if [[ "$left_fraction" == "$right_fraction" ]]; then
+      NUMERIC_COMPARE=0
+    elif [[ "$left_fraction" > "$right_fraction" ]]; then
+      NUMERIC_COMPARE=1
+    else
+      NUMERIC_COMPARE=-1
+    fi
+  elif [[ "$left_integer" > "$right_integer" ]]; then
+    NUMERIC_COMPARE=1
+  else
+    NUMERIC_COMPARE=-1
+  fi
+  (( left_sign < 0 )) && NUMERIC_COMPARE=$((-NUMERIC_COMPARE))
+}
+
+worst_status() {
+  local current="$1"
+  local candidate="$2"
+
+  if [[ "$current" == "ERROR" || "$candidate" == "ERROR" ]]; then
+    FUNCTION_RESULT="ERROR"
+  elif [[ "$current" == "WARN" || "$candidate" == "WARN" ]]; then
+    FUNCTION_RESULT="WARN"
+  else
+    FUNCTION_RESULT="OK"
+  fi
+}
+
+wait_for_quit_or_timeout() {
+  local timeout="$1"
+  local key
+
+  if IFS= read -rsn1 -t "$timeout" key; then
+    [[ "$key" == "q" ]]
+    return
+  fi
+
+  return 1
+}
+
+show_resize_pause() {
+  # Clear the dashboard and return the cursor home for the resize message.
+  printf '\033[2J\033[H'
+  printf 'Terminal too small: need %sx%s, have %sx%s. Resize or press q to exit.' \
+    "$REQUIRED_COLS" "$REQUIRED_TERMINAL_ROWS" "$TERMINAL_COLS" "$TERMINAL_ROWS"
+}
+
+process_terminal_resize() {
+  read_terminal_size || return 1
+  RESIZE_PENDING=0
+
+  if (( TERMINAL_COLS < REQUIRED_COLS || TERMINAL_ROWS < REQUIRED_TERMINAL_ROWS )); then
+    if (( DASHBOARD_PAUSED == 0 )); then
+      show_resize_pause
+    fi
+    DASHBOARD_PAUSED=1
+    return 1
+  fi
+
+  if (( DASHBOARD_PAUSED == 1 )); then
+    DASHBOARD_PAUSED=0
+  fi
+  FORCE_FULL_REDRAW=1
+  return 0
+}
+
+run_dashboard_loop() {
+  while true; do
+    if (( RESIZE_PENDING == 1 || DASHBOARD_PAUSED == 1 )); then
+      process_terminal_resize || true
+    fi
+
+    if (( DASHBOARD_PAUSED == 1 )); then
+      if wait_for_quit_or_timeout 1; then
+        return 0
+      fi
+      continue
+    fi
+
+    run_panel_commands
+
+    if wait_for_quit_or_timeout "$REFRESH_INTERVAL"; then
+      return 0
+    fi
+  done
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help|--usage)
+      usage
+      return 0
+      ;;
+  esac
+
+  local config_file="${1:-$DEFAULT_CONFIG}"
+
+  if ! load_config "$config_file"; then
+    return 1
+  fi
+
+  if ! validate_terminal_size; then
+    return 1
+  fi
+
+  trap cleanup_terminal EXIT
+  trap handle_interrupt INT
+  trap handle_resize WINCH
+
+  setup_terminal
+  initialize_loading_dashboard
+  render_dashboard
+  run_dashboard_loop
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

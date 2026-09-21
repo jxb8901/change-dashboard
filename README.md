@@ -54,7 +54,7 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.4 includes explicit SSH polling-master lifecycle and reliable stream
+V5.5 includes asynchronous per-target SSH polling-master lifecycle and reliable stream
 shutdown/process handling on top of the V5.2 multi-server SSH execution,
 partial refresh, continuous raw/table
 stream panels with event-driven redraws, fixed-width tables, multi-row
@@ -65,10 +65,13 @@ During shutdown LHC gives active local/SSH commands and stream collectors a
 short TERM grace period, escalates to KILL when necessary, reaps wrappers
 within a bound, and closes SSH control masters. Completed refresh jobs are
 removed from active scheduler state. SSH polling masters are created explicitly
-per target with bounded `ControlPersist=30`; polling commands use independent
-channels over that master, while continuous streams use dedicated
-non-multiplexed connections. LHC checks master readiness before polling,
-recreates stale/dead masters, and retries a failed polling transport once.
+per target with bounded `ControlPersist=30`; master creation runs in a
+per-target background lifecycle worker, so slow or unreachable targets do not
+block local panels or keyboard input. Polling commands use independent channels
+over that master, while continuous streams use dedicated non-multiplexed
+connections. LHC checks master readiness before polling, recreates stale/dead
+masters with one worker per target, backs off failed targets, and retries a
+failed polling transport once.
 An abnormal termination therefore cannot leave a master indefinitely.
 
 Press `q` or `Ctrl-C` for normal shutdown. `Ctrl-Z` suspends a foreground Unix
@@ -124,7 +127,7 @@ Run the V5.3 shutdown and process-lifecycle regression test:
 bash tests/test_v5_shutdown.sh
 ```
 
-Run the V5.4 SSH master lifecycle regression test:
+Run the V5.5 SSH master lifecycle regression test:
 
 ```bash
 bash tests/test_v6_ssh_lifecycle.sh

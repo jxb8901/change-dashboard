@@ -62,6 +62,12 @@ if [[ "$operation" == "check" ]]; then
 fi
 if (( master_request == 1 )); then
   [[ -n "$control_path" ]] || exit 64
+  if [[ -n "${FAKE_SSH_MASTER_DELAY_SECONDS:-}" ]]; then
+    sleep "$FAKE_SSH_MASTER_DELAY_SECONDS"
+  fi
+  if [[ "${FAKE_SSH_MASTER_FAIL_TARGET:-}" == "$target" ]]; then
+    exit 255
+  fi
   mkdir -p "${control_path}.fake-state" 2>/dev/null || exit 255
   [[ -n "$FAKE_SSH_LOG" ]] && printf 'master %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
   exit 0

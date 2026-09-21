@@ -37,4 +37,6 @@ percentage-based panel geometry. V5.2 also defines height-bounded continuous
 raw/table stream panels for local and SSH commands, with event-driven redraws.
 V5.3 adds bounded TERM/KILL shutdown, active PID ownership checks,
 completed-job compaction, responsive keyboard handling, and bounded SSH
-control-master persistence.
+control-master persistence. V5.5 adds asynchronous per-target master workers,
+STARTING/READY/FAILED lifecycle state with retry backoff, and direct ownership
+of the actual SSH channel/stream PID by each command wrapper.

@@ -1,10 +1,11 @@
 # V5 Requirements
 
-- V5.4 creates one explicit, bounded SSH polling master per target. Polling
-  commands use independent non-master channels over that control path, while
-  continuous SSH streams use dedicated non-multiplexed connections. LHC checks
-  readiness before use, recreates stale/dead masters, and retries a transport
-  failure at most once.
+- V5.5 creates one explicit, bounded SSH polling master per target through a
+  Bash 3.2-safe background lifecycle worker. Targets move through
+  `STARTING`, `READY`, and `FAILED` state; failed targets use retry backoff.
+  Polling command wrappers wait for readiness without blocking the scheduler,
+  launch the actual SSH channel directly, and retry a dead transport at most
+  once. Continuous SSH streams use dedicated non-multiplexed connections.
 
 - SSH polling commands keep one explicit OpenSSH transport per target during
   one LHC process while retaining independent sessions/channels; streams use
@@ -40,7 +41,8 @@
 - Shutdown is bounded: LHC sends `TERM`, waits briefly, sends `KILL` to
   TERM-resistant children, then stops and reaps wrappers. SSH control masters
   use bounded `ControlPersist=30`, are explicitly closed with `-O exit`, and
-  are never used by stream connections.
+  are never used by stream connections. Master workers and actual SSH child
+  processes are tracked with PID/identity files and cleaned up separately.
   Only a live process with the recorded parent and identity is eligible for a
   cleanup signal.
 - `q` and `Ctrl-C` remain connected to the keyboard wait even when continuous
