@@ -137,6 +137,93 @@ unset FAKE_SSH_MASTER_DELAY_SECONDS FAKE_SSH_MASTER_FAIL_TARGET RESPONSIVE_FILE
   cleanup_panel_commands
 )
 
+FALLBACK_ARM_FILE="$TEST_TEMP_DIR/drop-after-ready-check"
+(
+  FALLBACK_LOG="$TEST_TEMP_DIR/fallback.log"
+  export FAKE_SSH_LOG="$FALLBACK_LOG"
+  export FAKE_SSH_ALLOW_CHANNEL_FALLBACK=1
+  export FAKE_SSH_DROP_MASTER_AFTER_CHECK_FILE="$FALLBACK_ARM_FILE"
+  source "$TEST_ROOT/bin/lhc"
+  SSH_SERVERS=("APP|app")
+  PANEL_TITLES[0]='OpenSSH fallback recovery'
+  PANEL_COMMANDS[0]='printf "fallback-ok\\n"'
+  PANEL_SSH_ALIASES[0]='APP'
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=32; PANEL_HEIGHTS[0]=8
+
+  validate_config || fail_test "fallback configuration was rejected"
+  TERMINAL_ROWS=20; TERMINAL_COLS=80; resolve_panel_dimensions
+  initialize_loading_dashboard
+  render_dashboard() { :; }
+  wait_for_panel 0
+  assert_equal "APP fallback-ok" "${PANEL_OUTPUTS[0]}" "initial fallback output"
+
+  : >"$FALLBACK_ARM_FILE"
+  PANEL_NEXT_RUN_SECONDS[0]=0
+  wait_for_panel 0
+  assert_equal "APP fallback-ok" "${PANEL_OUTPUTS[0]}" "output after standalone fallback"
+  PANEL_NEXT_RUN_SECONDS[0]=9999
+
+  CONTROL_PATH="${SSH_CONTROL_PATHS[0]}"
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    service_ssh_polling_masters
+    read_ssh_master_state "$CONTROL_PATH"
+    MASTER_COUNT="$(awk '$1 == "master" { count += 1 } END { print count + 0 }' "$FALLBACK_LOG")"
+    [[ "$MASTER_COUNT" -ge 2 && "$FUNCTION_RESULT" == "READY" ]] && break
+    sleep 0.02
+  done
+  assert_equal "2" "$MASTER_COUNT" "fallback master recovery"
+  FALLBACK_COUNT="$(awk '$1 == "fallback" { count += 1 } END { print count + 0 }' "$FALLBACK_LOG")"
+  assert_equal "1" "$FALLBACK_COUNT" "standalone fallback channel"
+  cleanup_panel_commands
+)
+unset FAKE_SSH_ALLOW_CHANNEL_FALLBACK FAKE_SSH_DROP_MASTER_AFTER_CHECK_FILE
+
+RECOVERY_DROP_FILE="$TEST_TEMP_DIR/drop-during-recovery"
+RECOVERY_DELAY_FILE="$TEST_TEMP_DIR/delay-during-recovery"
+(
+  RECOVERY_LOG="$TEST_TEMP_DIR/recovery.log"
+  export FAKE_SSH_LOG="$RECOVERY_LOG"
+  export FAKE_SSH_DROP_FIRST_CHANNEL_FILE="$RECOVERY_DROP_FILE"
+  export FAKE_SSH_MASTER_DELAY_FILE="$RECOVERY_DELAY_FILE"
+  export FAKE_SSH_MASTER_DELAY_FILE_SECONDS=3
+  : >"$RECOVERY_DROP_FILE"
+  source "$TEST_ROOT/bin/lhc"
+  SSH_SERVERS=("APP|app")
+  PANEL_TITLES[0]='Recovery child cleanup'
+  PANEL_COMMANDS[0]='printf "recovery-ok\\n"'
+  PANEL_SSH_ALIASES[0]='APP'
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=32; PANEL_HEIGHTS[0]=8
+
+  validate_config || fail_test "recovery cleanup configuration was rejected"
+  TERMINAL_ROWS=20; TERMINAL_COLS=80; resolve_panel_dimensions
+  initialize_loading_dashboard
+  render_dashboard() { :; }
+  wait_for_panel 0
+  assert_equal "APP recovery-ok" "${PANEL_OUTPUTS[0]}" "initial recovery-cleanup output"
+
+  CONTROL_PATH="${SSH_CONTROL_PATHS[0]}"
+  CHILD_PID_FILE="$PANEL_COMMAND_TEMP_DIR/child.0"
+  CHILD_IDENTITY_FILE="$PANEL_COMMAND_TEMP_DIR/child-identity.0"
+  rm -f "$RECOVERY_DROP_FILE"
+  : >"$RECOVERY_DELAY_FILE"
+  PANEL_NEXT_RUN_SECONDS[0]=0
+  OBSERVED_CLEANUP=0
+  for ((attempt = 0; attempt < 160; attempt++)); do
+    run_panel_commands || fail_test "recovery cleanup scheduler failed"
+    if [[ -e "${CONTROL_PATH}.recover" && ! -s "$CHILD_PID_FILE" &&
+      ! -s "$CHILD_IDENTITY_FILE" ]]; then
+      OBSERVED_CLEANUP=1
+      break
+    fi
+    sleep 0.02
+  done
+  [[ "$OBSERVED_CLEANUP" -eq 1 ]] || fail_test "stale child identity remained during recovery wait"
+  cleanup_panel_commands
+  [[ ! -s "$CHILD_PID_FILE" && ! -s "$CHILD_IDENTITY_FILE" ]] ||
+    fail_test "child identity files were not empty after cleanup"
+)
+unset FAKE_SSH_DROP_FIRST_CHANNEL_FILE FAKE_SSH_MASTER_DELAY_FILE FAKE_SSH_MASTER_DELAY_FILE_SECONDS
+
 RECOVERY_DROP_FILE="$TEST_TEMP_DIR/drop-first-channel"
 export FAKE_SSH_DROP_FIRST_CHANNEL_FILE="$RECOVERY_DROP_FILE"
 (

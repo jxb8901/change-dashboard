@@ -56,6 +56,11 @@ fi
 if [[ "$operation" == "check" ]]; then
   if [[ -n "$control_path" && -d "${control_path}.fake-state" ]]; then
     [[ -n "$FAKE_SSH_LOG" ]] && printf 'check %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+    if [[ -n "${FAKE_SSH_DROP_MASTER_AFTER_CHECK_FILE:-}" &&
+      -e "$FAKE_SSH_DROP_MASTER_AFTER_CHECK_FILE" ]]; then
+      rm -f "$FAKE_SSH_DROP_MASTER_AFTER_CHECK_FILE"
+      rm -rf "${control_path}.fake-state"
+    fi
     exit 0
   fi
   exit 255
@@ -64,6 +69,10 @@ if (( master_request == 1 )); then
   [[ -n "$control_path" ]] || exit 64
   if [[ -n "${FAKE_SSH_MASTER_DELAY_SECONDS:-}" ]]; then
     sleep "$FAKE_SSH_MASTER_DELAY_SECONDS"
+  fi
+  if [[ -n "${FAKE_SSH_MASTER_DELAY_FILE:-}" &&
+    -e "$FAKE_SSH_MASTER_DELAY_FILE" ]]; then
+    sleep "${FAKE_SSH_MASTER_DELAY_FILE_SECONDS:-1}"
   fi
   if [[ "${FAKE_SSH_MASTER_FAIL_TARGET:-}" == "$target" ]]; then
     exit 255
@@ -75,7 +84,10 @@ fi
 [[ "${1:-}" == "bash" && "${2:-}" == "-s" ]] || exit 64
 
 if [[ "$control_master" == "no" && "$control_path" != "none" ]]; then
-  [[ -d "${control_path}.fake-state" ]] || exit 255
+  if [[ ! -d "${control_path}.fake-state" ]]; then
+    [[ "${FAKE_SSH_ALLOW_CHANNEL_FALLBACK:-0}" == "1" ]] || exit 255
+    [[ -n "$FAKE_SSH_LOG" ]] && printf 'fallback %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
+  fi
   [[ -n "$FAKE_SSH_LOG" ]] && printf 'channel %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
   if [[ -n "${FAKE_SSH_DROP_FIRST_CHANNEL_FILE:-}" && ! -e "$FAKE_SSH_DROP_FIRST_CHANNEL_FILE" ]]; then
     : >"$FAKE_SSH_DROP_FIRST_CHANNEL_FILE"

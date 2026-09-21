@@ -2436,7 +2436,7 @@ request_ssh_master_recovery() {
 }
 
 wait_for_ssh_polling_master() {
-  local control_path="$1" state attempts max_attempts
+  local target="$1" control_path="$2" state attempts max_attempts
 
   max_attempts=$(( (SSH_CONNECT_TIMEOUT_SECONDS + 2) * 20 ))
   for ((attempts = 0; attempts < max_attempts; attempts++)); do
@@ -2444,7 +2444,10 @@ wait_for_ssh_polling_master() {
     state="$FUNCTION_RESULT"
     case "$state" in
       READY)
-        return 0
+        if ssh_polling_master_ready "$target" "$control_path"; then
+          return 0
+        fi
+        request_ssh_master_recovery "$target" "$control_path"
         ;;
       FAILED|CLOSED)
         return 1
@@ -2539,7 +2542,7 @@ service_ssh_polling_masters() {
 launch_ssh_command() {
   local target="$1" input_file="$2" output_file="$3" error_file="$4"
   local child_pid_file="$5" child_identity_file="$6" control_path="$7"
-  local launched_pid
+  local launched_pid exit_status
 
   if [[ "$control_path" == "none" ]]; then
     ssh -T \
@@ -2565,7 +2568,11 @@ launch_ssh_command() {
   printf '%s\n' "$launched_pid" >"$child_pid_file"
   get_process_identity "$launched_pid" >"$child_identity_file"
   wait "$launched_pid"
-  FUNCTION_RESULT=$?
+  exit_status=$?
+  child_pid=""
+  : >"$child_pid_file"
+  : >"$child_identity_file"
+  FUNCTION_RESULT="$exit_status"
 }
 
 run_ssh_polling_command() {
@@ -2576,7 +2583,16 @@ run_ssh_polling_command() {
   launch_ssh_command "$target" "$input_file" "$output_file" "$error_file" \
     "$child_pid_file" "$child_identity_file" "$control_path"
   exit_status="$FUNCTION_RESULT"
-  (( exit_status == 0 )) && { FUNCTION_RESULT=0; return 0; }
+  if (( exit_status == 0 )); then
+    # A bounded ControlPersist master can expire immediately after the
+    # channel succeeds. Re-check it so the next polling job cannot trust a
+    # stale READY state and silently fall back to a standalone SSH session.
+    if ! ssh_polling_master_ready "$target" "$control_path"; then
+      request_ssh_master_recovery "$target" "$control_path"
+    fi
+    FUNCTION_RESULT=0
+    return 0
+  fi
 
   # A command failure with a healthy master is a remote-command failure, not
   # a transport failure. Only recreate/retry when the control socket itself
@@ -2586,7 +2602,7 @@ run_ssh_polling_command() {
     return 0
   fi
   request_ssh_master_recovery "$target" "$control_path"
-  if ! wait_for_ssh_polling_master "$control_path"; then
+  if ! wait_for_ssh_polling_master "$target" "$control_path"; then
     FUNCTION_RESULT="$exit_status"
     return 0
   fi
@@ -2594,7 +2610,11 @@ run_ssh_polling_command() {
   : >"$error_file"
   launch_ssh_command "$target" "$input_file" "$output_file" "$error_file" \
     "$child_pid_file" "$child_identity_file" "$control_path"
-  FUNCTION_RESULT="$FUNCTION_RESULT"
+  exit_status="$FUNCTION_RESULT"
+  if (( exit_status == 0 )) && ! ssh_polling_master_ready "$target" "$control_path"; then
+    request_ssh_master_recovery "$target" "$control_path"
+  fi
+  FUNCTION_RESULT="$exit_status"
 }
 
 start_panel_command_job() {
@@ -2701,7 +2721,7 @@ start_panel_command_job() {
         "$child_pid_file" "$child_identity_file" none
       exit_status="$FUNCTION_RESULT"
     elif [[ -n "$alias" ]]; then
-      if wait_for_ssh_polling_master "$control_path"; then
+      if wait_for_ssh_polling_master "$target" "$control_path"; then
         run_ssh_polling_command "$target" "$control_path" "$input_file" \
           "$output_target" "$error_file" "$child_pid_file" "$child_identity_file"
         exit_status="$FUNCTION_RESULT"
@@ -2717,6 +2737,9 @@ start_panel_command_job() {
       get_process_identity "$child_pid" >"$child_identity_file"
       wait "$child_pid"
       exit_status=$?
+      child_pid=""
+      : >"$child_pid_file"
+      : >"$child_identity_file"
     fi
     if [[ "$stream_mode" == "1" ]]; then
       wait "$collector_pid" 2>/dev/null || true
