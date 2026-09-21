@@ -35,9 +35,9 @@ Each startup or refresh cycle works as follows:
 3. Start each due panel's local command or SSH jobs concurrently.
 4. For a snapshot panel, parse and redraw as soon as all its jobs finish. For a
    stream panel, redraw whenever new complete output lines arrive while its
-   command remains active. The stream collector sends an event to the main
-   terminal loop after each snapshot update, so this does not wait for the
-   one-second scheduler timeout.
+   command remains active. The stream collector coalesces pending notifications
+   and wakes the main terminal loop, so this does not wait for the one-second
+   scheduler timeout.
 5. Schedule that panel's next run after `REFRESH_INTERVAL` seconds when its
    command set finishes; other panels have independent timers and are not
    blocked by it.
@@ -155,7 +155,7 @@ Example continuous raw panel:
 
 ```bash
 PANEL_TITLES[0]="Application log"
-PANEL_COMMANDS[0]="tail -f /var/log/app.log"
+PANEL_COMMANDS[0]="tail -F /var/log/app.log"
 PANEL_STREAM[0]=1
 PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=60; PANEL_HEIGHTS[0]=12
 ```
@@ -198,7 +198,7 @@ synthetic failure row.
 
 ```bash
 PANEL_TITLES[0]="Live Services"
-PANEL_COMMANDS[0]="tail -f /tmp/services.tsv"
+PANEL_COMMANDS[0]="tail -F /tmp/services.tsv"
 PANEL_STREAM[0]=1
 PANEL_TABLE_COLUMNS[0]="SERVICE COUNT STATUS"
 PANEL_TABLE_LAYOUT[0]="table"
@@ -314,8 +314,9 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
   stream command that exits is restarted after `REFRESH_INTERVAL` seconds.
 - Completed refresh jobs are removed from active scheduler state. This keeps
   long-running dashboards from accumulating historical job PIDs. During
-  continuous output, stream notifications are coalesced but do not bypass the
-  keyboard wait, so `q` remains responsive.
+  continuous output, stream notifications are coalesced and processed by the
+  short event-loop poll; keyboard input is read independently, so `q` remains
+  responsive without introducing a one-second signal-blind window.
 - Empty results display `No data`. Content is clipped to panel height and does not scroll automatically.
 - Cell widths are fixed. A numeric value that is too wide becomes all `#` characters; an overlong text value keeps a trailing `.` (for example, `abcdefg.` in an eight-character cell).
 - Warning cells use black text on yellow; error cells and failed-panel content use white text on red. `NO_COLOR` only disables ANSI colors.

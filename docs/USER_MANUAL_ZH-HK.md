@@ -35,8 +35,8 @@ NO_COLOR=1 ./bin/lhc example/fpp.conf
 3. 啟動每個已到期 panel 的本機命令或 SSH jobs。
 4. snapshot panel 在所有 jobs 完成後立即解析並重畫；stream panel
    在命令仍然運行時，每收到新的完整輸出行便重畫。stream collector
-   每次更新快照後會通知主終端機循環，因此不需要等待原本的一秒排程
-   timeout。
+   會合併待處理的 notification 並喚醒主終端機循環，因此不需要等待
+   原本的一秒排程 timeout。
 5. 該 panel 的命令結束後等待 `REFRESH_INTERVAL` 秒再執行下一輪；其他
    panel 使用獨立計時器，不會被它阻塞。
 
@@ -141,7 +141,7 @@ PANEL_HEIGHTS[0]=7
 
 ```bash
 PANEL_TITLES[0]="Application log"
-PANEL_COMMANDS[0]="tail -f /var/log/app.log"
+PANEL_COMMANDS[0]="tail -F /var/log/app.log"
 PANEL_STREAM[0]=1
 PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=60; PANEL_HEIGHTS[0]=12
 ```
@@ -182,7 +182,7 @@ synthetic failure row。
 
 ```bash
 PANEL_TITLES[0]="Live Services"
-PANEL_COMMANDS[0]="tail -f /tmp/services.tsv"
+PANEL_COMMANDS[0]="tail -F /tmp/services.tsv"
 PANEL_STREAM[0]=1
 PANEL_TABLE_COLUMNS[0]="SERVICE COUNT STATUS"
 PANEL_TABLE_LAYOUT[0]="table"
@@ -293,7 +293,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 - 面板標題置中顯示；標題過長時會按面板可用寬度截斷。
 - raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示字段名稱/字段值 block，且不增加獨立表格列頭。
 - stream raw 及 table panel 會在命令仍然運行時以事件驅動方式更新，只保留最近的可見內容高度行數；命令退出後按 `REFRESH_INTERVAL` 秒重啟。
-- 已完成的 refresh job 會從活動 scheduler state 移除，長時間運行不會無限累積歷史 PID。連續輸出事件會合併處理，但不會跳過鍵盤等待，因此 `q` 仍可快速離開。
+- 已完成的 refresh job 會從活動 scheduler state 移除，長時間運行不會無限累積歷史 PID。連續輸出事件會合併，並由短間隔 event loop 處理；鍵盤輸入獨立讀取，因此 `q` 仍可快速離開，也不會出現一秒的 signal blind window。
 - 空結果顯示 `No data`。資料按面板高度裁剪，不會自動滾動。
 - cell 寬度是固定的。超寬數字全部顯示為 `#`；超寬文字在最後保留 `.`，例如寬度 8 的文字可能顯示 `abcdefg.`。
 - warning cell 是黑字黃底；error cell 及失敗面板內容是白字紅底。`NO_COLOR` 只關閉 ANSI 顏色。

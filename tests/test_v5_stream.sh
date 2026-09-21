@@ -71,28 +71,38 @@ TAIL_TEST_FILE="$(mktemp "${TMPDIR:-/tmp}/lhc-v5-tail.XXXXXX")" || exit 1
   source "$TEST_ROOT/bin/lhc"
 
   PANEL_TITLES[0]="Tail follow"
-  PANEL_COMMANDS[0]="tail -f \"$TAIL_TEST_FILE\""
+  PANEL_COMMANDS[0]="tail -F \"$TAIL_TEST_FILE\""
   PANEL_STREAM[0]=1
   PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=32; PANEL_HEIGHTS[0]=5
 
-  validate_config || fail_test "tail -f stream configuration was rejected"
+  validate_config || fail_test "tail -F stream configuration was rejected"
   TERMINAL_ROWS=20; TERMINAL_COLS=80; resolve_panel_dimensions
   initialize_loading_dashboard
   render_dashboard() { :; }
-  run_panel_commands || fail_test "tail -f scheduler failed to start"
+  run_panel_commands || fail_test "tail -F scheduler failed to start"
   printf 'tail-1\ntail-2\ntail-3\ntail-4\n' >>"$TAIL_TEST_FILE"
 
   for ((attempt = 0; attempt < 40; attempt++)); do
-    run_panel_commands || fail_test "tail -f scheduler failed while reading"
+    run_panel_commands || fail_test "tail -F scheduler failed while reading"
     [[ "${PANEL_OUTPUTS[0]:-}" == $'tail-2\ntail-3\ntail-4' ]] && break
     sleep 0.03
   done
-  assert_equal $'tail-2\ntail-3\ntail-4' "${PANEL_OUTPUTS[0]}" "tail -f rolling output"
+  assert_equal $'tail-2\ntail-3\ntail-4' "${PANEL_OUTPUTS[0]}" "tail -F rolling output"
+
+  mv "$TAIL_TEST_FILE" "${TAIL_TEST_FILE}.rotated"
+  : >"$TAIL_TEST_FILE"
+  printf 'tail-5\ntail-6\ntail-7\n' >>"$TAIL_TEST_FILE"
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    run_panel_commands || fail_test "tail -F scheduler failed after rotation"
+    [[ "${PANEL_OUTPUTS[0]:-}" == $'tail-5\ntail-6\ntail-7' ]] && break
+    sleep 0.03
+  done
+  assert_equal $'tail-5\ntail-6\ntail-7' "${PANEL_OUTPUTS[0]}" "tail -F rotation and reopen"
   COMMAND_TEMP_DIR="$PANEL_COMMAND_TEMP_DIR"
   cleanup_panel_commands
-  [[ ! -e "$COMMAND_TEMP_DIR" ]] || fail_test "tail -f cleanup left temp directory"
+  [[ ! -e "$COMMAND_TEMP_DIR" ]] || fail_test "tail -F cleanup left temp directory"
 )
-rm -f "$TAIL_TEST_FILE"
+rm -f "$TAIL_TEST_FILE" "${TAIL_TEST_FILE}.rotated"
 
 (
   source "$TEST_ROOT/bin/lhc"
@@ -273,11 +283,13 @@ export PATH
   PANEL_OUTPUTS[2]='READY 1'; prepare_panel_output 2
   get_line_at_position() { fail_test "raw frame performed repeated line scanning"; }
   get_table_status_line() { fail_test "table frame performed repeated status scanning"; }
-  render_dashboard >/dev/null
-  PANEL_FRAME_BUILD_COUNTS=()
-
   DIRTY_RENDER_DIR="$STREAM_TEST_TEMP_DIR/dirty-render"
   mkdir -p "$DIRTY_RENDER_DIR"
+  RAW_RENDER_FILE="$DIRTY_RENDER_DIR/initial-render"
+  render_dashboard >"$RAW_RENDER_FILE"
+  grep -Fq 'stream-1' "$RAW_RENDER_FILE" || fail_test "real raw renderer did not draw stream content"
+  PANEL_FRAME_BUILD_COUNTS=()
+
   DIRTY_OUTPUT_FILE="$DIRTY_RENDER_DIR/output"
   DIRTY_STATUS_FILE="$DIRTY_RENDER_DIR/status"
   printf 'stream-2\n' >"$DIRTY_OUTPUT_FILE"
@@ -296,8 +308,87 @@ export PATH
   assert_equal '1' "${PANEL_FRAME_BUILD_COUNTS[0]:-0}" "dirty stream panel rebuild count"
   assert_equal '0' "${PANEL_FRAME_BUILD_COUNTS[1]:-0}" "unchanged raw panel rebuild count"
   assert_equal '0' "${PANEL_FRAME_BUILD_COUNTS[2]:-0}" "unchanged table panel rebuild count"
+
+  MARKER_FIFO_FILE="$DIRTY_RENDER_DIR/marker-fifo"
+  PANEL_COMMAND_FIFO_FILES[0]="$MARKER_FIFO_FILE"
+  : >"${MARKER_FIFO_FILE}.refresh"
+  PANEL_COMMAND_LAST_OUTPUTS[0]='stream-2'
+  read_stream_snapshot() {
+    [[ ! -e "${PANEL_COMMAND_FIFO_FILES[0]}.refresh" ]] ||
+      fail_test "stream marker was not acknowledged before snapshot capture"
+    FUNCTION_RESULT='stream-3'
+  }
+  refresh_stream_panels >/dev/null
+  assert_equal 'stream-3' "${PANEL_OUTPUTS[0]}" "marker-race snapshot refresh"
   rm -rf "$DIRTY_RENDER_DIR"
 )
+
+latency_event_loop_test() {
+  command -v perl >/dev/null 2>&1 || exit 0
+  source "$TEST_ROOT/bin/lhc"
+  NO_COLOR=1
+
+  LATENCY_DIR="$STREAM_TEST_TEMP_DIR/latency"
+  mkdir -p "$LATENCY_DIR"
+  LATENCY_STDIN_FIFO="$LATENCY_DIR/stdin"
+  LATENCY_EMIT_FILE="$LATENCY_DIR/emitted"
+  LATENCY_RENDER_FILE="$LATENCY_DIR/rendered"
+  mkfifo "$LATENCY_STDIN_FIFO"
+  LHC_LATENCY_EMIT_FILE="$LATENCY_EMIT_FILE"
+  export LHC_LATENCY_EMIT_FILE
+
+  PANEL_TITLES[0]='Latency stream'
+  PANEL_COMMANDS[0]="sleep 0.2; printf 'latency-token\\n'; perl -MTime::HiRes -e 'printf \"%.6f\\n\", Time::HiRes::time()' >\"$LATENCY_EMIT_FILE\""
+  PANEL_STREAM[0]=1
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=36; PANEL_HEIGHTS[0]=6
+  PANEL_TITLES[1]='Stable raw'
+  PANEL_COMMANDS[1]='printf "stable raw\\n"'
+  PANEL_X[1]=38; PANEL_Y[1]=1; PANEL_WIDTHS[1]=30; PANEL_HEIGHTS[1]=6
+  PANEL_TITLES[2]='Stable table'
+  PANEL_COMMANDS[2]='printf "STATE 1\\n"'
+  PANEL_TABLE_COLUMNS[2]='STATE COUNT'
+  PANEL_X[2]=70; PANEL_Y[2]=1; PANEL_WIDTHS[2]=30; PANEL_HEIGHTS[2]=6
+
+  validate_config || fail_test "latency configuration was rejected"
+  TERMINAL_ROWS=20; TERMINAL_COLS=110; resolve_panel_dimensions
+  calculate_required_terminal_size
+  initialize_loading_dashboard
+
+  eval "$(declare -f draw_frame_value | sed 's/^draw_frame_value/latency_original_draw_frame_value/')"
+  draw_frame_value() {
+    if [[ "$2" == *latency-token* && ! -s "$LATENCY_RENDER_FILE" ]]; then
+      perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time()' >"$LATENCY_RENDER_FILE"
+      printf 'q' >&9
+    fi
+    latency_original_draw_frame_value "$@"
+  }
+
+  exec 8<&0
+  exec 0<>"$LATENCY_STDIN_FIFO"
+  exec 9>"$LATENCY_STDIN_FIFO"
+  STREAM_REFRESH_PID="$$"
+  LHC_OWNER_PID="$$"
+  trap 'handle_stream_refresh' USR1
+  render_dashboard >/dev/null
+  run_dashboard_loop >/dev/null
+  exec 9>&-
+  exec 0<&-
+  exec 0<&8
+  exec 8<&-
+  trap - USR1
+  sleep 0.1
+
+  [[ -s "$LATENCY_EMIT_FILE" ]] || fail_test "latency stream did not publish an emission timestamp"
+  [[ -s "$LATENCY_RENDER_FILE" ]] || fail_test "latency stream did not reach the real renderer"
+  LATENCY_MS="$(perl -e '$start = <>; $end = <>; printf "%.0f\n", ($end - $start) * 1000' \
+    "$LATENCY_EMIT_FILE" "$LATENCY_RENDER_FILE")"
+  [[ "$LATENCY_MS" =~ ^[0-9]+$ ]] || fail_test "invalid measured latency: $LATENCY_MS"
+  (( LATENCY_MS < 500 )) || fail_test "stream render latency exceeded 500ms: ${LATENCY_MS}ms"
+  cleanup_panel_commands
+  rm -rf "$LATENCY_DIR"
+}
+
+latency_event_loop_test
 
 rm -rf "$STREAM_TEST_TEMP_DIR"
 

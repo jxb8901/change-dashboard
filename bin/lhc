@@ -68,13 +68,15 @@ STREAM_REFRESH_PID=""
 AUTO_PANEL_HEIGHT_INDEX=""
 CLEANUP_IN_PROGRESS=0
 SHUTDOWN_IN_PROGRESS=0
+QUIT_PENDING=0
 LHC_OWNER_PID="$$"
 JOB_TERM_GRACE_ATTEMPTS=10
 JOB_KILL_GRACE_ATTEMPTS=10
 JOB_GRACE_SLEEP=0.05
-# macOS Bash 3.2 accepts only integer read -t values. Stream signals still
-# interrupt this timeout as soon as a snapshot changes.
-STREAM_EVENT_SLEEP=1
+# macOS Bash 3.2 does not reliably interrupt read -t when a stream signal is
+# delivered. Keep keyboard input in a dedicated reader and let the dashboard
+# loop poll its signal flags at a short, bounded interval.
+STREAM_EVENT_POLL_SECONDS=0.05
 SSH_CONTROL_PERSIST_SECONDS=30
 SSH_CONNECT_TIMEOUT_SECONDS=10
 SSH_MASTER_RETRY_BACKOFF_SECONDS=5
@@ -165,9 +167,41 @@ setup_terminal() {
   printf '\033[?25l'
 }
 
+handle_quit() {
+  QUIT_PENDING=1
+}
+
+start_keyboard_reader() {
+  local owner_pid="${STREAM_REFRESH_PID:-$$}"
+
+  [[ -n "${KEYBOARD_READER_PID:-}" ]] && return 0
+  (
+    local key
+    trap 'exit 0' TERM INT
+    while IFS= read -rsn1 key; do
+      [[ "$key" == "q" ]] || continue
+      kill -USR2 "$owner_pid" 2>/dev/null || true
+      break
+    done
+  ) &
+  KEYBOARD_READER_PID=$!
+}
+
+stop_keyboard_reader() {
+  local reader_pid="${KEYBOARD_READER_PID:-}"
+
+  [[ -n "$reader_pid" ]] || return 0
+  kill -TERM "$reader_pid" 2>/dev/null || true
+  kill -KILL "$reader_pid" 2>/dev/null || true
+  wait "$reader_pid" 2>/dev/null || true
+  KEYBOARD_READER_PID=""
+}
+
 cleanup_terminal() {
   SHUTDOWN_IN_PROGRESS=1
   trap ':' USR1 2>/dev/null || true
+  trap ':' USR2 2>/dev/null || true
+  stop_keyboard_reader
   cleanup_panel_commands
   if [[ "$TERMINAL_ACTIVE" -eq 1 ]]; then
     # Show the cursor again before returning control to the shell.
@@ -1760,11 +1794,11 @@ build_raw_frame() {
     (( row >= height )) && break
     render_raw_line "$index" "$((y + row))" "$x" "$width" "$line"
     row=$((row + 1))
-  done
+  done <<< "$content"
   while (( row < height )); do
     render_raw_line "$index" "$((y + row))" "$x" "$width" ""
     row=$((row + 1))
-  done <<< "$content"
+  done
 }
 
 render_raw_line() {
@@ -2219,8 +2253,20 @@ aggregate_ssh_stream_output() {
   fi
 }
 
+acknowledge_stream_refresh_marker() {
+  local fifo_file="$1"
+
+  [[ -n "$fifo_file" ]] && rm -f "${fifo_file}.refresh"
+}
+
+read_stream_snapshot() {
+  local output_file="$1"
+
+  FUNCTION_RESULT="$(<"$output_file")"
+}
+
 refresh_stream_panels() {
-  local panel_index job output_file current previous status last_status changed
+  local panel_index job output_file fifo_file current previous status last_status changed
 
   for panel_index in "${PANEL_ORDER[@]}"; do
     [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-0}" -eq 1 ]] || continue
@@ -2232,9 +2278,10 @@ refresh_stream_panels() {
       [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
       output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
       [[ -f "$output_file" ]] || continue
-      current="$(<"$output_file")"
-      [[ -n "${PANEL_COMMAND_FIFO_FILES[$job]:-}" ]] &&
-        rm -f "${PANEL_COMMAND_FIFO_FILES[$job]}.refresh"
+      fifo_file="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
+      acknowledge_stream_refresh_marker "$fifo_file"
+      read_stream_snapshot "$output_file"
+      current="$FUNCTION_RESULT"
       previous="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
       status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
       last_status="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
@@ -2252,7 +2299,7 @@ refresh_stream_panels() {
       for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
         [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
         [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
-        PANEL_OUTPUTS[$panel_index]="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+        PANEL_OUTPUTS[$panel_index]="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
         limit_stream_output "$panel_index"
         PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
         prepare_panel_output "$panel_index"
@@ -3328,23 +3375,18 @@ worst_status() {
 
 wait_for_quit_or_timeout() {
   local timeout="$1"
-  local ignore_stream_signals="${2:-0}" key
-
-  if [[ "$ignore_stream_signals" -eq 1 ]]; then
-    trap ':' USR1 2>/dev/null || true
-  fi
+  local key
 
   if IFS= read -rsn1 -t "$timeout" key; then
-    if [[ "$ignore_stream_signals" -eq 1 ]]; then
-      trap handle_stream_refresh USR1 2>/dev/null || true
-    fi
     [[ "$key" == "q" ]]
     return
   fi
-  if [[ "$ignore_stream_signals" -eq 1 ]]; then
-    trap handle_stream_refresh USR1 2>/dev/null || true
-  fi
   return 1
+}
+
+wait_for_dashboard_tick() {
+  sleep "$STREAM_EVENT_POLL_SECONDS"
+  (( QUIT_PENDING == 1 ))
 }
 
 show_resize_pause() {
@@ -3406,13 +3448,16 @@ process_terminal_resize() {
 }
 
 run_dashboard_loop() {
+  trap handle_quit USR2
+  start_keyboard_reader
   while true; do
     if (( RESIZE_PENDING == 1 || DASHBOARD_PAUSED == 1 )); then
       process_terminal_resize || true
     fi
 
     if (( DASHBOARD_PAUSED == 1 )); then
-      if wait_for_quit_or_timeout 1; then
+      if wait_for_dashboard_tick; then
+        stop_keyboard_reader
         return 0
       fi
       continue
@@ -3420,20 +3465,20 @@ run_dashboard_loop() {
 
     run_panel_commands
 
-    # A stream collector interrupts the keyboard wait through SIGUSR1. Use an
-    # integer timeout because Bash 3.2 rejects fractional read -t values;
-    # stream signals still wake the normal keyboard wait as soon as new output
-    # is available. During this short post-refresh wait, ignore another burst
-    # so a high-frequency producer cannot starve q.
+    # Process a pending stream event immediately. A one-second read here would
+    # delay a notification whose signal arrived just before the read started;
+    # the dedicated keyboard reader makes short polling safe on Bash 3.2.
+    if (( QUIT_PENDING == 1 )); then
+      stop_keyboard_reader
+      return 0
+    fi
     if (( STREAM_REFRESH_PENDING == 1 )); then
       STREAM_REFRESH_PENDING=0
-      if wait_for_quit_or_timeout "$STREAM_EVENT_SLEEP" 1; then
-        return 0
-      fi
       continue
     fi
 
-    if wait_for_quit_or_timeout 1; then
+    if wait_for_dashboard_tick; then
+      stop_keyboard_reader
       return 0
     fi
   done
