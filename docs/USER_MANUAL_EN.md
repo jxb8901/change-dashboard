@@ -137,7 +137,10 @@ line-count setting is required. The same setting works for local and raw SSH
 panels. Table stream panels are described below; transpose stream panels remain
 unsupported. When the command exits, the final buffer remains visible and the panel is restarted after
 `REFRESH_INTERVAL` seconds. A producer that buffers stdout may need a
-line-buffering option such as `stdbuf -oL`.
+line-buffering option such as `stdbuf -oL`. Stream notifications use a
+panel-local frame rebuild and diff, so unrelated panels are not recalculated
+for each new stream line; the full dashboard is rebuilt for the initial draw,
+ordinary panel completion, and terminal resize.
 
 ```bash
 PANEL_TITLES[0]="Deployment"

@@ -249,6 +249,56 @@ export PATH
   [[ ! -e "$COMMAND_TEMP_DIR" ]] || fail_test "SSH table stream cleanup left temp directory"
 )
 
+(
+  source "$TEST_ROOT/bin/lhc"
+  NO_COLOR=1
+
+  PANEL_TITLES[0]='Dirty stream'
+  PANEL_COMMANDS[0]='printf "stream-1\\n"'
+  PANEL_STREAM[0]=1
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=32; PANEL_HEIGHTS[0]=6
+  PANEL_TITLES[1]='Unchanged raw'
+  PANEL_COMMANDS[1]='printf "unchanged\\n"'
+  PANEL_X[1]=34; PANEL_Y[1]=1; PANEL_WIDTHS[1]=32; PANEL_HEIGHTS[1]=6
+  PANEL_TITLES[2]='Unchanged table'
+  PANEL_COMMANDS[2]='printf "READY 1\\n"'
+  PANEL_TABLE_COLUMNS[2]='STATE COUNT'
+  PANEL_X[2]=67; PANEL_Y[2]=1; PANEL_WIDTHS[2]=32; PANEL_HEIGHTS[2]=6
+
+  validate_config || fail_test "dirty-render configuration was rejected"
+  TERMINAL_ROWS=20; TERMINAL_COLS=110; resolve_panel_dimensions
+  initialize_loading_dashboard
+  PANEL_OUTPUTS[0]='stream-1'; prepare_panel_output 0
+  PANEL_OUTPUTS[1]='unchanged'; prepare_panel_output 1
+  PANEL_OUTPUTS[2]='READY 1'; prepare_panel_output 2
+  get_line_at_position() { fail_test "raw frame performed repeated line scanning"; }
+  get_table_status_line() { fail_test "table frame performed repeated status scanning"; }
+  render_dashboard >/dev/null
+  PANEL_FRAME_BUILD_COUNTS=()
+
+  DIRTY_RENDER_DIR="$STREAM_TEST_TEMP_DIR/dirty-render"
+  mkdir -p "$DIRTY_RENDER_DIR"
+  DIRTY_OUTPUT_FILE="$DIRTY_RENDER_DIR/output"
+  DIRTY_STATUS_FILE="$DIRTY_RENDER_DIR/status"
+  printf 'stream-2\n' >"$DIRTY_OUTPUT_FILE"
+  : >"$DIRTY_STATUS_FILE"
+  PANEL_COMMAND_ACTIVE[0]=1
+  PANEL_COMMAND_JOB_COUNT=1
+  PANEL_COMMAND_PANEL_INDEXES[0]=0
+  PANEL_COMMAND_STREAMS[0]=1
+  PANEL_COMMAND_OUTPUT_FILES[0]="$DIRTY_OUTPUT_FILE"
+  PANEL_COMMAND_STATUS_FILES[0]="$DIRTY_STATUS_FILE"
+  PANEL_COMMAND_LAST_OUTPUTS[0]='stream-1'
+  PANEL_COMMAND_LAST_STATUSES[0]=''
+
+  refresh_stream_panels >/dev/null
+  assert_equal 'stream-2' "${PANEL_OUTPUTS[0]}" "dirty stream output"
+  assert_equal '1' "${PANEL_FRAME_BUILD_COUNTS[0]:-0}" "dirty stream panel rebuild count"
+  assert_equal '0' "${PANEL_FRAME_BUILD_COUNTS[1]:-0}" "unchanged raw panel rebuild count"
+  assert_equal '0' "${PANEL_FRAME_BUILD_COUNTS[2]:-0}" "unchanged table panel rebuild count"
+  rm -rf "$DIRTY_RENDER_DIR"
+)
+
 rm -rf "$STREAM_TEST_TEMP_DIR"
 
 EVENT_TEST_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc-v5-event.XXXXXX")" || exit 1

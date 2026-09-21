@@ -72,7 +72,9 @@ LHC_OWNER_PID="$$"
 JOB_TERM_GRACE_ATTEMPTS=10
 JOB_KILL_GRACE_ATTEMPTS=10
 JOB_GRACE_SLEEP=0.05
-STREAM_EVENT_SLEEP=0.05
+# macOS Bash 3.2 accepts only integer read -t values. Stream signals still
+# interrupt this timeout as soon as a snapshot changes.
+STREAM_EVENT_SLEEP=1
 SSH_CONTROL_PERSIST_SECONDS=30
 SSH_CONNECT_TIMEOUT_SECONDS=10
 SSH_MASTER_RETRY_BACKOFF_SECONDS=5
@@ -111,6 +113,10 @@ declare -a PREVIOUS_FRAME_KEYS=()
 declare -a PREVIOUS_FRAME_TEXT=()
 declare -a PREVIOUS_FRAME_STYLES=()
 declare -a CURRENT_FRAME_INDEX=()
+declare -a CURRENT_PANEL_FRAME_STARTS=()
+declare -a CURRENT_PANEL_FRAME_ENDS=()
+declare -a PANEL_FRAME_READY=()
+declare -a PANEL_FRAME_BUILD_COUNTS=()
 declare -a PREVIOUS_FRAME_INDEX=()
 declare -a PANEL_COMMAND_PIDS=()
 declare -a PANEL_COMMAND_WRAPPER_STARTS=()
@@ -550,7 +556,7 @@ cleanup_panel_commands() {
 
   for index in "${!PANEL_COMMAND_FIFO_FILES[@]}"; do
     file="${PANEL_COMMAND_FIFO_FILES[$index]:-}"
-    [[ -n "$file" ]] && rm -f "$file"
+    [[ -n "$file" ]] && rm -f "$file" "${file}.refresh"
   done
 
   if [[ -n "$PANEL_COMMAND_TEMP_DIR" ]]; then
@@ -1559,7 +1565,7 @@ draw_frame_value() {
 }
 
 render_frame_diff() {
-  local i previous key lookup
+  local i previous key lookup index
 
   for i in "${!PREVIOUS_FRAME_KEYS[@]}"; do
     key="${PREVIOUS_FRAME_KEYS[$i]}"
@@ -1591,7 +1597,98 @@ render_frame_diff() {
     frame_key_index "${PREVIOUS_FRAME_KEYS[$i]}"
     PREVIOUS_FRAME_INDEX[$FRAME_KEY_INDEX]=$i
   done
+  for index in "${PANEL_ORDER[@]}"; do
+    store_panel_frame_snapshot "$index" \
+      "${CURRENT_PANEL_FRAME_STARTS[$index]:-0}" \
+      "${CURRENT_PANEL_FRAME_ENDS[$index]:--1}"
+  done
   FORCE_FULL_REDRAW=0
+}
+
+clear_panel_frame_snapshots() {
+  local index
+
+  for index in "${!PANEL_FRAME_READY[@]}"; do
+    unset "PANEL_PREVIOUS_FRAME_KEYS_${index}"
+    unset "PANEL_PREVIOUS_FRAME_TEXT_${index}"
+    unset "PANEL_PREVIOUS_FRAME_STYLES_${index}"
+    unset "PANEL_PREVIOUS_FRAME_INDEX_${index}"
+  done
+  PANEL_FRAME_READY=()
+  CURRENT_PANEL_FRAME_STARTS=()
+  CURRENT_PANEL_FRAME_ENDS=()
+}
+
+store_panel_frame_snapshot() {
+  local panel_index="$1" start="$2" end="$3"
+  local i relative key lookup snapshot_count
+
+  eval "PANEL_PREVIOUS_FRAME_KEYS_${panel_index}=()"
+  eval "PANEL_PREVIOUS_FRAME_TEXT_${panel_index}=()"
+  eval "PANEL_PREVIOUS_FRAME_STYLES_${panel_index}=()"
+  eval "PANEL_PREVIOUS_FRAME_INDEX_${panel_index}=()"
+
+  if (( end >= start )); then
+    for ((i = start; i <= end; i++)); do
+      relative=$((i - start))
+      eval "PANEL_PREVIOUS_FRAME_KEYS_${panel_index}[$relative]=\"\${CURRENT_FRAME_KEYS[$i]}\""
+      eval "PANEL_PREVIOUS_FRAME_TEXT_${panel_index}[$relative]=\"\${CURRENT_FRAME_TEXT[$i]}\""
+      eval "PANEL_PREVIOUS_FRAME_STYLES_${panel_index}[$relative]=\"\${CURRENT_FRAME_STYLES[$i]}\""
+    done
+  fi
+
+  eval "snapshot_count=\${#PANEL_PREVIOUS_FRAME_KEYS_${panel_index}[@]}"
+  for ((i = 0; i < snapshot_count; i++)); do
+    eval "key=\"\${PANEL_PREVIOUS_FRAME_KEYS_${panel_index}[$i]}\""
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    eval "PANEL_PREVIOUS_FRAME_INDEX_${panel_index}[$lookup]=$i"
+  done
+  PANEL_FRAME_READY[$panel_index]=1
+}
+
+render_panel_frame_diff() {
+  local panel_index="$1" i key lookup previous previous_set previous_text previous_style
+  local previous_count current_count
+
+  previous_count=0
+  if [[ "${PANEL_FRAME_READY[$panel_index]:-0}" -eq 1 ]]; then
+    eval "previous_count=\${#PANEL_PREVIOUS_FRAME_KEYS_${panel_index}[@]}"
+  fi
+
+  for ((i = 0; i < previous_count; i++)); do
+    eval "key=\"\${PANEL_PREVIOUS_FRAME_KEYS_${panel_index}[$i]}\""
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    if [[ -z "${CURRENT_FRAME_INDEX[$lookup]+set}" ]]; then
+      repeat_char ' ' "${key##*:}"
+      draw_frame_value "$key" "$FUNCTION_RESULT" OK
+    fi
+  done
+
+  for i in "${!CURRENT_FRAME_KEYS[@]}"; do
+    key="${CURRENT_FRAME_KEYS[$i]}"
+    frame_key_index "$key"
+    lookup="$FRAME_KEY_INDEX"
+    previous_set=""
+    if [[ "${PANEL_FRAME_READY[$panel_index]:-0}" -eq 1 ]]; then
+      eval "previous_set=\${PANEL_PREVIOUS_FRAME_INDEX_${panel_index}[$lookup]+set}"
+    fi
+    if [[ -z "$previous_set" ]]; then
+      draw_frame_value "$key" "${CURRENT_FRAME_TEXT[$i]}" "${CURRENT_FRAME_STYLES[$i]}"
+      continue
+    fi
+    eval "previous=\${PANEL_PREVIOUS_FRAME_INDEX_${panel_index}[$lookup]}"
+    eval "previous_text=\"\${PANEL_PREVIOUS_FRAME_TEXT_${panel_index}[$previous]}\""
+    eval "previous_style=\"\${PANEL_PREVIOUS_FRAME_STYLES_${panel_index}[$previous]}\""
+    if [[ "${CURRENT_FRAME_TEXT[$i]}" != "$previous_text" ||
+      "${CURRENT_FRAME_STYLES[$i]}" != "$previous_style" ]]; then
+      draw_frame_value "$key" "${CURRENT_FRAME_TEXT[$i]}" "${CURRENT_FRAME_STYLES[$i]}"
+    fi
+  done
+
+  current_count="${#CURRENT_FRAME_KEYS[@]}"
+  store_panel_frame_snapshot "$panel_index" 0 "$((current_count - 1))"
 }
 
 get_word_at_position() {
@@ -1659,12 +1756,15 @@ build_raw_frame() {
   local width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2)) height=$((PANEL_EFFECTIVE_HEIGHTS[index] - 2))
   local content="${PANEL_OUTPUTS[$index]:-No data}"
 
-  while (( row < height )); do
-    get_line_at_position "$content" "$row"
-    line="$FUNCTION_RESULT"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    (( row >= height )) && break
     render_raw_line "$index" "$((y + row))" "$x" "$width" "$line"
     row=$((row + 1))
   done
+  while (( row < height )); do
+    render_raw_line "$index" "$((y + row))" "$x" "$width" ""
+    row=$((row + 1))
+  done <<< "$content"
 }
 
 render_raw_line() {
@@ -1767,6 +1867,7 @@ get_raw_matching_keywords() {
 
 build_table_frame() {
   local index="$1" row=0 col width offset cell line status_line status alignment column_count=0
+  local -a table_lines=() status_lines=()
   ensure_effective_panel_dimensions "$index"
   local x=$((PANEL_EFFECTIVE_X[index] + 1)) y=$((PANEL_EFFECTIVE_Y[index] + 1))
   local content_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
@@ -1774,6 +1875,12 @@ build_table_frame() {
 
   resolve_table_widths "$index"
   for width in $RESOLVED_WIDTHS; do column_count=$((column_count + 1)); done
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    table_lines+=("$line")
+  done <<< "${PANEL_TABLE_ROWS[$index]:-}"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    status_lines+=("$line")
+  done <<< "${PANEL_TABLE_CELL_STATUSES[$index]:-}"
   while (( row < content_height )); do
     if (( row > 0 )) && [[ -z "${PANEL_TABLE_ROWS[$index]:-}" ]]; then
       if (( row == 1 )); then
@@ -1788,10 +1895,8 @@ build_table_frame() {
     line=""
     status_line=""
     if (( row > 0 )); then
-      get_line_at_position "${PANEL_TABLE_ROWS[$index]:-}" "$((row - 1))"
-      line="$FUNCTION_RESULT"
-      get_table_status_line "$index" "$row"
-      status_line="$FUNCTION_RESULT"
+      line="${table_lines[$((row - 1))]:-}"
+      status_line="${status_lines[$((row - 1))]:-}"
     fi
     col=0
     for width in $RESOLVED_WIDTHS; do
@@ -1825,6 +1930,7 @@ build_table_frame() {
 
 build_transpose_frame() {
   local index="$1" row=0 source_row=1 column_index column value status alignment line
+  local -a source_lines=() status_lines=()
   ensure_effective_panel_dimensions "$index"
   local x=$((PANEL_EFFECTIVE_X[index] + 1)) y=$((PANEL_EFFECTIVE_Y[index] + 1))
   local content_width=$((PANEL_EFFECTIVE_WIDTHS[index] - 2))
@@ -1851,8 +1957,13 @@ build_transpose_frame() {
     value_width="$FUNCTION_RESULT"
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
-    get_table_status_line "$index" "$source_row"
-    statuses="$FUNCTION_RESULT"
+    source_lines+=("$line")
+  done <<< "$source"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    status_lines+=("$line")
+  done <<< "${PANEL_TABLE_CELL_STATUSES[$index]:-}"
+  for line in "${source_lines[@]}"; do
+    statuses="${status_lines[$((source_row - 1))]:-}"
     column_index=0
     for column in ${PANEL_TABLE_HEADERS[$index]}; do
       (( row >= content_height )) && break 2
@@ -1872,7 +1983,7 @@ build_transpose_frame() {
       column_index=$((column_index + 1))
     done
     source_row=$((source_row + 1))
-  done <<< "$source"
+  done
 
   while (( row < content_height )); do
     frame_add "$((y + row))" "$x" "$content_width" "" OK
@@ -1886,13 +1997,33 @@ build_current_frame() {
   CURRENT_FRAME_TEXT=()
   CURRENT_FRAME_STYLES=()
   CURRENT_FRAME_INDEX=()
+  CURRENT_PANEL_FRAME_STARTS=()
+  CURRENT_PANEL_FRAME_ENDS=()
   for index in "${PANEL_ORDER[@]}"; do
+    CURRENT_PANEL_FRAME_STARTS[$index]="${#CURRENT_FRAME_KEYS[@]}"
+    PANEL_FRAME_BUILD_COUNTS[$index]=$(( ${PANEL_FRAME_BUILD_COUNTS[$index]:-0} + 1 ))
     case "${PANEL_RENDER_MODES[$index]:-raw}" in
       table) build_table_frame "$index" ;;
       transpose) build_transpose_frame "$index" ;;
       *) build_raw_frame "$index" ;;
     esac
+    CURRENT_PANEL_FRAME_ENDS[$index]="$(( ${#CURRENT_FRAME_KEYS[@]} - 1 ))"
   done
+}
+
+build_panel_frame() {
+  local index="$1"
+
+  CURRENT_FRAME_KEYS=()
+  CURRENT_FRAME_TEXT=()
+  CURRENT_FRAME_STYLES=()
+  CURRENT_FRAME_INDEX=()
+  PANEL_FRAME_BUILD_COUNTS[$index]=$(( ${PANEL_FRAME_BUILD_COUNTS[$index]:-0} + 1 ))
+  case "${PANEL_RENDER_MODES[$index]:-raw}" in
+    table) build_table_frame "$index" ;;
+    transpose) build_transpose_frame "$index" ;;
+    *) build_raw_frame "$index" ;;
+  esac
 }
 
 draw_static_dashboard() {
@@ -1918,6 +2049,15 @@ draw_static_dashboard() {
 }
 
 render_dashboard() {
+  local dirty_panel="${1:-}"
+
+  if [[ -n "$dirty_panel" && "$FORCE_FULL_REDRAW" -eq 0 ]]; then
+    build_panel_frame "$dirty_panel"
+    render_panel_frame_diff "$dirty_panel"
+    move_cursor "$((REQUIRED_ROWS + 1))" 1
+    return 0
+  fi
+
   if (( FORCE_FULL_REDRAW == 1 )); then
     PREVIOUS_FRAME_KEYS=()
     PREVIOUS_FRAME_TEXT=()
@@ -1934,6 +2074,7 @@ render_dashboard() {
 initialize_loading_dashboard() {
   local index
 
+  clear_panel_frame_snapshots
   PANEL_OUTPUTS=()
   PANEL_RENDER_MODES=()
   PANEL_STATUSES=()
@@ -1941,6 +2082,7 @@ initialize_loading_dashboard() {
   PANEL_TABLE_ROWS=()
   PANEL_TABLE_CELL_STATUSES=()
   PANEL_SSH_FAILURE_ROWS=()
+  PANEL_FRAME_BUILD_COUNTS=()
 
   for index in "${PANEL_ORDER[@]}"; do
     PANEL_OUTPUTS[$index]="Loading..."
@@ -1981,6 +2123,7 @@ stream_collect() {
   local snapshot_file="$2"
   local capacity="$3"
   local refresh_pid="${4:-}"
+  local refresh_marker="${5:-}"
   local line temporary start position slot
   local count=0
   local next=0
@@ -2007,9 +2150,12 @@ stream_collect() {
     done
     mv -f "$temporary" "$snapshot_file"
     if [[ -n "$refresh_pid" ]]; then
-      kill -USR1 "$refresh_pid" 2>/dev/null || true
+      if [[ -z "$refresh_marker" ]] || ( set -C; : >"$refresh_marker" ) 2>/dev/null; then
+        kill -USR1 "$refresh_pid" 2>/dev/null || true
+      fi
     fi
   done <"$fifo"
+  [[ -n "$refresh_marker" ]] && rm -f "$refresh_marker"
 }
 
 aggregate_ssh_stream_output() {
@@ -2087,6 +2233,8 @@ refresh_stream_panels() {
       output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
       [[ -f "$output_file" ]] || continue
       current="$(<"$output_file")"
+      [[ -n "${PANEL_COMMAND_FIFO_FILES[$job]:-}" ]] &&
+        rm -f "${PANEL_COMMAND_FIFO_FILES[$job]}.refresh"
       previous="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
       status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
       last_status="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
@@ -2111,7 +2259,7 @@ refresh_stream_panels() {
         break
       done
     fi
-    render_dashboard
+    render_dashboard "$panel_index"
   done
 }
 
@@ -2706,7 +2854,8 @@ start_panel_command_job() {
 
     output_target="$output_file"
     if [[ "$stream_mode" == "1" ]]; then
-      stream_collect "$fifo_file" "$output_file" "$stream_capacity" "$refresh_pid" &
+      stream_collect "$fifo_file" "$output_file" "$stream_capacity" "$refresh_pid" \
+        "${fifo_file}.refresh" &
       collector_pid=$!
       printf '%s\n' "$collector_pid" >"$collector_pid_file"
       get_process_identity "$collector_pid" >"$collector_identity_file"
@@ -3179,11 +3328,21 @@ worst_status() {
 
 wait_for_quit_or_timeout() {
   local timeout="$1"
-  local key
+  local ignore_stream_signals="${2:-0}" key
+
+  if [[ "$ignore_stream_signals" -eq 1 ]]; then
+    trap ':' USR1 2>/dev/null || true
+  fi
 
   if IFS= read -rsn1 -t "$timeout" key; then
+    if [[ "$ignore_stream_signals" -eq 1 ]]; then
+      trap handle_stream_refresh USR1 2>/dev/null || true
+    fi
     [[ "$key" == "q" ]]
     return
+  fi
+  if [[ "$ignore_stream_signals" -eq 1 ]]; then
+    trap handle_stream_refresh USR1 2>/dev/null || true
   fi
   return 1
 }
@@ -3261,13 +3420,14 @@ run_dashboard_loop() {
 
     run_panel_commands
 
-    # A stream collector interrupts the keyboard wait through SIGUSR1. Use a
-    # short positive-timeout read here: Bash read -t 0 only probes for input
-    # and does not consume the waiting character, which can starve q while a
-    # stream keeps asserting STREAM_REFRESH_PENDING.
+    # A stream collector interrupts the keyboard wait through SIGUSR1. Use an
+    # integer timeout because Bash 3.2 rejects fractional read -t values;
+    # stream signals still wake the normal keyboard wait as soon as new output
+    # is available. During this short post-refresh wait, ignore another burst
+    # so a high-frequency producer cannot starve q.
     if (( STREAM_REFRESH_PENDING == 1 )); then
       STREAM_REFRESH_PENDING=0
-      if wait_for_quit_or_timeout "$STREAM_EVENT_SLEEP"; then
+      if wait_for_quit_or_timeout "$STREAM_EVENT_SLEEP" 1; then
         return 0
       fi
       continue

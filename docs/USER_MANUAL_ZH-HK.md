@@ -124,7 +124,9 @@ footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機�
 transpose stream panel 仍不支援。命令退出後保留最後 buffer，並在
 `REFRESH_INTERVAL` 秒後重啟。
 如果輸出程序本身有 stdout buffering，可能需要使用 `stdbuf -oL` 等
-line-buffering 設定。
+line-buffering 設定。Stream notification 只會重建及 diff 發生變化的
+panel，不會因每一行新輸出而重新計算其他 panel；初始畫面、普通 panel
+完成及 terminal resize 仍會重建整個 dashboard。
 
 ```bash
 PANEL_TITLES[0]="Deployment"
