@@ -22,3 +22,4 @@ jobs:
           bash tests/test_v5_features.sh
           bash tests/test_v6_ssh_lifecycle.sh
           bash tests/test_v7_scheduler_timeout.sh
+          bash tests/test_v8_dirty_snapshot.sh

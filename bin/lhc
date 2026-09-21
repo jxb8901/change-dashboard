@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-21 V5.6: Render completed snapshot panels through panel-local
+#   frame diffs, preserving full-dashboard redraws for startup, resize, and
+#   forced layout changes.
+# - 2026-09-21 V5.5.1: Propagate scheduler start failures with rollback,
+#   add bounded local/SSH snapshot command timeouts with per-panel overrides,
+#   and publish Bash regression coverage through GitHub Actions.
 # - 2026-09-21 V5.5: Establish SSH polling masters asynchronously per target,
 #   keep the scheduler responsive during slow connections, and make command
 #   wrappers own the actual SSH process for reliable cleanup.
@@ -2463,7 +2469,7 @@ run_panel_commands() {
     PANEL_NEXT_RUN_SECONDS[$panel_index]=$((SECONDS + REFRESH_INTERVAL))
     cleanup_panel_result_files "$panel_index"
     compact_completed_panel_jobs "$panel_index"
-    render_dashboard
+    render_dashboard "$panel_index"
   done
 
   refresh_stream_panels
