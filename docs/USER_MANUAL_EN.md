@@ -38,7 +38,10 @@ Each startup or refresh cycle works as follows:
    command remains active. The stream collector coalesces pending notifications
    and wakes the main terminal loop, so this does not wait for the one-second
    scheduler timeout.
-5. Schedule that panel's next run after `REFRESH_INTERVAL` seconds when its
+5. If a snapshot command exceeds its configured timeout, terminate its owned
+   process tree and display `TIMEOUT after Ns` as failed panel output. A timed
+   out panel is scheduled again after `REFRESH_INTERVAL` seconds.
+6. Schedule that panel's next run after `REFRESH_INTERVAL` seconds when its
    command set finishes; other panels have independent timers and are not
    blocked by it.
 
@@ -50,6 +53,7 @@ Every panel uses the same zero-based index. The following is a raw-output panel:
 
 ```bash
 REFRESH_INTERVAL=2
+COMMAND_TIMEOUT_SECONDS=10
 
 PANEL_TITLES[0]="Queue"
 PANEL_COMMANDS[0]="printf 'queue=0\\noldest=0s\\n'"
@@ -82,6 +86,7 @@ and bounds checks still apply.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `REFRESH_INTERVAL` | No | Positive integer seconds; default `2`. Each panel starts its next run this many seconds after its own command set finishes. |
+| `COMMAND_TIMEOUT_SECONDS` | No | Non-negative integer seconds; default `0` (unlimited). Maximum runtime for snapshot commands; `PANEL_TIMEOUT_SECONDS[i]` can override it per panel. A timed out command displays `TIMEOUT after Ns` and the panel retries after `REFRESH_INTERVAL`. Stream commands are not limited by this setting. |
 | `NO_COLOR` | Environment | Any non-empty value disables ANSI warning/error colors. |
 
 `TMPDIR` is not a panel setting. When set, LHC creates its temporary command-output directory below it and removes that directory on exit; otherwise it uses `/tmp`.
@@ -125,6 +130,15 @@ the dashboard pauses until the terminal is large enough.
 | Variable | Example | Description |
 | --- | --- | --- |
 | `PANEL_STREAM[i]` | `1` | Enables continuous raw or `table` output for panel `i`; valid values are `0` and `1`, and the default is snapshot mode. The rolling buffer is derived from the panel's effective height. |
+| `PANEL_TIMEOUT_SECONDS[i]` | `20` | Optional non-negative integer timeout for snapshot panel `i`; overrides `COMMAND_TIMEOUT_SECONDS`. `0` means unlimited. Stream panels ignore command timeouts so long-running streams remain active. |
+
+Timeouts apply to the complete local or SSH snapshot command set. LHC owns the
+wrapper and child processes, sends `TERM`, and uses the normal bounded cleanup
+escalation if a process does not exit. A timeout replaces stale successful data
+with the explicit failed output `TIMEOUT after Ns`; the panel is retried after
+`REFRESH_INTERVAL`. If a panel cannot start its temporary directory, FIFO, or
+job, the scheduler reports an error and rolls back the partial start before
+exiting.
 
 ### 4.3 Raw panels
 
@@ -330,6 +344,7 @@ The following configuration demonstrates raw, table, transpose, and SSH panels. 
 
 ```bash
 REFRESH_INTERVAL=2
+COMMAND_TIMEOUT_SECONDS=10
 
 # Raw local panel
 PANEL_TITLES[0]="Local Release"
@@ -364,6 +379,7 @@ PANEL_SSH_ALIASES[3]="APP01 APP02"
 PANEL_X[3]=38; PANEL_Y[3]=10; PANEL_WIDTHS[3]=42; PANEL_HEIGHTS[3]=10
 PANEL_TABLE_COLUMNS[3]="SERVER APP DEPTH STATUS"
 PANEL_TABLE_WIDTHS[3]="8 8 8 12"
+PANEL_TIMEOUT_SECONDS[3]=20
 PANEL_WARN_RULES[3]="DEPTH:>20"
 PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 ```
@@ -379,18 +395,19 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 | `Command failed` | Run the command directly and check permissions, PATH, and exit status; LHC does not put stderr in the display. |
 | An SSH row is `SSH_FAILED` | Check registry aliases, `~/.ssh/config`, key/agent access, `known_hosts`, and the target host; strict host-key policy must succeed. |
 | No colors appear | Ensure `NO_COLOR` is unset or empty and use an ANSI-capable terminal. |
-| A remote command runs too long | LHC has only an SSH connection timeout, not a post-connection command timeout; configure `SSH_CONNECT_TIMEOUT_SECONDS` if needed and add a timeout to the remote check itself. |
+| A command runs too long | Set `COMMAND_TIMEOUT_SECONDS` or `PANEL_TIMEOUT_SECONDS[i]` for snapshot commands. The panel shows `TIMEOUT after Ns` and retries after `REFRESH_INTERVAL`; stream commands intentionally remain long-running. |
 
 ## 8. Testing and compatibility
 
 LHC remains compatible with Bash 3.2 and does not depend on associative arrays or `wait -n`. After changing the script or configuration, run:
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh tests/test_v7_scheduler_timeout.sh
 ./tests/test_v4_ssh.sh
 bash tests/test_v5_stream.sh
 bash tests/test_v5_shutdown.sh
 bash tests/test_v6_ssh_lifecycle.sh
+bash tests/test_v7_scheduler_timeout.sh
 ```
 
 The test uses fake SSH. It does not prove that production hosts, credentials, host keys, or remote commands work; verify those with real SSH targets before deployment.

@@ -42,6 +42,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_CONFIG="$ROOT_DIR/example/sample.conf"
 TERMINAL_ACTIVE=0
 REFRESH_INTERVAL=2
+COMMAND_TIMEOUT_SECONDS=0
 TABLE_COLUMN_GAP=1
 PANEL_COUNT=0
 TERMINAL_ROWS=0
@@ -91,6 +92,7 @@ declare -a PANEL_X=()
 declare -a PANEL_Y=()
 declare -a PANEL_WIDTHS=()
 declare -a PANEL_HEIGHTS=()
+declare -a PANEL_TIMEOUT_SECONDS=()
 declare -a PANEL_EFFECTIVE_X=()
 declare -a PANEL_EFFECTIVE_Y=()
 declare -a PANEL_EFFECTIVE_WIDTHS=()
@@ -145,6 +147,8 @@ declare -a PANEL_COMMAND_COUNTS=()
 declare -a PANEL_COMMAND_COMPLETED_COUNTS=()
 declare -a PANEL_COMMAND_ACTIVE=()
 declare -a PANEL_COMMAND_STATES=()
+declare -a PANEL_COMMAND_START_SECONDS=()
+declare -a PANEL_COMMAND_TIMEOUT_FILES=()
 declare -a PANEL_NEXT_RUN_SECONDS=()
 declare -a PANEL_COMMAND_START_JOBS=()
 PANEL_COMMAND_SCHEDULER_INITIALIZED=0
@@ -604,6 +608,11 @@ cleanup_panel_commands() {
     [[ -n "$file" ]] && rm -f "$file" "${file}.refresh"
   done
 
+  for index in "${!PANEL_COMMAND_TIMEOUT_FILES[@]}"; do
+    file="${PANEL_COMMAND_TIMEOUT_FILES[$index]:-}"
+    [[ -n "$file" ]] && rm -f "$file"
+  done
+
   if [[ -n "$PANEL_COMMAND_TEMP_DIR" ]]; then
     rmdir "$PANEL_COMMAND_TEMP_DIR" 2>/dev/null || true
     PANEL_COMMAND_TEMP_DIR=""
@@ -629,6 +638,8 @@ cleanup_panel_commands() {
   PANEL_COMMAND_FIFO_FILES=()
   PANEL_COMMAND_LAST_OUTPUTS=()
   PANEL_COMMAND_LAST_STATUSES=()
+  PANEL_COMMAND_START_SECONDS=()
+  PANEL_COMMAND_TIMEOUT_FILES=()
   PANEL_COMMAND_COUNTS=()
   PANEL_COMMAND_COMPLETED_COUNTS=()
   PANEL_COMMAND_ACTIVE=()
@@ -705,6 +716,7 @@ load_config() {
   fi
 
   REFRESH_INTERVAL=2
+  COMMAND_TIMEOUT_SECONDS=0
   SSH_CONTROL_PERSIST_SECONDS=30
   SSH_CONNECT_TIMEOUT_SECONDS=10
   SSH_MASTER_RETRY_BACKOFF_SECONDS=5
@@ -719,6 +731,7 @@ load_config() {
   PANEL_Y=()
   PANEL_WIDTHS=()
   PANEL_HEIGHTS=()
+  PANEL_TIMEOUT_SECONDS=()
   PANEL_EFFECTIVE_X=()
   PANEL_EFFECTIVE_Y=()
   PANEL_EFFECTIVE_WIDTHS=()
@@ -755,6 +768,10 @@ load_config() {
     error "REFRESH_INTERVAL must be a positive integer"
     return 1
   fi
+  if ! is_non_negative_integer "$COMMAND_TIMEOUT_SECONDS"; then
+    error "COMMAND_TIMEOUT_SECONDS must be a non-negative integer"
+    return 1
+  fi
 
   validate_config
 }
@@ -788,6 +805,14 @@ validate_config() {
   validate_optional_panel_indexes PANEL_TABLE_WIDTHS || return 1
   validate_optional_panel_indexes PANEL_SSH_ALIASES || return 1
   validate_optional_panel_indexes PANEL_STREAM || return 1
+  validate_optional_panel_indexes PANEL_TIMEOUT_SECONDS || return 1
+
+  for index in "${!PANEL_TIMEOUT_SECONDS[@]}"; do
+    if ! is_non_negative_integer "${PANEL_TIMEOUT_SECONDS[$index]}"; then
+      error "PANEL_TIMEOUT_SECONDS[$index] must be a non-negative integer"
+      return 1
+    fi
+  done
 
   validate_table_configs || return 1
   validate_stream_configs || return 1
@@ -2324,6 +2349,7 @@ refresh_stream_panels() {
 run_panel_commands() {
   local index alias target job panel_index status_file
   local completed total now completed_panels=""
+  local -a started_panels=()
 
   if (( PANEL_COMMAND_SCHEDULER_INITIALIZED == 0 )); then
     PANEL_COMMAND_PIDS=()
@@ -2346,6 +2372,8 @@ run_panel_commands() {
     PANEL_COMMAND_FIFO_FILES=()
     PANEL_COMMAND_LAST_OUTPUTS=()
     PANEL_COMMAND_LAST_STATUSES=()
+    PANEL_COMMAND_START_SECONDS=()
+    PANEL_COMMAND_TIMEOUT_FILES=()
     PANEL_COMMAND_COUNTS=()
     PANEL_COMMAND_COMPLETED_COUNTS=()
     PANEL_COMMAND_ACTIVE=()
@@ -2377,15 +2405,24 @@ run_panel_commands() {
     PANEL_COMMAND_COMPLETED_COUNTS[$index]=0
     PANEL_COMMAND_ACTIVE[$index]=1
     PANEL_COMMAND_START_JOBS[$index]="$PANEL_COMMAND_JOB_COUNT"
+    started_panels[${#started_panels[@]}]="$index"
     if has_array_index PANEL_SSH_ALIASES "$index"; then
       for alias in ${PANEL_SSH_ALIASES[$index]}; do
         resolve_ssh_target "$alias"
         target="$FUNCTION_RESULT"
-        start_panel_command_job "$index" "$alias" "$target" || return 1
+        if ! start_panel_command_job "$index" "$alias" "$target"; then
+          error "unable to start panel $index SSH job for alias $alias"
+          rollback_started_panels "${started_panels[@]}"
+          return 1
+        fi
         PANEL_COMMAND_COUNTS[$index]=$((PANEL_COMMAND_COUNTS[index] + 1))
       done
     else
-      start_panel_command_job "$index" "" "" || return 1
+      if ! start_panel_command_job "$index" "" ""; then
+        error "unable to start panel $index command"
+        rollback_started_panels "${started_panels[@]}"
+        return 1
+      fi
       PANEL_COMMAND_COUNTS[$index]=1
     fi
   done
@@ -2395,6 +2432,7 @@ run_panel_commands() {
   # target cannot block local panels, other SSH targets, or keyboard input.
   service_ssh_polling_masters
 
+  timeout_running_panel_commands
   refresh_stream_panels
 
   # Poll portable completion markers instead of wait -n, which is unavailable
@@ -2429,6 +2467,7 @@ run_panel_commands() {
   done
 
   refresh_stream_panels
+  return 0
 }
 
 cleanup_panel_result_files() {
@@ -2448,7 +2487,8 @@ cleanup_panel_result_files() {
       "${PANEL_COMMAND_CHILD_PID_FILES[$job]:-}" \
       "${PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]:-}" \
       "${PANEL_COMMAND_COLLECTOR_PID_FILES[$job]:-}" \
-      "${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]:-}"; do
+      "${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]:-}" \
+      "${PANEL_COMMAND_TIMEOUT_FILES[$job]:-}"; do
       [[ -n "$file" ]] && rm -f "$file"
     done
   done
@@ -2463,6 +2503,7 @@ compact_completed_panel_jobs() {
   local -a new_aliases=() new_targets=() new_input_files=() new_error_files=()
   local -a new_exit_statuses=() new_control_paths=() new_streams=()
   local -a new_fifo_files=() new_last_outputs=() new_last_statuses=()
+  local -a new_start_seconds=() new_timeout_files=()
   local -a new_states=()
 
   for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
@@ -2487,6 +2528,8 @@ compact_completed_panel_jobs() {
     new_fifo_files[$new_job]="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
     new_last_outputs[$new_job]="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
     new_last_statuses[$new_job]="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
+    new_start_seconds[$new_job]="${PANEL_COMMAND_START_SECONDS[$job]:-}"
+    new_timeout_files[$new_job]="${PANEL_COMMAND_TIMEOUT_FILES[$job]:-}"
     new_states[$new_job]="${PANEL_COMMAND_STATES[$job]:-}"
     new_job=$((new_job + 1))
   done
@@ -2512,6 +2555,8 @@ compact_completed_panel_jobs() {
     PANEL_COMMAND_FIFO_FILES=()
     PANEL_COMMAND_LAST_OUTPUTS=()
     PANEL_COMMAND_LAST_STATUSES=()
+    PANEL_COMMAND_START_SECONDS=()
+    PANEL_COMMAND_TIMEOUT_FILES=()
     PANEL_COMMAND_STATES=()
   else
     PANEL_COMMAND_PIDS=("${new_pids[@]}")
@@ -2534,9 +2579,112 @@ compact_completed_panel_jobs() {
     PANEL_COMMAND_FIFO_FILES=("${new_fifo_files[@]}")
     PANEL_COMMAND_LAST_OUTPUTS=("${new_last_outputs[@]}")
     PANEL_COMMAND_LAST_STATUSES=("${new_last_statuses[@]}")
+    PANEL_COMMAND_START_SECONDS=("${new_start_seconds[@]}")
+    PANEL_COMMAND_TIMEOUT_FILES=("${new_timeout_files[@]}")
     PANEL_COMMAND_STATES=("${new_states[@]}")
   fi
   PANEL_COMMAND_JOB_COUNT=$new_job
+}
+
+get_panel_timeout_seconds() {
+  local panel_index="$1" timeout="${COMMAND_TIMEOUT_SECONDS:-0}"
+
+  if has_array_index PANEL_TIMEOUT_SECONDS "$panel_index"; then
+    timeout="${PANEL_TIMEOUT_SECONDS[$panel_index]}"
+  fi
+  FUNCTION_RESULT="$timeout"
+}
+
+panel_timeout_message() {
+  local panel_index="$1"
+
+  get_panel_timeout_seconds "$panel_index"
+  FUNCTION_RESULT="TIMEOUT after ${FUNCTION_RESULT}s"
+}
+
+mark_panel_timeout() {
+  local panel_index="$1"
+
+  panel_timeout_message "$panel_index"
+  PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+  PANEL_RENDER_MODES[$panel_index]="failed"
+  PANEL_STATUSES[$panel_index]="TIMEOUT"
+  PANEL_TABLE_HEADERS[$panel_index]=""
+  PANEL_TABLE_ROWS[$panel_index]=""
+  PANEL_TABLE_CELL_STATUSES[$panel_index]=""
+}
+
+panel_has_timeout() {
+  local panel_index="$1" job
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    [[ "${PANEL_COMMAND_EXIT_STATUSES[$job]:-}" == "TIMEOUT" ]] && return 0
+  done
+  return 1
+}
+
+timeout_running_panel_commands() {
+  local job panel_index timeout start timeout_file status_file wrapper_pid
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 0 ]] || continue
+    [[ "${PANEL_COMMAND_STATES[$job]:-}" == "RUNNING" ]] || continue
+    [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 0 ]] || continue
+    status_file="${PANEL_COMMAND_STATUS_FILES[$job]:-}"
+    [[ -s "$status_file" ]] && continue
+    panel_index="${PANEL_COMMAND_PANEL_INDEXES[$job]}"
+    get_panel_timeout_seconds "$panel_index"
+    timeout="$FUNCTION_RESULT"
+    (( timeout > 0 )) || continue
+    start="${PANEL_COMMAND_START_SECONDS[$job]:-$SECONDS}"
+    (( SECONDS - start >= timeout )) || continue
+    timeout_file="${PANEL_COMMAND_TIMEOUT_FILES[$job]:-}"
+    [[ -n "$timeout_file" ]] || continue
+    [[ -e "$timeout_file" ]] && continue
+
+    : >"$timeout_file"
+    PANEL_COMMAND_STATES[$job]="TIMING_OUT"
+    if get_owned_job_pid "$job" wrapper; then
+      kill -TERM "$FUNCTION_RESULT" 2>/dev/null || true
+    elif [[ -z "${PANEL_COMMAND_WRAPPER_STARTS[$job]:-}" ]]; then
+      # During the short publication window ps may not yet expose the wrapper
+      # identity. The PID was just created by this scheduler, so use kill -0
+      # as the bounded fallback until the identity becomes available.
+      wrapper_pid="${PANEL_COMMAND_PIDS[$job]:-}"
+      if [[ "$wrapper_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$wrapper_pid" 2>/dev/null; then
+        kill -TERM "$wrapper_pid" 2>/dev/null || true
+      fi
+    else
+      signal_owned_job_processes "$job" TERM 1 2>/dev/null || true
+    fi
+    mark_panel_timeout "$panel_index"
+    render_dashboard "$panel_index"
+  done
+  return 0
+}
+
+rollback_panel_start() {
+  local panel_index="$1" job start_job count=0
+
+  start_job="${PANEL_COMMAND_START_JOBS[$panel_index]:-0}"
+  for ((job = start_job; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    count=$((count + 1))
+    signal_owned_job_processes "$job" TERM 1 2>/dev/null || true
+  done
+  PANEL_COMMAND_ACTIVE[$panel_index]=0
+  PANEL_COMMAND_COUNTS[$panel_index]="$count"
+  PANEL_COMMAND_COMPLETED_COUNTS[$panel_index]=0
+  PANEL_NEXT_RUN_SECONDS[$panel_index]=$((SECONDS + REFRESH_INTERVAL))
+}
+
+rollback_started_panels() {
+  local panel_index
+
+  for panel_index in "$@"; do
+    rollback_panel_start "$panel_index"
+  done
 }
 
 get_ssh_control_path() {
@@ -2835,6 +2983,7 @@ start_panel_command_job() {
   local child_identity_file="$PANEL_COMMAND_TEMP_DIR/child-identity.$job"
   local collector_pid_file="$PANEL_COMMAND_TEMP_DIR/collector.$job"
   local collector_identity_file="$PANEL_COMMAND_TEMP_DIR/collector-identity.$job"
+  local timeout_file="$PANEL_COMMAND_TEMP_DIR/timeout.$job"
   local control_path=""
   local stream_mode="${PANEL_STREAM[$panel_index]:-0}"
   local stream_capacity=""
@@ -2866,6 +3015,8 @@ start_panel_command_job() {
   PANEL_COMMAND_FIFO_FILES[$job]=""
   PANEL_COMMAND_LAST_OUTPUTS[$job]=""
   PANEL_COMMAND_LAST_STATUSES[$job]=""
+  PANEL_COMMAND_START_SECONDS[$job]="$SECONDS"
+  PANEL_COMMAND_TIMEOUT_FILES[$job]="$timeout_file"
   PANEL_COMMAND_STATES[$job]="STARTING"
   : >"$status_file"
   : >"$error_file"
@@ -2891,6 +3042,7 @@ start_panel_command_job() {
 
   (
     local child_pid="" collector_pid="" exit_status output_target refresh_pid="${STREAM_REFRESH_PID:-}"
+    local timeout_file="${PANEL_COMMAND_TIMEOUT_FILES[$job]:-}"
 
     terminate_job_process() {
       local process_pid="$1" attempt
@@ -2906,6 +3058,9 @@ start_panel_command_job() {
     handle_job_signal() {
       terminate_job_process "$child_pid"
       terminate_job_process "$collector_pid"
+      if [[ -e "$timeout_file" ]]; then
+        printf '%s\n' "TIMEOUT" >"$status_file"
+      fi
       exit 143
     }
     trap handle_job_signal TERM INT
@@ -2965,6 +3120,11 @@ start_panel_command_job() {
 finalize_panel_command_output() {
   local panel_index="$1" job exit_status output_file
 
+  if panel_has_timeout "$panel_index"; then
+    mark_panel_timeout "$panel_index"
+    return
+  fi
+
   if has_array_index PANEL_SSH_ALIASES "$panel_index"; then
     aggregate_ssh_panel_output "$panel_index"
     return
@@ -2974,7 +3134,7 @@ finalize_panel_command_output() {
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
     output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
-    if [[ "$exit_status" -eq 0 ]]; then
+    if [[ "$exit_status" == "0" ]]; then
       PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
       if [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]]; then
         limit_stream_output "$panel_index"
@@ -3474,7 +3634,11 @@ run_dashboard_loop() {
       continue
     fi
 
-    run_panel_commands
+    if ! run_panel_commands; then
+      error "dashboard scheduler failed; exiting"
+      stop_keyboard_reader
+      return 1
+    fi
 
     # Process a pending stream event immediately. A one-second read here would
     # delay a notification whose signal arrived just before the read started;

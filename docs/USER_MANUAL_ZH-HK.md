@@ -37,7 +37,10 @@ NO_COLOR=1 ./bin/lhc example/fpp.conf
    在命令仍然運行時，每收到新的完整輸出行便重畫。stream collector
    會合併待處理的 notification 並喚醒主終端機循環，因此不需要等待
    原本的一秒排程 timeout。
-5. 該 panel 的命令結束後等待 `REFRESH_INTERVAL` 秒再執行下一輪；其他
+5. 如果 snapshot 命令超過配置的 timeout，LHC 會終止其擁有的 process
+   tree，並以 failed panel 輸出 `TIMEOUT after Ns`。該 panel 會在
+   `REFRESH_INTERVAL` 秒後重新執行。
+6. 該 panel 的命令結束後等待 `REFRESH_INTERVAL` 秒再執行下一輪；其他
    panel 使用獨立計時器，不會被它阻塞。
 
 SSH job 會並行執行，但同一面板的結果按 `PANEL_SSH_ALIASES` 配置順序聚合，而不是按完成先後排序。LHC 使用局部 frame diff 更新改變的內容；調整終端機大小後會強制完整重畫。
@@ -48,6 +51,7 @@ SSH job 會並行執行，但同一面板的結果按 `PANEL_SSH_ALIASES` 配置
 
 ```bash
 REFRESH_INTERVAL=2
+COMMAND_TIMEOUT_SECONDS=10
 
 PANEL_TITLES[0]="Queue"
 PANEL_COMMANDS[0]="printf 'queue=0\\noldest=0s\\n'"
@@ -72,6 +76,7 @@ PANEL_HEIGHTS[0]=8
 | 變數 | 必需 | 說明 |
 | --- | --- | --- |
 | `REFRESH_INTERVAL` | 否 | 正整數秒數；預設 `2`。每個 panel 在自己的命令完成後等待這段時間再刷新。 |
+| `COMMAND_TIMEOUT_SECONDS` | 否 | 非負整數秒數；預設 `0`（不限時）。snapshot 命令的最長執行時間；`PANEL_TIMEOUT_SECONDS[i]` 可對單一 panel 覆寫。超時會顯示 `TIMEOUT after Ns`，並在 `REFRESH_INTERVAL` 秒後重試；stream 命令不受此設定限制。 |
 | `NO_COLOR` | 環境變數 | 任何非空值都會關閉 warning/error 的 ANSI 顏色。 |
 
 `TMPDIR` 不是面板配置欄位；若已設定，LHC 會在其下建立短暫的命令輸出目錄，離開時清理。未設定時使用 `/tmp`。
@@ -112,6 +117,13 @@ footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機�
 | 變數 | 例子 | 說明 |
 | --- | --- | --- |
 | `PANEL_STREAM[i]` | `1` | 啟用 panel `i` 的持續 raw 或 `table` 輸出；有效值是 `0` 或 `1`，預設是 snapshot 模式。滾動 buffer 按 panel 有效高度計算。 |
+| `PANEL_TIMEOUT_SECONDS[i]` | `20` | 可選的非負整數 timeout，套用於 panel `i` 的 snapshot 命令；會覆寫 `COMMAND_TIMEOUT_SECONDS`。`0` 代表不限時。Stream panel 不套用 command timeout，以保留長時間運行的 stream。 |
+
+Timeout 會套用於完整的本機或 SSH snapshot 命令組。LHC 擁有 wrapper
+及子程序，先送出 `TERM`，若仍未退出則使用既有的有界清理流程升級至
+`KILL`。超時會以明確的 failed 輸出 `TIMEOUT after Ns` 取代過時的成功資料，
+並在 `REFRESH_INTERVAL` 秒後重試。如果 panel 無法建立暫存目錄、FIFO 或
+job，scheduler 會報錯並回滾部分啟動後退出。
 
 ### 4.3 Raw 面板
 
@@ -306,6 +318,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 
 ```bash
 REFRESH_INTERVAL=2
+COMMAND_TIMEOUT_SECONDS=10
 
 # Raw local panel
 PANEL_TITLES[0]="Local Release"
@@ -340,6 +353,7 @@ PANEL_SSH_ALIASES[3]="APP01 APP02"
 PANEL_X[3]=38; PANEL_Y[3]=10; PANEL_WIDTHS[3]=42; PANEL_HEIGHTS[3]=10
 PANEL_TABLE_COLUMNS[3]="SERVER APP DEPTH STATUS"
 PANEL_TABLE_WIDTHS[3]="8 8 8 12"
+PANEL_TIMEOUT_SECONDS[3]=20
 PANEL_WARN_RULES[3]="DEPTH:>20"
 PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 ```
@@ -355,18 +369,19 @@ PANEL_ERROR_RULES[3]="DEPTH:>50 STATUS:==DOWN"
 | 出現 `Command failed` | 直接在 shell 測試命令、權限、PATH 及 exit status；LHC 不把 stderr 放進畫面。 |
 | SSH row 是 `SSH_FAILED` | 檢查 registry alias、`~/.ssh/config`、key/agent、`known_hosts` 及目標主機；必須接受 strict host-key policy。 |
 | 沒有顏色 | 確認沒有設定非空 `NO_COLOR`，並使用支援 ANSI 的終端機。 |
-| 遠端命令執行太久 | LHC 只有 10 秒 SSH 連線建立 timeout，沒有成功連線後的命令 timeout；應在遠端檢查命令本身設定 timeout。 |
+| 命令執行太久 | 對 snapshot 命令設定 `COMMAND_TIMEOUT_SECONDS` 或 `PANEL_TIMEOUT_SECONDS[i]`。面板會顯示 `TIMEOUT after Ns`，並在 `REFRESH_INTERVAL` 秒後重試；stream 命令則刻意保持長時間運行。 |
 
 ## 8. 測試及相容性
 
 LHC 保持 Bash 3.2 相容性，不依賴 associative arrays 或 `wait -n`。修改腳本或配置後可執行：
 
 ```bash
-bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh
+bash -n bin/lhc tests/fixtures/ssh tests/test_v4_ssh.sh tests/test_v5_shutdown.sh tests/test_v6_ssh_lifecycle.sh tests/test_v7_scheduler_timeout.sh
 ./tests/test_v4_ssh.sh
 bash tests/test_v5_stream.sh
 bash tests/test_v5_shutdown.sh
 bash tests/test_v6_ssh_lifecycle.sh
+bash tests/test_v7_scheduler_timeout.sh
 ```
 
 測試使用 fake SSH，不代表實際部署主機、憑證、host key 或遠端命令已驗證；正式使用前仍須以實際 SSH 目標測試。
