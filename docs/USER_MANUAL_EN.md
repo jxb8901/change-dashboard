@@ -86,7 +86,7 @@ and bounds checks still apply.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `REFRESH_INTERVAL` | No | Positive integer seconds; default `2`. Each panel starts its next run this many seconds after its own command set finishes. |
-| `COMMAND_TIMEOUT_SECONDS` | No | Non-negative integer seconds; default `0` (unlimited). Maximum runtime for snapshot commands; `PANEL_TIMEOUT_SECONDS[i]` can override it per panel. A timed out command displays `TIMEOUT after Ns` and the panel retries after `REFRESH_INTERVAL`. Stream commands are not limited by this setting. |
+| `COMMAND_TIMEOUT_SECONDS` | No | Non-negative integer seconds; default `0` (unlimited). Maximum runtime for snapshot commands; `PANEL_TIMEOUT_SECONDS[i]` can override it per panel. A timed out command displays `TIMEOUT after Ns` and the panel retries after `REFRESH_INTERVAL`. Bash 3.2 timing is integer-resolution and intentionally errs late by up to about one second. Stream commands are not limited by this setting. |
 | `NO_COLOR` | Environment | Any non-empty value disables ANSI warning/error colors. |
 
 `TMPDIR` is not a panel setting. When set, LHC creates its temporary command-output directory below it and removes that directory on exit; otherwise it uses `/tmp`.
@@ -130,7 +130,7 @@ the dashboard pauses until the terminal is large enough.
 | Variable | Example | Description |
 | --- | --- | --- |
 | `PANEL_STREAM[i]` | `1` | Enables continuous raw or `table` output for panel `i`; valid values are `0` and `1`, and the default is snapshot mode. The rolling buffer is derived from the panel's effective height. |
-| `PANEL_TIMEOUT_SECONDS[i]` | `20` | Optional non-negative integer timeout for snapshot panel `i`; overrides `COMMAND_TIMEOUT_SECONDS`. `0` means unlimited. Stream panels ignore command timeouts so long-running streams remain active. |
+| `PANEL_TIMEOUT_SECONDS[i]` | `20` | Optional non-negative integer timeout for snapshot panel `i`; overrides `COMMAND_TIMEOUT_SECONDS`. `0` means unlimited. Bash 3.2 timing is conservative and may fire up to about one second late. Stream panels ignore command timeouts so long-running streams remain active. |
 
 Timeouts apply to the complete local or SSH snapshot command set. LHC owns the
 wrapper and child processes, sends `TERM`, and uses the normal bounded cleanup

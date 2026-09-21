@@ -51,6 +51,17 @@ run_until_panel_finishes() {
   fail_test "panel did not finish within the bounded test window"
 }
 
+run_until_panel_output() {
+  local expected="$1" attempt
+
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    run_panel_commands || fail_test "scheduler returned an unexpected failure"
+    [[ "${PANEL_OUTPUTS[0]:-}" == "$expected" ]] && return 0
+    sleep 0.05
+  done
+  fail_test "panel did not produce [$expected] within the bounded test window"
+}
+
 # Issue #4: scheduler-level failure must propagate and leave no active panel.
 configure_local_panel
 PANEL_COMMAND_TEMP_DIR=""
@@ -90,8 +101,8 @@ fi
 # Issue #5: the global timeout replaces stale successful data with an error state.
 configure_local_panel
 COMMAND_TIMEOUT_SECONDS=1
-PANEL_COMMANDS[0]="printf 'old success\\n'"
-run_until_panel_finishes
+PANEL_COMMANDS[0]="sleep 0.2; printf 'old success\\n'"
+run_until_panel_output "old success"
 assert_equal "old success" "${PANEL_OUTPUTS[0]}" "pre-timeout successful output"
 PANEL_COMMANDS[0]="sleep 5"
 PANEL_NEXT_RUN_SECONDS[0]=0
@@ -100,6 +111,9 @@ assert_equal "TIMEOUT after 1s" "${PANEL_OUTPUTS[0]}" "local timeout message"
 assert_equal "failed" "${PANEL_RENDER_MODES[0]}" "local timeout render mode"
 assert_equal "TIMEOUT" "${PANEL_STATUSES[0]}" "local timeout status"
 assert_equal "0" "$PANEL_COMMAND_JOB_COUNT" "timed-out local job was reaped"
+PANEL_COMMANDS[0]="printf 'recovered\\n'"
+run_until_panel_output "recovered"
+assert_equal "recovered" "${PANEL_OUTPUTS[0]}" "panel restarted successfully after timeout"
 cleanup_panel_commands
 
 # Issue #5: a per-panel timeout overrides the unlimited global default and kills
@@ -108,9 +122,15 @@ configure_local_panel
 COMMAND_TIMEOUT_SECONDS=0
 PANEL_TIMEOUT_SECONDS[0]=1
 PANEL_COMMANDS[0]="trap '' TERM; sleep 5"
+PANEL_TITLES[1]="Fast panel"
+PANEL_COMMANDS[1]="printf 'fast\\n'"
+PANEL_X[1]=42; PANEL_Y[1]=1; PANEL_WIDTHS[1]=36; PANEL_HEIGHTS[1]=6
+validate_config || fail_test "unrelated fast panel configuration was rejected"
+resolve_panel_dimensions
 run_until_panel_finishes
 assert_equal "TIMEOUT after 1s" "${PANEL_OUTPUTS[0]}" "panel timeout message"
 assert_equal "0" "$PANEL_COMMAND_JOB_COUNT" "TERM-resistant job was reaped"
+assert_equal "fast" "${PANEL_OUTPUTS[1]}" "unrelated fast panel completed"
 cleanup_panel_commands
 
 # Issue #5: an SSH polling command is bounded without leaking its channel/master.

@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  bash-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check Bash syntax
+        run: bash -n bin/lhc tests/fixtures/ssh tests/test_*.sh
+
+      - name: Run regression tests
+        run: |
+          bash tests/test_cli_options.sh
+          bash tests/test_v4_ssh.sh
+          bash tests/test_v5_features.sh
+          bash tests/test_v6_ssh_lifecycle.sh
+          bash tests/test_v7_scheduler_timeout.sh

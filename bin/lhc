@@ -3015,7 +3015,10 @@ start_panel_command_job() {
   PANEL_COMMAND_FIFO_FILES[$job]=""
   PANEL_COMMAND_LAST_OUTPUTS[$job]=""
   PANEL_COMMAND_LAST_STATUSES[$job]=""
-  PANEL_COMMAND_START_SECONDS[$job]="$SECONDS"
+  # Bash 3.2 exposes SECONDS only at integer resolution. Rounding the
+  # effective start forward by one second guarantees a timeout cannot fire
+  # early; it may fire up to one second late.
+  PANEL_COMMAND_START_SECONDS[$job]=$((SECONDS + 1))
   PANEL_COMMAND_TIMEOUT_FILES[$job]="$timeout_file"
   PANEL_COMMAND_STATES[$job]="STARTING"
   : >"$status_file"

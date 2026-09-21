@@ -76,7 +76,7 @@ PANEL_HEIGHTS[0]=8
 | 變數 | 必需 | 說明 |
 | --- | --- | --- |
 | `REFRESH_INTERVAL` | 否 | 正整數秒數；預設 `2`。每個 panel 在自己的命令完成後等待這段時間再刷新。 |
-| `COMMAND_TIMEOUT_SECONDS` | 否 | 非負整數秒數；預設 `0`（不限時）。snapshot 命令的最長執行時間；`PANEL_TIMEOUT_SECONDS[i]` 可對單一 panel 覆寫。超時會顯示 `TIMEOUT after Ns`，並在 `REFRESH_INTERVAL` 秒後重試；stream 命令不受此設定限制。 |
+| `COMMAND_TIMEOUT_SECONDS` | 否 | 非負整數秒數；預設 `0`（不限時）。snapshot 命令的最長執行時間；`PANEL_TIMEOUT_SECONDS[i]` 可對單一 panel 覆寫。超時會顯示 `TIMEOUT after Ns`，並在 `REFRESH_INTERVAL` 秒後重試。Bash 3.2 只提供整數秒解析度，實作會保守地最多遲約一秒觸發；stream 命令不受此設定限制。 |
 | `NO_COLOR` | 環境變數 | 任何非空值都會關閉 warning/error 的 ANSI 顏色。 |
 
 `TMPDIR` 不是面板配置欄位；若已設定，LHC 會在其下建立短暫的命令輸出目錄，離開時清理。未設定時使用 `/tmp`。
@@ -117,7 +117,7 @@ footer 行仍會保留。百分比換算後低於最小尺寸或超出終端機�
 | 變數 | 例子 | 說明 |
 | --- | --- | --- |
 | `PANEL_STREAM[i]` | `1` | 啟用 panel `i` 的持續 raw 或 `table` 輸出；有效值是 `0` 或 `1`，預設是 snapshot 模式。滾動 buffer 按 panel 有效高度計算。 |
-| `PANEL_TIMEOUT_SECONDS[i]` | `20` | 可選的非負整數 timeout，套用於 panel `i` 的 snapshot 命令；會覆寫 `COMMAND_TIMEOUT_SECONDS`。`0` 代表不限時。Stream panel 不套用 command timeout，以保留長時間運行的 stream。 |
+| `PANEL_TIMEOUT_SECONDS[i]` | `20` | 可選的非負整數 timeout，套用於 panel `i` 的 snapshot 命令；會覆寫 `COMMAND_TIMEOUT_SECONDS`。`0` 代表不限時。Bash 3.2 的計時採保守方式，最多可能遲約一秒觸發。Stream panel 不套用 command timeout，以保留長時間運行的 stream。 |
 
 Timeout 會套用於完整的本機或 SSH snapshot 命令組。LHC 擁有 wrapper
 及子程序，先送出 `TERM`，若仍未退出則使用既有的有界清理流程升級至
