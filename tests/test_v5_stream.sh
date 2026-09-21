@@ -338,7 +338,7 @@ latency_event_loop_test() {
   export LHC_LATENCY_EMIT_FILE
 
   PANEL_TITLES[0]='Latency stream'
-  PANEL_COMMANDS[0]="sleep 0.2; printf 'latency-token\\n'; perl -MTime::HiRes -e 'printf \"%.6f\\n\", Time::HiRes::time()' >\"$LATENCY_EMIT_FILE\""
+  PANEL_COMMANDS[0]="sleep 0.2; perl -MTime::HiRes -e 'open my \$fh, \">\", \$ENV{LHC_LATENCY_EMIT_FILE} or die \$!; printf \$fh \"%.6f\\n\", Time::HiRes::time(); print \"latency-token\\n\"; close \$fh'"
   PANEL_STREAM[0]=1
   PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=36; PANEL_HEIGHTS[0]=6
   PANEL_TITLES[1]='Stable raw'
@@ -358,26 +358,39 @@ latency_event_loop_test() {
   draw_frame_value() {
     if [[ "$2" == *latency-token* && ! -s "$LATENCY_RENDER_FILE" ]]; then
       perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time()' >"$LATENCY_RENDER_FILE"
-      printf 'q' >&9
+      printf 'q' >"$LATENCY_STDIN_FIFO"
     fi
     latency_original_draw_frame_value "$@"
   }
 
-  exec 8<&0
+  exec 7<&0
   exec 0<>"$LATENCY_STDIN_FIFO"
-  exec 9>"$LATENCY_STDIN_FIFO"
   STREAM_REFRESH_PID="$$"
   LHC_OWNER_PID="$$"
+  LATENCY_WATCHDOG_FIRED=0
+  handle_latency_watchdog() {
+    LATENCY_WATCHDOG_FIRED=1
+    QUIT_PENDING=1
+  }
+  trap handle_latency_watchdog TERM
+  (
+    sleep 5
+    kill -TERM "$$" 2>/dev/null || true
+  ) &
+  LATENCY_WATCHDOG_PID=$!
   trap 'handle_stream_refresh' USR1
   render_dashboard >/dev/null
   run_dashboard_loop >/dev/null
-  exec 9>&-
+  kill -TERM "$LATENCY_WATCHDOG_PID" 2>/dev/null || true
+  wait "$LATENCY_WATCHDOG_PID" 2>/dev/null || true
   exec 0<&-
-  exec 0<&8
-  exec 8<&-
+  exec 0<&7
+  exec 7<&-
+  trap - TERM
   trap - USR1
   sleep 0.1
 
+  (( LATENCY_WATCHDOG_FIRED == 0 )) || fail_test "latency event loop watchdog expired before q shutdown"
   [[ -s "$LATENCY_EMIT_FILE" ]] || fail_test "latency stream did not publish an emission timestamp"
   [[ -s "$LATENCY_RENDER_FILE" ]] || fail_test "latency stream did not reach the real renderer"
   LATENCY_MS="$(perl -e '$start = <>; $end = <>; printf "%.0f\n", ($end - $start) * 1000' \

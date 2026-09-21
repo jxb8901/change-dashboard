@@ -69,6 +69,7 @@ AUTO_PANEL_HEIGHT_INDEX=""
 CLEANUP_IN_PROGRESS=0
 SHUTDOWN_IN_PROGRESS=0
 QUIT_PENDING=0
+KEYBOARD_READER_FD_OPEN=0
 LHC_OWNER_PID="$$"
 JOB_TERM_GRACE_ATTEMPTS=10
 JOB_KILL_GRACE_ATTEMPTS=10
@@ -175,10 +176,15 @@ start_keyboard_reader() {
   local owner_pid="${STREAM_REFRESH_PID:-$$}"
 
   [[ -n "${KEYBOARD_READER_PID:-}" ]] && return 0
+  # Bash starts asynchronous commands with stdin redirected to /dev/null when
+  # job control is disabled. Preserve the dashboard input on a fixed reserved
+  # descriptor and make the background reader use it explicitly.
+  exec 8<&0
+  KEYBOARD_READER_FD_OPEN=1
   (
     local key
     trap 'exit 0' TERM INT
-    while IFS= read -rsn1 key; do
+    while IFS= read -rsn1 key <&8; do
       [[ "$key" == "q" ]] || continue
       kill -USR2 "$owner_pid" 2>/dev/null || true
       break
@@ -190,11 +196,16 @@ start_keyboard_reader() {
 stop_keyboard_reader() {
   local reader_pid="${KEYBOARD_READER_PID:-}"
 
-  [[ -n "$reader_pid" ]] || return 0
-  kill -TERM "$reader_pid" 2>/dev/null || true
-  kill -KILL "$reader_pid" 2>/dev/null || true
-  wait "$reader_pid" 2>/dev/null || true
-  KEYBOARD_READER_PID=""
+  if [[ -n "$reader_pid" ]]; then
+    kill -TERM "$reader_pid" 2>/dev/null || true
+    kill -KILL "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid" 2>/dev/null || true
+    KEYBOARD_READER_PID=""
+  fi
+  if (( KEYBOARD_READER_FD_OPEN == 1 )); then
+    exec 8<&-
+    KEYBOARD_READER_FD_OPEN=0
+  fi
 }
 
 cleanup_terminal() {
