@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.3: Publish unified regression/CI coverage and a separate
+#   real-OpenSSH integration scenario for master and stream lifecycle behavior.
 # - 2026-09-22 V5.8.2: Recompute active stream ring capacities after terminal
 #   resize, trim existing event-mode rings in memory, and cover shrink/grow
 #   behavior with a resize regression.
@@ -265,6 +267,21 @@ get_process_parent_pid() {
   ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]'
 }
 
+process_has_ancestor() {
+  local pid="$1" expected_ancestor="$2" parent depth=0
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ &&
+     "$expected_ancestor" =~ ^[1-9][0-9]*$ ]] || return 1
+  while (( depth < 8 )); do
+    parent="$(get_process_parent_pid "$pid")"
+    [[ -n "$parent" && "$parent" != "$pid" && "$parent" != 1 ]] || return 1
+    [[ "$parent" == "$expected_ancestor" ]] && return 0
+    pid="$parent"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
 process_is_running() {
   local pid="$1" state
 
@@ -280,7 +297,12 @@ process_belongs_to() {
 
   process_is_running "$pid" || return 1
   actual_parent="$(get_process_parent_pid "$pid")"
-  [[ -n "$actual_parent" && "$actual_parent" == "$expected_parent" ]] || return 1
+  # Bash 3.2 keeps $$ unchanged in subshells, and script(1) can add another
+  # shell layer. Accept a bounded owner ancestry while the recorded identity
+  # below prevents a reused PID from being signalled.
+  [[ -n "$actual_parent" ]] || return 1
+  [[ "$actual_parent" == "$expected_parent" ]] ||
+    process_has_ancestor "$pid" "$expected_parent" || return 1
   # During the short STARTING window the wrapper may have published its PID
   # before ps can return the identity string. The live parent relationship is
   # the safe fallback for that one window; once an identity is recorded it is
@@ -902,6 +924,7 @@ validate_panel() {
   require_panel_field PANEL_WIDTHS "$index" || return 1
   if ! has_array_index PANEL_HEIGHTS "$index"; then
     if [[ "$index" == "${PANEL_ORDER[${#PANEL_ORDER[@]}-1]}" ]]; then
+      # shellcheck disable=SC2034 # retained as configuration state for callers
       AUTO_PANEL_HEIGHT_INDEX="$index"
     else
       error "PANEL_HEIGHTS[$index] is required"
@@ -941,7 +964,7 @@ validate_panel_geometry_value() {
     percentage="${value%%%}"
     percentage=$((10#$percentage))
     if (( percentage < percentage_min || percentage > 100 )); then
-      error "$field[$index] percentage must be between ${percentage_min}% and 100%"
+      error "${field}[$index] percentage must be between ${percentage_min}% and 100%"
       return 1
     fi
     return 0
@@ -954,9 +977,9 @@ validate_panel_geometry_value() {
 
   if ! is_positive_integer "$value" || (( integer_value < integer_min )); then
     if [[ "$integer_min" -eq 1 ]]; then
-      error "$field[$index] must be a positive integer or a percentage between ${percentage_min}% and 100%"
+      error "${field}[$index] must be a positive integer or a percentage between ${percentage_min}% and 100%"
     else
-      error "$field[$index] must be at least $integer_min or a percentage between ${percentage_min}% and 100%"
+      error "${field}[$index] must be at least $integer_min or a percentage between ${percentage_min}% and 100%"
     fi
     return 1
   fi
@@ -1327,7 +1350,7 @@ require_panel_field() {
   local index="$2"
 
   if ! has_array_index "$array_name" "$index"; then
-    error "$array_name[$index] is required"
+    error "${array_name}[$index] is required"
     return 1
   fi
 }
@@ -1344,6 +1367,7 @@ build_panel_model() {
     PANEL_ORDER+=("$index")
   done
 
+  # shellcheck disable=SC2034 # retained as exported dashboard metadata
   PANEL_COUNT="${#PANEL_ORDER[@]}"
 }
 
@@ -2323,6 +2347,7 @@ ensure_stream_event_channel() {
   fi
   eval "exec ${STREAM_EVENT_FD}<>\"$STREAM_EVENT_FIFO\"" || return 1
   STREAM_EVENT_CHANNEL_ACTIVE=1
+  # shellcheck disable=SC2034 # reserved for buffered event compatibility
   STREAM_EVENT_BUFFER=""
 }
 
@@ -2357,6 +2382,7 @@ close_stream_event_channel() {
     eval "exec ${STREAM_EVENT_FD}>&-" 2>/dev/null || true
   fi
   STREAM_EVENT_CHANNEL_ACTIVE=0
+  # shellcheck disable=SC2034 # reserved for buffered event compatibility
   STREAM_EVENT_BUFFER=""
   if [[ -n "$STREAM_EVENT_FIFO" ]]; then
     rm -f "$STREAM_EVENT_FIFO"
@@ -3106,7 +3132,8 @@ ssh_polling_master_ready() {
 }
 
 write_ssh_master_state() {
-  local control_path="$1" state="$2" state_file="${control_path}.state"
+  local control_path="$1" state="$2"
+  local state_file="${control_path}.state"
   local temporary_file="${state_file}.tmp.$$"
 
   [[ -d "${control_path%/*}" ]] || return 0
@@ -3778,6 +3805,7 @@ evaluate_table_output() {
   done <<< "${PANEL_TABLE_ROWS[$index]}"
 
   PANEL_TABLE_CELL_STATUSES[$index]="${status_rows%$'\n'}"
+  # shellcheck disable=SC2034 # renderer-facing panel state is retained for callers
   PANEL_STATUSES[$index]="$panel_status"
 }
 
@@ -3932,6 +3960,7 @@ compare_numbers() {
   esac
 }
 
+# shellcheck disable=SC2071 # lexical compare is intentional after equalizing lengths
 compare_decimal_values() {
   local left="$1" right="$2" left_sign=1 right_sign=1
   local left_integer left_fraction right_integer right_fraction length
@@ -4055,6 +4084,7 @@ wait_for_dashboard_event() {
   if (( timeout > 0 )); then
     if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
       if IFS= read -r -t "$timeout" event <&9; then
+        # shellcheck disable=SC2034 # event receipt is observable by embedding callers
         DASHBOARD_EVENT_RECEIVED=1
         return 0
       fi

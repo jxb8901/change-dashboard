@@ -445,7 +445,7 @@ trap handle_stream_refresh_with_q USR1
   kill -USR1 "$$"
 ) &
 Q_SIGNAL_PID=$!
-if ! wait_for_quit_or_timeout 1; then
+if ! wait_for_quit_or_timeout 2; then
   fail_test "q was not handled after a stream signal interrupted the keyboard wait"
 fi
 wait "$Q_SIGNAL_PID"

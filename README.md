@@ -54,7 +54,7 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.8.2 includes a blocking stream event channel, in-memory bounded stream rings,
+V5.8.3 includes a blocking stream event channel, in-memory bounded stream rings,
 and asynchronous per-target SSH polling-master lifecycle and reliable stream
 shutdown/process handling on top of the V5.2 multi-server SSH execution,
 partial refresh, continuous raw/table
@@ -134,6 +134,22 @@ Run the V4 regression test without real SSH servers:
 ```bash
 ./tests/test_v4_ssh.sh
 ```
+
+Run the complete deterministic local regression suite in its standard order:
+
+```bash
+bash tests/run_all.sh
+```
+
+On Linux with `sshd`, run the real OpenSSH integration separately. It creates
+an ephemeral local server and verifies master creation, `-O check`/`-O exit`,
+channel reuse, bounded `ControlPersist` expiry, dedicated stream connections,
+master death recovery, and shutdown:
+
+```bash
+bash tests/test_real_openssh.sh
+```
+
 
 Run the V5 raw-stream regression test without real SSH servers:
 

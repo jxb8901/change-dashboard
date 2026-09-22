@@ -193,7 +193,26 @@ if command -v script >/dev/null 2>&1 && command -v perl >/dev/null 2>&1 && (( PR
   TTY_SCRIPT_PID=$!
   TTY_DASHBOARD_PID=""
   for ((attempt = 0; attempt < 100; attempt++)); do
-    TTY_DASHBOARD_PID="$(ps -axo pid=,ppid=,command= | awk -v parent="$TTY_SCRIPT_PID" '$2 == parent && $0 ~ /\/bin\/lhc/ { print $1; exit }')"
+    # util-linux script(1) can insert a shell between itself and the command,
+    # while the macOS implementation normally exposes lhc as a direct child.
+    # Walk the complete descendant tree instead of assuming one process layer.
+    TTY_DASHBOARD_PID="$(ps -axo pid=,ppid=,command= | awk -v root="$TTY_SCRIPT_PID" '
+      function walk(parent, i, n, ids) {
+        if (found) return
+        n = split(children[parent], ids, " ")
+        for (i = 1; i <= n; i++) {
+          if (ids[i] == "") continue
+          if (command[ids[i]] ~ /\/bin\/lhc/) {
+            print ids[i]
+            found = 1
+            return
+          }
+          walk(ids[i])
+        }
+      }
+      { pid = $1; ppid = $2; command[pid] = $0; children[ppid] = children[ppid] " " pid }
+      END { walk(root) }
+    ')"
     if [[ "$TTY_DASHBOARD_PID" =~ ^[1-9][0-9]*$ && -s "$TTY_PID_FILE" ]]; then
       break
     fi
@@ -204,10 +223,15 @@ if command -v script >/dev/null 2>&1 && command -v perl >/dev/null 2>&1 && (( PR
     wait "$TTY_SCRIPT_PID" 2>/dev/null || true
     fail_test "Ctrl-C dashboard PID was not discovered"
   fi
-  # A terminal Ctrl-C targets the foreground process group. The macOS
-  # script(1) wrapper can leave one extra bash layer between itself and lhc,
-  # so signal the discovered foreground group rather than only its leader.
-  kill -INT -"$TTY_DASHBOARD_PID" 2>/dev/null || true
+  # A terminal Ctrl-C targets the foreground process group. Resolve the group
+  # from the discovered lhc descendant because Linux script(1) may add both a
+  # shell layer and a different process-group leader.
+  TTY_DASHBOARD_PGID="$(ps -p "$TTY_DASHBOARD_PID" -o pgid= | awk '{print $1}')"
+  if [[ "$TTY_DASHBOARD_PGID" =~ ^[1-9][0-9]*$ ]]; then
+    kill -INT -"$TTY_DASHBOARD_PGID" 2>/dev/null || true
+  else
+    kill -INT "$TTY_DASHBOARD_PID" 2>/dev/null || true
+  fi
   wait "$TTY_SCRIPT_PID"
   TTY_RC=$?
   set -e

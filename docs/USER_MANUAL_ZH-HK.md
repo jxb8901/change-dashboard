@@ -248,6 +248,20 @@ time、peak CPU、peak process count 及 dropped lines。2026-09-22 macOS
 Plain tail 只是 transport baseline，不包括 LHC parsing、rules 及 terminal
 rendering；CPU 及 process 數字會隨機器而變。
 
+要按固定順序執行完整本機回歸套件：
+
+```bash
+bash tests/run_all.sh
+```
+
+Linux 且具備 `sshd` 時，可另外執行 real-OpenSSH integration，驗證 master
+建立、channel reuse、ControlPersist 到期、獨立 stream connection、master
+死亡恢復及明確 shutdown：
+
+```bash
+bash tests/test_real_openssh.sh
+```
+
 Raw panel 若設定 `PANEL_WARN_RULES`、`PANEL_ERROR_RULES` 或 `PANEL_INFO_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
 
 ### 4.5 Transpose layout

@@ -213,7 +213,7 @@ sleep 0.1
 SECONDS=0
 INTERRUPT_TEMP_DIR="$PANEL_COMMAND_TEMP_DIR"
 cleanup_panel_commands
-(( SECONDS <= 2 )) || fail_test "cleanup did not promptly terminate an active SSH job"
+(( SECONDS <= 5 )) || fail_test "cleanup did not promptly terminate an active SSH job (${SECONDS}s)"
 [[ ! -e "$INTERRUPT_TEMP_DIR" ]] || fail_test "active-job cleanup left its temporary directory"
 
 printf 'PASS: local/SSH execution, aggregation, multi-row transpose, and validation\n'

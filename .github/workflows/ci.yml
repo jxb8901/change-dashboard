@@ -5,26 +5,68 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   bash-regression:
-    runs-on: ubuntu-latest
+    name: Regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Check Bash syntax
-        run: bash -n bin/lhc tests/fixtures/ssh tests/fixtures/lhc_event_loop_case.sh tests/benchmark_stream_event_loop.sh tests/test_*.sh
-
-      - name: Run regression tests
         run: |
-          bash tests/test_cli_options.sh
-          bash tests/test_v4_ssh.sh
-          bash tests/test_v5_features.sh
-          bash tests/test_v5_stream.sh
-          bash tests/test_v5_shutdown.sh
-          bash tests/test_v6_ssh_lifecycle.sh
-          bash tests/test_v7_scheduler_timeout.sh
-          bash tests/test_v8_dirty_snapshot.sh
-          bash tests/test_v9_ssh_starting_recovery.sh
-          bash tests/test_v10_output_sanitization.sh
-          bash tests/test_v11_stream_event_loop.sh
+          bash --version | head -1
+          bash -n bin/lhc \
+            tests/run_all.sh \
+            tests/test_real_openssh.sh \
+            tests/fixtures/ssh \
+            tests/fixtures/lhc_event_loop_case.sh \
+            tests/test_*.sh
+
+      - name: Run standard regression suites
+        run: bash tests/run_all.sh
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Check shell scripts
+        run: |
+          shellcheck --shell=bash --severity=warning -x \
+            bin/lhc \
+            tests/run_all.sh \
+            tests/test_real_openssh.sh \
+            tests/test_v5_shutdown.sh \
+            tests/test_v11_stream_event_loop.sh \
+            tests/fixtures/ssh \
+            tests/fixtures/lhc_event_loop_case.sh
+
+  real-openssh:
+    name: Real OpenSSH integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openssh-server
+
+      - name: Run real OpenSSH integration
+        run: bash tests/test_real_openssh.sh

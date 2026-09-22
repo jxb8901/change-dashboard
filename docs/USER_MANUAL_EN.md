@@ -270,6 +270,20 @@ representative 50-sample macOS run on 2026-09-22 produced these results:
 Plain tail is only a transport baseline and does not include LHC parsing,
 rules, or terminal rendering; CPU and process values are machine-dependent.
 
+Run the complete deterministic local suite with:
+
+```bash
+bash tests/run_all.sh
+```
+
+On Linux with `sshd`, the separate real-OpenSSH integration test verifies
+master creation, channel reuse, bounded persistence expiry, dedicated stream
+connections, master death recovery, and explicit shutdown:
+
+```bash
+bash tests/test_real_openssh.sh
+```
+
 If `PANEL_WARN_RULES`, `PANEL_ERROR_RULES`, or `PANEL_INFO_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
 
 ### 4.5 Transpose layout
