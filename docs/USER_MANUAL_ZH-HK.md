@@ -330,7 +330,7 @@ Registry record 必須是 `alias|target`：
 - `PANEL_SSH_ALIASES[i]` 是空白分隔且不可重複的 registry alias。面板未設定此欄位時，命令在本機執行。
 - SSH 使用 `ssh -T`、`BatchMode=yes`、`ConnectTimeout=10`、`StrictHostKeyChecking=yes`，並以 `bash -s` 在遠端執行 `PANEL_COMMANDS[i]`。
 - 同一次 LHC 執行期間，相同 SSH target 的 polling 命令會共用一條明確建立、具有限制的 master（預設 `ControlPersist=30`），每個命令仍使用獨立的 session/channel。每個 target 由一個背景 lifecycle worker 建立 master，並使用 `STARTING`、`READY`、`FAILED` 狀態；慢或不可達 target 不會阻塞本機 panel 或鍵盤輸入。LHC 使用前會檢查 master 是否 ready；發現 stale/dead master 時會重建，transport failure 最多重試一次。Continuous stream 會使用獨立、非 multiplexed connection，不會消耗 polling master 的 session capacity。LHC 結束時會明確關閉連線，下一次啟動不會重用。
-- `SSH_CONTROL_PERSIST_SECONDS` 可設為 1 至 3600 秒，`SSH_CONNECT_TIMEOUT_SECONDS` 及 `SSH_MASTER_RETRY_BACKOFF_SECONDS` 均可設為 1 至 300 秒，預設分別是 `30`、`10` 及 `5`。連線 timeout 只限制建立 SSH 連線的時間；成功連線後的遠端命令沒有額外 timeout。請預先準備 key/agent 及 `known_hosts`，否則不會互動式要求密碼或確認 host key。
+- `SSH_CONTROL_PERSIST_SECONDS` 可設為 1 至 3600 秒，`SSH_CONNECT_TIMEOUT_SECONDS` 及 `SSH_MASTER_RETRY_BACKOFF_SECONDS` 均可設為 1 至 300 秒，`SSH_CONTROL_CHECK_TIMEOUT_SECONDS` 可設為 1 至 60 秒，預設分別是 `30`、`10`、`2` 及 `5`。連線 timeout 只限制建立 SSH 連線的時間；control socket 檢查另有 wall-clock 上限，成功連線後的遠端命令沒有額外 timeout。請預先準備 key/agent 及 `known_hosts`，否則不會互動式要求密碼或確認 host key。
 
 SSH 面板的第一個配置欄位是名為 `SERVER` 的合成伺服器識別字段，不由遠端命令輸出；遠端命令只應為其餘配置的數據字段各輸出一個值。例如上述設定中，每行應輸出三個欄位：
 

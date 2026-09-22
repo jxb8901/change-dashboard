@@ -39,11 +39,41 @@ assert_equal() {
     fail_test "oversized SSH_CONNECT_TIMEOUT_SECONDS was accepted"
   fi
   SSH_CONNECT_TIMEOUT_SECONDS=10
+  SSH_CONTROL_CHECK_TIMEOUT_SECONDS=0
+  if validate_config >/dev/null 2>&1; then
+    fail_test "zero SSH_CONTROL_CHECK_TIMEOUT_SECONDS was accepted"
+  fi
+  SSH_CONTROL_CHECK_TIMEOUT_SECONDS=61
+  if validate_config >/dev/null 2>&1; then
+    fail_test "oversized SSH_CONTROL_CHECK_TIMEOUT_SECONDS was accepted"
+  fi
+  SSH_CONTROL_CHECK_TIMEOUT_SECONDS=2
   SSH_MASTER_RETRY_BACKOFF_SECONDS=0
   if validate_config >/dev/null 2>&1; then
     fail_test "zero SSH_MASTER_RETRY_BACKOFF_SECONDS was accepted"
   fi
 )
+
+CHECK_HANG_FILE="$TEST_TEMP_DIR/control-check-hang"
+: >"$CHECK_HANG_FILE"
+export FAKE_SSH_CHECK_HANG_FILE="$CHECK_HANG_FILE"
+(
+  source "$TEST_ROOT/bin/lhc"
+  PANEL_COMMAND_TEMP_DIR="$TEST_TEMP_DIR/control-check"
+  mkdir -p "$PANEL_COMMAND_TEMP_DIR"
+  get_ssh_control_path app
+  CONTROL_PATH="$FUNCTION_RESULT"
+  mkdir -p "${CONTROL_PATH}.fake-state"
+  SSH_CONTROL_CHECK_TIMEOUT_SECONDS=1
+  start_time="$SECONDS"
+  if ssh_polling_master_ready app "$CONTROL_PATH"; then
+    fail_test "hung SSH control check unexpectedly succeeded"
+  fi
+  elapsed=$((SECONDS - start_time))
+  (( elapsed <= 3 )) || fail_test "SSH control check exceeded wall-clock bound: ${elapsed}s"
+)
+rm -f "$CHECK_HANG_FILE"
+unset FAKE_SSH_CHECK_HANG_FILE
 
 wait_for_panel() {
   local panel_index="$1" attempts

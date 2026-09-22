@@ -54,6 +54,11 @@ if [[ "$operation" == "exit" ]]; then
   exit 0
 fi
 if [[ "$operation" == "check" ]]; then
+  if [[ -n "${FAKE_SSH_CHECK_HANG_FILE:-}" ]]; then
+    while [[ -e "$FAKE_SSH_CHECK_HANG_FILE" ]]; do
+      :
+    done
+  fi
   if [[ -n "$control_path" && -d "${control_path}.fake-state" ]]; then
     [[ -n "$FAKE_SSH_LOG" ]] && printf 'check %s %s\n' "$target" "$control_path" >>"$FAKE_SSH_LOG"
     if [[ -n "${FAKE_SSH_DROP_MASTER_AFTER_CHECK_FILE:-}" &&

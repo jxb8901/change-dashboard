@@ -70,6 +70,7 @@ PANEL_TABLE_LAYOUT[2]="transpose"
 PANEL_TABLE_WIDTHS[2]="8 12"
 PANEL_SSH_ALIASES[2]="FAST SLOW"
 
+REFRESH_INTERVAL=3600
 validate_config || fail_test "valid V4 configuration was rejected"
 initialize_loading_dashboard
 
@@ -140,6 +141,7 @@ assert_equal "8" "$CHANNEL_COUNT" "polling commands use logical channels"
 for panel_index in "${PANEL_ORDER[@]}"; do
   PANEL_NEXT_RUN_SECONDS[$panel_index]=0
 done
+INITIAL_CHANNEL_COUNT="$CHANNEL_COUNT"
 while (( RENDER_COUNT < 6 )); do
   run_panel_commands || fail_test "second SSH refresh failed"
   sleep 0.05
@@ -148,7 +150,8 @@ SSH_LOG_CONTENT="$(<"$FAKE_SSH_LOG")"
 MASTER_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "master" { count += 1 } END { print count + 0 }')"
 CHANNEL_COUNT="$(printf '%s\n' "$SSH_LOG_CONTENT" | awk '$1 == "channel" { count += 1 } END { print count + 0 }')"
 assert_equal "5" "$MASTER_COUNT" "SSH masters persist across refreshes"
-assert_equal "16" "$CHANNEL_COUNT" "refreshes use new logical channels"
+CHANNEL_COUNT_DELTA=$((CHANNEL_COUNT - INITIAL_CHANNEL_COUNT))
+assert_equal "8" "$CHANNEL_COUNT_DELTA" "refreshes use new logical channels"
 
 COMMAND_TEMP_DIR="$PANEL_COMMAND_TEMP_DIR"
 cleanup_panel_commands
@@ -207,6 +210,9 @@ PANEL_COMMAND_OUTPUT_FILES=()
 PANEL_COMMAND_STATUS_FILES=()
 PANEL_COMMAND_INPUT_FILES=()
 PANEL_COMMAND_ERROR_FILES=()
+# Keep the intentionally unserviced master wait bounded in this isolated
+# cleanup case; the production default remains covered by the scheduler tests.
+SSH_CONNECT_TIMEOUT_SECONDS=1
 PANEL_COMMANDS[0]='sleep 30'
 start_panel_command_job 0 "SLOW" "slow"
 sleep 0.1

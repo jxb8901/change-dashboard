@@ -190,16 +190,19 @@ The temporary control sockets and master connections are closed when LHC exits;
 they are not shared across LHC launches. The bounded persistence value is
 configurable through `SSH_CONTROL_PERSIST_SECONDS` from 1 to 3600 seconds;
 the default is 30 seconds. `SSH_CONNECT_TIMEOUT_SECONDS` is configurable from
-1 to 300 seconds and defaults to 10. `SSH_MASTER_RETRY_BACKOFF_SECONDS` is
-configurable from 1 to 300 seconds and defaults to 5; it prevents a failed
-target from being retried on every scheduler tick.
+1 to 300 seconds and defaults to 10. Each control-socket readiness probe is
+bounded by `SSH_CONTROL_CHECK_TIMEOUT_SECONDS`, configurable from 1 to 60
+seconds and defaulting to 2. `SSH_MASTER_RETRY_BACKOFF_SECONDS` is configurable
+from 1 to 300 seconds and defaults to 5; it prevents a failed target from being
+retried on every scheduler tick.
 
 The dashboard therefore never prompts for a password, key passphrase, or host
 key confirmation. Authentication, SSH agent access, and `known_hosts` entries
 must be prepared before LHC starts.
 
-The connection-timeout value limits connection establishment only. LHC does
-not add a runtime limit for a successfully started remote command.
+The connection-timeout value limits connection establishment only. Control
+socket checks have their separate wall-clock bound; LHC does not add a runtime
+limit for a successfully started remote command.
 
 ### 3.3 Cleanup
 

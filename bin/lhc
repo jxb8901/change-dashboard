@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.7: Keep cleanup responsive during the wrapper identity
+#   publication window while preserving owner-ancestry checks.
+# - 2026-09-22 V5.8.6: Bound SSH control-socket probes with owned helper
+#   cleanup, and make refresh-generation channel-count validation deterministic.
 # - 2026-09-22 V5.8.5: Propagate util-linux PTY child status and add staged,
 #   bounded diagnostics for real OpenSSH CI lifecycle failures.
 # - 2026-09-22 V5.8.4: Make the cross-platform Ctrl-C regression harness and
@@ -110,6 +114,7 @@ DASHBOARD_EVENT_RECEIVED=0
 DASHBOARD_EVENT_LOOP_ACTIVE=0
 SSH_CONTROL_PERSIST_SECONDS=30
 SSH_CONNECT_TIMEOUT_SECONDS=10
+SSH_CONTROL_CHECK_TIMEOUT_SECONDS=2
 SSH_MASTER_RETRY_BACKOFF_SECONDS=5
 
 declare -a SSH_SERVERS=()
@@ -383,6 +388,24 @@ signal_owned_job_processes() {
   fi
 }
 
+signal_unpublished_job_wrapper() {
+  local job="$1" signal="$2" wrapper_pid parent
+
+  # The wrapper publishes its identity immediately after fork, but ps can
+  # briefly return no identity on macOS. During that narrow window the
+  # scheduler-owned PID is safe to signal only when its live parent ancestry
+  # still resolves to this LHC process. Once an identity exists, callers must
+  # use get_owned_job_pid so a reused PID can never be signalled.
+  [[ -z "${PANEL_COMMAND_WRAPPER_STARTS[$job]:-}" ]] || return 1
+  wrapper_pid="${PANEL_COMMAND_PIDS[$job]:-}"
+  [[ "$wrapper_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$wrapper_pid" 2>/dev/null || return 1
+  parent="$(get_process_parent_pid "$wrapper_pid")"
+  [[ "$parent" == "$LHC_OWNER_PID" ]] ||
+    process_has_ancestor "$wrapper_pid" "$LHC_OWNER_PID" || return 1
+  kill -"$signal" "$wrapper_pid" 2>/dev/null || true
+}
+
 job_has_owned_child_process() {
   local job="$1" role
 
@@ -574,6 +597,8 @@ cleanup_panel_commands() {
     if ! job_has_owned_child_process "$job"; then
       if get_owned_job_pid "$job" wrapper; then
         kill -TERM "$FUNCTION_RESULT" 2>/dev/null || true
+      else
+        signal_unpublished_job_wrapper "$job" TERM 2>/dev/null || true
       fi
     fi
   done
@@ -594,6 +619,8 @@ cleanup_panel_commands() {
     [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
     if get_owned_job_pid "$job" wrapper; then
       kill -TERM "$FUNCTION_RESULT" 2>/dev/null || true
+    else
+      signal_unpublished_job_wrapper "$job" TERM 2>/dev/null || true
     fi
   done
   wait_for_job_wrappers "$JOB_TERM_GRACE_ATTEMPTS" || true
@@ -601,6 +628,8 @@ cleanup_panel_commands() {
     [[ "${PANEL_COMMAND_STATES[$job]:-}" != "REAPED" ]] || continue
     if get_owned_job_pid "$job" wrapper; then
       kill -KILL "$FUNCTION_RESULT" 2>/dev/null || true
+    else
+      signal_unpublished_job_wrapper "$job" KILL 2>/dev/null || true
     fi
   done
   wait_for_job_wrappers "$JOB_KILL_GRACE_ATTEMPTS" || true
@@ -754,6 +783,11 @@ validate_ssh_transport_config() {
     error "SSH_CONNECT_TIMEOUT_SECONDS must be an integer from 1 to 300"
     return 1
   fi
+  if ! is_positive_integer "$SSH_CONTROL_CHECK_TIMEOUT_SECONDS" ||
+    (( SSH_CONTROL_CHECK_TIMEOUT_SECONDS > 60 )); then
+    error "SSH_CONTROL_CHECK_TIMEOUT_SECONDS must be an integer from 1 to 60"
+    return 1
+  fi
   if ! is_positive_integer "$SSH_MASTER_RETRY_BACKOFF_SECONDS" ||
     (( SSH_MASTER_RETRY_BACKOFF_SECONDS > 300 )); then
     error "SSH_MASTER_RETRY_BACKOFF_SECONDS must be an integer from 1 to 300"
@@ -773,6 +807,7 @@ load_config() {
   COMMAND_TIMEOUT_SECONDS=0
   SSH_CONTROL_PERSIST_SECONDS=30
   SSH_CONNECT_TIMEOUT_SECONDS=10
+  SSH_CONTROL_CHECK_TIMEOUT_SECONDS=2
   SSH_MASTER_RETRY_BACKOFF_SECONDS=5
   LAYOUT_ERROR=""
   PANEL_COUNT=0
@@ -3126,13 +3161,53 @@ get_ssh_control_index() {
 
 ssh_polling_master_ready() {
   local target="$1" control_path="$2"
+  local result_file check_pid check_status attempts max_attempts
 
-  ssh -T \
-    -o BatchMode=yes \
-    -o ConnectTimeout=1 \
-    -o ControlPath="$control_path" \
-    -O check \
-    "$target" >/dev/null 2>&1
+  # OpenSSH can leave -O check blocked on a wedged control socket even when
+  # ConnectTimeout has elapsed. Keep the helper and its actual SSH child
+  # owned by this function so a stale socket cannot block the scheduler or
+  # shutdown indefinitely.
+  result_file="$(mktemp "${control_path}.check.XXXXXX" 2>/dev/null)" || return 1
+  (
+    local ssh_pid="" ssh_status
+
+    ssh -T \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_CONTROL_CHECK_TIMEOUT_SECONDS" \
+      -o ControlPath="$control_path" \
+      -O check \
+      "$target" >/dev/null 2>&1 &
+    ssh_pid=$!
+    trap '[[ -n "$ssh_pid" ]] && kill -TERM "$ssh_pid" 2>/dev/null || true; exit 143' TERM INT
+    wait "$ssh_pid"
+    ssh_status=$?
+    trap - TERM INT
+    printf '%s\n' "$ssh_status" >"$result_file"
+    exit "$ssh_status"
+  ) &
+  check_pid=$!
+  max_attempts=$((SSH_CONTROL_CHECK_TIMEOUT_SECONDS * 20))
+  (( max_attempts > 0 )) || max_attempts=1
+  for ((attempts = 0; attempts < max_attempts; attempts++)); do
+    if [[ -s "$result_file" ]]; then
+      IFS= read -r check_status <"$result_file" || check_status=1
+      wait "$check_pid" 2>/dev/null || true
+      rm -f "$result_file"
+      [[ "$check_status" == "0" ]]
+      return $?
+    fi
+    sleep "$JOB_GRACE_SLEEP"
+  done
+
+  kill -TERM "$check_pid" 2>/dev/null || true
+  for ((attempts = 0; attempts < JOB_TERM_GRACE_ATTEMPTS; attempts++)); do
+    [[ -s "$result_file" ]] && break
+    sleep "$JOB_GRACE_SLEEP"
+  done
+  kill -KILL "$check_pid" 2>/dev/null || true
+  wait "$check_pid" 2>/dev/null || true
+  rm -f "$result_file"
+  return 124
 }
 
 write_ssh_master_state() {
