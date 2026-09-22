@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8: Replace fixed stream polling with a blocking event
+#   channel, publish line deltas through coalesced per-job queues, maintain
+#   stream rings in memory, and wake the main loop only for stream events or
+#   scheduler deadlines.
 # - 2026-09-22 V5.7: Recover SSH polling targets whose STARTING worker dies
 #   before publishing a terminal state, and sanitize command output before it
 #   reaches raw, table, transpose, local, or SSH render paths.
@@ -84,10 +88,14 @@ LHC_OWNER_PID="$$"
 JOB_TERM_GRACE_ATTEMPTS=10
 JOB_KILL_GRACE_ATTEMPTS=10
 JOB_GRACE_SLEEP=0.05
-# macOS Bash 3.2 does not reliably interrupt read -t when a stream signal is
-# delivered. Keep keyboard input in a dedicated reader and let the dashboard
-# loop poll its signal flags at a short, bounded interval.
-STREAM_EVENT_POLL_SECONDS=0.05
+# Keep keyboard input in a dedicated reader. Stream output uses a FIFO event
+# channel so the main loop can block until real input or a scheduler deadline.
+STREAM_EVENT_FIFO=""
+STREAM_EVENT_FD=9
+STREAM_EVENT_CHANNEL_ACTIVE=0
+STREAM_EVENT_BUFFER=""
+DASHBOARD_EVENT_RECEIVED=0
+DASHBOARD_EVENT_LOOP_ACTIVE=0
 SSH_CONTROL_PERSIST_SECONDS=30
 SSH_CONNECT_TIMEOUT_SECONDS=10
 SSH_MASTER_RETRY_BACKOFF_SECONDS=5
@@ -150,6 +158,8 @@ declare -a PANEL_COMMAND_EXIT_STATUSES=()
 declare -a PANEL_COMMAND_CONTROL_PATHS=()
 declare -a PANEL_COMMAND_STREAMS=()
 declare -a PANEL_COMMAND_FIFO_FILES=()
+declare -a PANEL_COMMAND_STREAM_CAPACITIES=()
+declare -a PANEL_COMMAND_STREAM_CHANGED=()
 declare -a PANEL_COMMAND_LAST_OUTPUTS=()
 declare -a PANEL_COMMAND_LAST_STATUSES=()
 declare -a PANEL_COMMAND_COUNTS=()
@@ -622,6 +632,7 @@ cleanup_panel_commands() {
     [[ -n "$file" ]] && rm -f "$file"
   done
 
+  close_stream_event_channel
   if [[ -n "$PANEL_COMMAND_TEMP_DIR" ]]; then
     rmdir "$PANEL_COMMAND_TEMP_DIR" 2>/dev/null || true
     PANEL_COMMAND_TEMP_DIR=""
@@ -645,6 +656,8 @@ cleanup_panel_commands() {
   PANEL_COMMAND_CONTROL_PATHS=()
   PANEL_COMMAND_STREAMS=()
   PANEL_COMMAND_FIFO_FILES=()
+  PANEL_COMMAND_STREAM_CAPACITIES=()
+  PANEL_COMMAND_STREAM_CHANGED=()
   PANEL_COMMAND_LAST_OUTPUTS=()
   PANEL_COMMAND_LAST_STATUSES=()
   PANEL_COMMAND_START_SECONDS=()
@@ -2295,6 +2308,59 @@ get_stream_capacity() {
   FUNCTION_RESULT="$capacity"
 }
 
+ensure_stream_event_channel() {
+  [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]] && return 0
+  [[ -n "$PANEL_COMMAND_TEMP_DIR" ]] || return 1
+  STREAM_EVENT_FIFO="$PANEL_COMMAND_TEMP_DIR/events.fifo"
+  if [[ ! -p "$STREAM_EVENT_FIFO" ]]; then
+    mkfifo "$STREAM_EVENT_FIFO" || return 1
+  fi
+  eval "exec ${STREAM_EVENT_FD}<>\"$STREAM_EVENT_FIFO\"" || return 1
+  STREAM_EVENT_CHANNEL_ACTIVE=1
+  STREAM_EVENT_BUFFER=""
+}
+
+publish_stream_event() {
+  local event_fifo="$1" event="$2" payload event_job queue ready lock attempts=0
+
+  payload="${event#*$'\t'}"
+  event_job="${payload%%$'\t'*}"
+  queue="${event_fifo}.${event_job}.queue"
+  ready="${event_fifo}.ready"
+  lock="${queue}.lock"
+  while ! mkdir "$lock" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    (( attempts < 100 )) || return 1
+    sleep 0.001
+  done
+  printf '%s\n' "$event" >>"$queue"
+  rmdir "$lock" 2>/dev/null || true
+  # There is at most one wake marker in the FIFO. The main process removes
+  # the marker before rotating queues, so a writer racing with the drain
+  # either joins this batch or publishes the next wakeup.
+  if (( DASHBOARD_EVENT_LOOP_ACTIVE == 1 )) && mkdir "$ready" 2>/dev/null; then
+    # The inherited read/write descriptor keeps the wakeup non-blocking even
+    # when a caller drives run_panel_commands directly without waiting on the
+    # dashboard loop.
+    eval "printf '%s\\n' event >&${STREAM_EVENT_FD}"
+  fi
+}
+
+close_stream_event_channel() {
+  if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+    eval "exec ${STREAM_EVENT_FD}>&-" 2>/dev/null || true
+  fi
+  STREAM_EVENT_CHANNEL_ACTIVE=0
+  STREAM_EVENT_BUFFER=""
+  if [[ -n "$STREAM_EVENT_FIFO" ]]; then
+    rm -f "$STREAM_EVENT_FIFO"
+    rm -f "${STREAM_EVENT_FIFO}".*.queue "${STREAM_EVENT_FIFO}".*.processing \
+      "${STREAM_EVENT_FIFO}".*.queue.lock
+    rmdir "$STREAM_EVENT_FIFO.ready" 2>/dev/null || true
+  fi
+  STREAM_EVENT_FIFO=""
+}
+
 limit_stream_output() {
   local panel_index="$1"
   local capacity content="${PANEL_OUTPUTS[$panel_index]:-}"
@@ -2303,6 +2369,14 @@ limit_stream_output() {
   capacity="$FUNCTION_RESULT"
   if [[ -z "$content" ]]; then
     FUNCTION_RESULT=""
+  elif [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+    if ! has_array_index PANEL_SSH_ALIASES "$panel_index"; then
+      # Event-mode local rings are already bounded while each line is
+      # received; avoid a tail subprocess on every redraw.
+      FUNCTION_RESULT="$content"
+    else
+      FUNCTION_RESULT="$(printf '%s\n' "$content" | tail -n "$capacity")"
+    fi
   else
     FUNCTION_RESULT="$(printf '%s\n' "$content" | tail -n "$capacity")"
   fi
@@ -2317,7 +2391,16 @@ stream_collect() {
   local line temporary start position slot
   local count=0
   local next=0
+  local event_fifo="${6:-}" event_job="${7:-}"
   local -a lines
+
+  if [[ -n "$event_fifo" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      sanitize_terminal_output "$line"
+      publish_stream_event "$event_fifo" $'S\t'"${event_job}"$'\t'"$FUNCTION_RESULT"
+    done <"$fifo"
+    return 0
+  fi
 
   lines=()
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2348,6 +2431,102 @@ stream_collect() {
   [[ -n "$refresh_marker" ]] && rm -f "$refresh_marker"
 }
 
+append_stream_event_line() {
+  local job="$1" line="$2"
+  local capacity content count remainder
+
+  capacity="${PANEL_COMMAND_STREAM_CAPACITIES[$job]:-1}"
+  content="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
+  if [[ -n "$content" ]]; then
+    content="$content"$'\n'
+  fi
+  content="$content$line"
+
+  # Keep the visible ring in memory. The panel heights are bounded, so this
+  # removes at most one old line per iteration without a fork or file I/O.
+  count=1
+  remainder="$content"
+  while [[ "$remainder" == *$'\n'* ]]; do
+    count=$((count + 1))
+    remainder="${remainder#*$'\n'}"
+  done
+  while (( count > capacity )); do
+    content="${content#*$'\n'}"
+    count=$((count - 1))
+  done
+  PANEL_COMMAND_LAST_OUTPUTS[$job]="$content"
+  PANEL_COMMAND_STREAM_CHANGED[$job]=1
+}
+
+get_stream_job_output() {
+  FUNCTION_RESULT="${PANEL_COMMAND_LAST_OUTPUTS[$1]:-}"
+}
+
+handle_stream_event_line() {
+  local event="$1" event_type rest job line
+
+  event_type="${event%%$'\t'*}"
+  rest="${event#*$'\t'}"
+  job="${rest%%$'\t'*}"
+  [[ "$job" =~ ^[0-9]+$ ]] || return 0
+  case "$event_type" in
+    S)
+      line="${rest#*$'\t'}"
+      append_stream_event_line "$job" "$line"
+      ;;
+    C)
+      PANEL_COMMAND_STREAM_CHANGED[$job]=1
+      ;;
+  esac
+}
+
+drain_stream_events() {
+  local event
+
+  [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]] || return 0
+  rmdir "${STREAM_EVENT_FIFO}.ready" 2>/dev/null || true
+  local event_file processing lock attempts locked
+  for event_file in "${STREAM_EVENT_FIFO}".*.queue; do
+    [[ -f "$event_file" ]] || continue
+    lock="${event_file}.lock"
+    attempts=0
+    locked=0
+    while true; do
+      if mkdir "$lock" 2>/dev/null; then
+        locked=1
+        break
+      fi
+      attempts=$((attempts + 1))
+      if (( attempts >= 100 )); then
+        break
+      fi
+      sleep 0.001
+    done
+    (( locked == 1 )) || continue
+    processing="${event_file}.processing"
+    mv -f "$event_file" "$processing" 2>/dev/null || {
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    }
+    rmdir "$lock" 2>/dev/null || true
+    while IFS= read -r event || [[ -n "$event" ]]; do
+      handle_stream_event_line "$event"
+    done <"$processing"
+    rm -f "$processing"
+  done
+}
+
+stream_output_for_job() {
+  local job="$1" output_file
+
+  if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+    get_stream_job_output "$job"
+  else
+    output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
+    read_stream_snapshot "$output_file"
+  fi
+}
+
 aggregate_ssh_stream_output() {
   local panel_index="$1" job alias status output line
   local aggregate="" failed=0 table_mode=0 column_count=0 column
@@ -2364,7 +2543,12 @@ aggregate_ssh_stream_output() {
     [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
     alias="${PANEL_COMMAND_ALIASES[$job]}"
     status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
-    output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+    if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+      stream_output_for_job "$job"
+      output="$FUNCTION_RESULT"
+    else
+      output="$(<"${PANEL_COMMAND_OUTPUT_FILES[$job]}")"
+    fi
     sanitize_terminal_output "$output"
     output="$FUNCTION_RESULT"
 
@@ -2435,18 +2619,27 @@ refresh_stream_panels() {
     for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
       [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
       [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
-      output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
-      [[ -f "$output_file" ]] || continue
-      fifo_file="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
-      acknowledge_stream_refresh_marker "$fifo_file"
-      read_stream_snapshot "$output_file"
-      current="$FUNCTION_RESULT"
+      if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+        [[ "${PANEL_COMMAND_STREAM_CHANGED[$job]:-0}" -eq 1 ]] || continue
+        stream_output_for_job "$job"
+        current="$FUNCTION_RESULT"
+      else
+        output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
+        [[ -f "$output_file" ]] || continue
+        fifo_file="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
+        acknowledge_stream_refresh_marker "$fifo_file"
+        read_stream_snapshot "$output_file"
+        current="$FUNCTION_RESULT"
+      fi
       previous="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
       status="$(<"${PANEL_COMMAND_STATUS_FILES[$job]}")"
       last_status="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
-      if [[ "$current" != "$previous" || "$status" != "$last_status" ]]; then
-        PANEL_COMMAND_LAST_OUTPUTS[$job]="$current"
+      if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 || "$current" != "$previous" || "$status" != "$last_status" ]]; then
+        if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 0 ]]; then
+          PANEL_COMMAND_LAST_OUTPUTS[$job]="$current"
+        fi
         PANEL_COMMAND_LAST_STATUSES[$job]="$status"
+        PANEL_COMMAND_STREAM_CHANGED[$job]=0
         changed=1
       fi
     done
@@ -2493,6 +2686,8 @@ run_panel_commands() {
     PANEL_COMMAND_CONTROL_PATHS=()
     PANEL_COMMAND_STREAMS=()
     PANEL_COMMAND_FIFO_FILES=()
+    PANEL_COMMAND_STREAM_CAPACITIES=()
+    PANEL_COMMAND_STREAM_CHANGED=()
     PANEL_COMMAND_LAST_OUTPUTS=()
     PANEL_COMMAND_LAST_STATUSES=()
     PANEL_COMMAND_START_SECONDS=()
@@ -2517,6 +2712,12 @@ run_panel_commands() {
       return 1
     }
   fi
+
+  if ! ensure_stream_event_channel; then
+    error "unable to create stream event channel"
+    return 1
+  fi
+  drain_stream_events
 
   now="$SECONDS"
   # Launch only panels whose own refresh timer is due. A panel remains active
@@ -2556,6 +2757,7 @@ run_panel_commands() {
   service_ssh_polling_masters
 
   timeout_running_panel_commands
+  drain_stream_events
   refresh_stream_panels
 
   # Poll portable completion markers instead of wait -n, which is unavailable
@@ -2580,6 +2782,11 @@ run_panel_commands() {
     fi
   done
 
+  # A wrapper publishes its completion marker only after its stream collector
+  # has stopped. Drain once more before final aggregation so the last burst is
+  # visible even when completion and the wakeup race the scheduler tick.
+  drain_stream_events
+
   for panel_index in $completed_panels; do
     finalize_panel_command_output "$panel_index"
     PANEL_COMMAND_ACTIVE[$panel_index]=0
@@ -2589,6 +2796,7 @@ run_panel_commands() {
     render_dashboard "$panel_index"
   done
 
+  drain_stream_events
   refresh_stream_panels
   return 0
 }
@@ -2626,6 +2834,7 @@ compact_completed_panel_jobs() {
   local -a new_aliases=() new_targets=() new_input_files=() new_error_files=()
   local -a new_exit_statuses=() new_control_paths=() new_streams=()
   local -a new_fifo_files=() new_last_outputs=() new_last_statuses=()
+  local -a new_stream_capacities=() new_stream_changed=()
   local -a new_start_seconds=() new_timeout_files=()
   local -a new_states=()
 
@@ -2649,6 +2858,8 @@ compact_completed_panel_jobs() {
     new_control_paths[$new_job]="${PANEL_COMMAND_CONTROL_PATHS[$job]:-}"
     new_streams[$new_job]="${PANEL_COMMAND_STREAMS[$job]:-}"
     new_fifo_files[$new_job]="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
+    new_stream_capacities[$new_job]="${PANEL_COMMAND_STREAM_CAPACITIES[$job]:-}"
+    new_stream_changed[$new_job]="${PANEL_COMMAND_STREAM_CHANGED[$job]:-0}"
     new_last_outputs[$new_job]="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
     new_last_statuses[$new_job]="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
     new_start_seconds[$new_job]="${PANEL_COMMAND_START_SECONDS[$job]:-}"
@@ -2676,6 +2887,8 @@ compact_completed_panel_jobs() {
     PANEL_COMMAND_CONTROL_PATHS=()
     PANEL_COMMAND_STREAMS=()
     PANEL_COMMAND_FIFO_FILES=()
+    PANEL_COMMAND_STREAM_CAPACITIES=()
+    PANEL_COMMAND_STREAM_CHANGED=()
     PANEL_COMMAND_LAST_OUTPUTS=()
     PANEL_COMMAND_LAST_STATUSES=()
     PANEL_COMMAND_START_SECONDS=()
@@ -2700,6 +2913,8 @@ compact_completed_panel_jobs() {
     PANEL_COMMAND_CONTROL_PATHS=("${new_control_paths[@]}")
     PANEL_COMMAND_STREAMS=("${new_streams[@]}")
     PANEL_COMMAND_FIFO_FILES=("${new_fifo_files[@]}")
+    PANEL_COMMAND_STREAM_CAPACITIES=("${new_stream_capacities[@]}")
+    PANEL_COMMAND_STREAM_CHANGED=("${new_stream_changed[@]}")
     PANEL_COMMAND_LAST_OUTPUTS=("${new_last_outputs[@]}")
     PANEL_COMMAND_LAST_STATUSES=("${new_last_statuses[@]}")
     PANEL_COMMAND_START_SECONDS=("${new_start_seconds[@]}")
@@ -3178,6 +3393,8 @@ start_panel_command_job() {
   PANEL_COMMAND_CONTROL_PATHS[$job]=""
   PANEL_COMMAND_STREAMS[$job]="$stream_mode"
   PANEL_COMMAND_FIFO_FILES[$job]=""
+  PANEL_COMMAND_STREAM_CAPACITIES[$job]="$stream_capacity"
+  PANEL_COMMAND_STREAM_CHANGED[$job]=0
   PANEL_COMMAND_LAST_OUTPUTS[$job]=""
   PANEL_COMMAND_LAST_STATUSES[$job]=""
   # Bash 3.2 exposes SECONDS only at integer resolution. Rounding the
@@ -3210,6 +3427,7 @@ start_panel_command_job() {
 
   (
     local child_pid="" collector_pid="" exit_status output_target refresh_pid="${STREAM_REFRESH_PID:-}"
+    local event_fifo="${STREAM_EVENT_FIFO:-}"
     local timeout_file="${PANEL_COMMAND_TIMEOUT_FILES[$job]:-}"
 
     terminate_job_process() {
@@ -3236,7 +3454,7 @@ start_panel_command_job() {
     output_target="$output_file"
     if [[ "$stream_mode" == "1" ]]; then
       stream_collect "$fifo_file" "$output_file" "$stream_capacity" "$refresh_pid" \
-        "${fifo_file}.refresh" &
+        "${fifo_file}.refresh" "$STREAM_EVENT_FIFO" "$job" &
       collector_pid=$!
       printf '%s\n' "$collector_pid" >"$collector_pid_file"
       get_process_identity "$collector_pid" >"$collector_identity_file"
@@ -3276,7 +3494,10 @@ start_panel_command_job() {
     fi
     trap - TERM INT
     printf '%s\n' "$exit_status" >"$status_file"
-    if [[ "$stream_mode" == "1" && -n "$refresh_pid" ]]; then
+    if [[ -n "$event_fifo" ]]; then
+      publish_stream_event "$event_fifo" $'C\t'"${job}"$'\t'"$exit_status"
+    fi
+    if [[ "$stream_mode" == "1" && "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 0 && -n "$refresh_pid" ]]; then
       kill -USR1 "$refresh_pid" 2>/dev/null || true
     fi
   ) &
@@ -3303,15 +3524,25 @@ finalize_panel_command_output() {
     exit_status="${PANEL_COMMAND_EXIT_STATUSES[$job]}"
     output_file="${PANEL_COMMAND_OUTPUT_FILES[$job]}"
     if [[ "$exit_status" == "0" ]]; then
-      PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      if [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 && "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+        stream_output_for_job "$job"
+        PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+      else
+        PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      fi
       if [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]]; then
         limit_stream_output "$panel_index"
         PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
       fi
       prepare_panel_output "$panel_index"
-    elif [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 && -s "$output_file" ]]; then
+    elif [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 && ( "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 || -s "$output_file" ) ]]; then
       # Keep the final stream window visible while marking the panel failed.
-      PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+        stream_output_for_job "$job"
+        PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
+      else
+        PANEL_OUTPUTS[$panel_index]="$(<"$output_file")"
+      fi
       limit_stream_output "$panel_index"
       PANEL_OUTPUTS[$panel_index]="$FUNCTION_RESULT"
       prepare_panel_output "$panel_index"
@@ -3330,6 +3561,11 @@ aggregate_ssh_panel_output() {
   local panel_index="$1" job alias exit_status output line
   local aggregate="" failed=0
   local table_mode=0 column_count=0 column
+
+  if [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 && "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+    aggregate_ssh_stream_output "$panel_index"
+    return
+  fi
 
   if has_array_index PANEL_TABLE_COLUMNS "$panel_index"; then
     table_mode=1
@@ -3727,9 +3963,66 @@ wait_for_quit_or_timeout() {
   return 1
 }
 
+get_dashboard_wait_seconds() {
+  local panel_index job now="$SECONDS" deadline remaining wait=1 timeout start
+
+  if (( PANEL_COMMAND_SCHEDULER_INITIALIZED == 0 )); then
+    FUNCTION_RESULT=1
+    return
+  fi
+
+  for panel_index in "${PANEL_ORDER[@]}"; do
+    if [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-0}" -eq 1 ]]; then
+      for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+        [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+        [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 0 ]] || continue
+        get_panel_timeout_seconds "$panel_index"
+        timeout="$FUNCTION_RESULT"
+        (( timeout > 0 )) || continue
+        start="${PANEL_COMMAND_START_SECONDS[$job]:-$now}"
+        if (( now - start >= timeout )); then
+          FUNCTION_RESULT=0
+          return
+        fi
+        remaining=$((timeout - now + start))
+        (( remaining < wait )) && wait="$remaining"
+      done
+    else
+      deadline="${PANEL_NEXT_RUN_SECONDS[$panel_index]:-0}"
+      if (( now >= deadline )); then
+        FUNCTION_RESULT=0
+        return
+      fi
+      remaining=$((deadline - now))
+      (( remaining < wait )) && wait="$remaining"
+    fi
+  done
+
+  (( wait > 0 )) || wait=1
+  FUNCTION_RESULT="$wait"
+}
+
+wait_for_dashboard_event() {
+  local timeout="$1" event
+
+  DASHBOARD_EVENT_RECEIVED=0
+  if (( timeout > 0 )); then
+    if [[ "$STREAM_EVENT_CHANNEL_ACTIVE" -eq 1 ]]; then
+      if IFS= read -r -t "$timeout" event <&9; then
+        DASHBOARD_EVENT_RECEIVED=1
+        return 0
+      fi
+    else
+      sleep "$timeout"
+    fi
+  fi
+  (( QUIT_PENDING == 1 )) && return 0
+  return 1
+}
+
 wait_for_dashboard_tick() {
-  sleep "$STREAM_EVENT_POLL_SECONDS"
-  (( QUIT_PENDING == 1 ))
+  get_dashboard_wait_seconds
+  wait_for_dashboard_event "$FUNCTION_RESULT"
 }
 
 show_resize_pause() {
@@ -3792,6 +4085,7 @@ process_terminal_resize() {
 
 run_dashboard_loop() {
   trap handle_quit USR2
+  DASHBOARD_EVENT_LOOP_ACTIVE=1
   start_keyboard_reader
   while true; do
     if (( RESIZE_PENDING == 1 || DASHBOARD_PAUSED == 1 )); then
@@ -3799,7 +4093,9 @@ run_dashboard_loop() {
     fi
 
     if (( DASHBOARD_PAUSED == 1 )); then
-      if wait_for_dashboard_tick; then
+      get_dashboard_wait_seconds
+      wait_for_dashboard_event "$FUNCTION_RESULT"
+      if (( QUIT_PENDING == 1 )); then
         stop_keyboard_reader
         return 0
       fi
@@ -3812,9 +4108,6 @@ run_dashboard_loop() {
       return 1
     fi
 
-    # Process a pending stream event immediately. A one-second read here would
-    # delay a notification whose signal arrived just before the read started;
-    # the dedicated keyboard reader makes short polling safe on Bash 3.2.
     if (( QUIT_PENDING == 1 )); then
       stop_keyboard_reader
       return 0
@@ -3824,7 +4117,9 @@ run_dashboard_loop() {
       continue
     fi
 
-    if wait_for_dashboard_tick; then
+    get_dashboard_wait_seconds
+    wait_for_dashboard_event "$FUNCTION_RESULT"
+    if (( QUIT_PENDING == 1 )); then
       stop_keyboard_reader
       return 0
     fi

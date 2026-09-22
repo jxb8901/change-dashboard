@@ -34,10 +34,12 @@ Each startup or refresh cycle works as follows:
 2. Draw all panel borders and `Loading...` placeholders.
 3. Start each due panel's local command or SSH jobs concurrently.
 4. For a snapshot panel, parse and redraw as soon as all its jobs finish. For a
-   stream panel, redraw whenever new complete output lines arrive while its
-   command remains active. The stream collector coalesces pending notifications
-   and wakes the main terminal loop, so this does not wait for the one-second
-   scheduler timeout.
+   stream panel, publish each complete output line as a delta into a bounded
+   per-job event queue and redraw whenever the main loop receives a wakeup.
+   The main shell is the only terminal drawer. It drains a burst into the
+   in-memory ring and otherwise blocks until the next stream event or scheduler
+   deadline; it does not use a fixed 50ms idle poll or rewrite a full snapshot
+   file for every line.
 5. If a snapshot command exceeds its configured timeout, terminate its owned
    process tree and display `TIMEOUT after Ns` as failed panel output. A timed
    out panel is scheduled again after `REFRESH_INTERVAL` seconds.
@@ -230,6 +232,22 @@ PANEL_WIDTHS[0]=48
 PANEL_HEIGHTS[0]=8
 ```
 
+### 4.4.1 Stream latency verification
+
+Run the Issue #7 regression check from the repository root:
+
+```bash
+bash tests/test_v11_stream_event_loop.sh
+```
+
+It measures a real local stream-to-render sample, requires less than 100ms for
+that sample, verifies the bounded ring, and checks that the fixed polling
+interval is absent. For a broader comparison, run the same timestamped producer
+through plain `tail -f` and `tail -F`, then through an LHC raw stream panel at
+10, 50, and 100 lines/second. Report p50, p95, max, CPU, and dropped lines;
+plain tail is only a transport baseline and does not include LHC parsing,
+rules, or terminal rendering.
+
 If `PANEL_WARN_RULES`, `PANEL_ERROR_RULES`, or `PANEL_INFO_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
 
 ### 4.5 Transpose layout
@@ -336,9 +354,9 @@ SSH stderr is not printed in the full-screen display; only the alias and exit st
   stream command that exits is restarted after `REFRESH_INTERVAL` seconds.
 - Completed refresh jobs are removed from active scheduler state. This keeps
   long-running dashboards from accumulating historical job PIDs. During
-  continuous output, stream notifications are coalesced and processed by the
-  short event-loop poll; keyboard input is read independently, so `q` remains
-  responsive without introducing a one-second signal-blind window.
+  continuous output, stream notifications are coalesced in per-job queues and
+  drained after the event FIFO wakes the main loop; keyboard input is read
+  independently, so `q` remains responsive without a fixed idle poll.
 - Empty results display `No data`. Content is clipped to panel height and does not scroll automatically.
 - Cell widths are fixed. A numeric value that is too wide becomes all `#` characters; an overlong text value keeps a trailing `.` (for example, `abcdefg.` in an eight-character cell).
 - Warning cells use black text on yellow; error cells and failed-panel content use white text on red. `NO_COLOR` only disables ANSI colors.

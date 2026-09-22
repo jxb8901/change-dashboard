@@ -34,9 +34,10 @@ NO_COLOR=1 ./bin/lhc example/fpp.conf
 2. 先畫出所有面板及 `Loading...` 狀態。
 3. 啟動每個已到期 panel 的本機命令或 SSH jobs。
 4. snapshot panel 在所有 jobs 完成後立即解析並重畫；stream panel
-   在命令仍然運行時，每收到新的完整輸出行便重畫。stream collector
-   會合併待處理的 notification 並喚醒主終端機循環，因此不需要等待
-   原本的一秒排程 timeout。
+   會把每一條完整輸出行作為 delta 寫入有界的 per-job event queue，主循環
+   收到 wakeup 後再重畫。只有主 shell 會繪畫終端機；它會把 burst 一次
+   drain 到記憶體 ring，沒有事件時則阻塞等待下一個 stream event 或排程
+   deadline，不再使用固定 50ms idle poll，也不會每行重寫及重讀完整 snapshot。
 5. 如果 snapshot 命令超過配置的 timeout，LHC 會終止其擁有的 process
    tree，並以 failed panel 輸出 `TIMEOUT after Ns`。該 panel 會在
    `REFRESH_INTERVAL` 秒後重新執行。
@@ -211,6 +212,21 @@ PANEL_WIDTHS[0]=48
 PANEL_HEIGHTS[0]=8
 ```
 
+### 4.4.1 Stream latency 驗證
+
+在 repository 根目錄執行 Issue #7 回歸測試：
+
+```bash
+bash tests/test_v11_stream_event_loop.sh
+```
+
+測試會經過真正的本機 stream/render path，要求單次 sample 低於 100ms，
+並檢查 ring buffer 及固定 polling interval 沒有重新出現。若要作較完整
+比較，使用相同的 timestamp producer，分別經 plain `tail -f`、`tail -F`
+及 LHC raw stream panel，在 10、50、100 lines/second 取樣，報告 p50、
+p95、max、CPU 及 dropped lines。Plain tail 只是 transport baseline，不
+包括 LHC 的 parsing、rules 及 terminal rendering。
+
 Raw panel 若設定 `PANEL_WARN_RULES`、`PANEL_ERROR_RULES` 或 `PANEL_INFO_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
 
 ### 4.5 Transpose layout
@@ -312,7 +328,7 @@ SSH 失敗的 stderr 不會直接顯示在全屏畫面，只顯示 alias 及 exi
 - 面板標題置中顯示；標題過長時會按面板可用寬度截斷。
 - raw 面板顯示文字；table 顯示標題列及資料列；transpose 顯示字段名稱/字段值 block，且不增加獨立表格列頭。
 - stream raw 及 table panel 會在命令仍然運行時以事件驅動方式更新，只保留最近的可見內容高度行數；命令退出後按 `REFRESH_INTERVAL` 秒重啟。
-- 已完成的 refresh job 會從活動 scheduler state 移除，長時間運行不會無限累積歷史 PID。連續輸出事件會合併，並由短間隔 event loop 處理；鍵盤輸入獨立讀取，因此 `q` 仍可快速離開，也不會出現一秒的 signal blind window。
+- 已完成的 refresh job 會從活動 scheduler state 移除，長時間運行不會無限累積歷史 PID。連續輸出事件會在 per-job queue 合併，event FIFO 喚醒主循環後一次 drain；鍵盤輸入獨立讀取，因此 `q` 仍可快速離開，也不需要固定 idle poll。
 - 空結果顯示 `No data`。資料按面板高度裁剪，不會自動滾動。
 - cell 寬度是固定的。超寬數字全部顯示為 `#`；超寬文字在最後保留 `.`，例如寬度 8 的文字可能顯示 `abcdefg.`。
 - warning cell 是黑字黃底；error cell 及失敗面板內容是白字紅底。`NO_COLOR` 只關閉 ANSI 顏色。

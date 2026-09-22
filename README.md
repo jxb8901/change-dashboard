@@ -54,12 +54,20 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.7 includes asynchronous per-target SSH polling-master lifecycle and reliable stream
+V5.8 includes a blocking stream event channel, in-memory bounded stream rings,
+and asynchronous per-target SSH polling-master lifecycle and reliable stream
 shutdown/process handling on top of the V5.2 multi-server SSH execution,
 partial refresh, continuous raw/table
 stream panels with event-driven redraws, fixed-width tables, multi-row
 transpose layout, automatic sizing, and percentage-based responsive panel
 geometry.
+
+Stream producers publish complete-line deltas to a coalesced per-job event
+queue. The main shell remains the only terminal drawer and blocks on the
+stream wakeup channel; when no event is pending it waits for the next scheduler
+deadline instead of waking on a fixed 50ms poll. A burst updates the affected
+panel from its in-memory ring without rewriting and rereading a full snapshot
+for every line. Local and dedicated SSH streams use the same path.
 
 During shutdown LHC gives active local/SSH commands and stream collectors a
 short TERM grace period, escalates to KILL when necessary, reaps wrappers
@@ -129,6 +137,22 @@ Run the V5 raw-stream regression test without real SSH servers:
 ```bash
 bash tests/test_v5_stream.sh
 ```
+
+Run the Issue #7 event-loop regression test. It exercises the real renderer,
+checks a sub-100ms local event path, verifies bounded ring ordering, and
+guards against reintroducing the fixed polling interval:
+
+```bash
+bash tests/test_v11_stream_event_loop.sh
+```
+
+For a repeatable latency comparison, use the same timestamp-producing command
+as the source for both a plain `tail -f`/`tail -F` baseline and an LHC stream
+panel. Record source-to-first-render samples at 10, 50, and 100 lines/second;
+report p50, p95, and max latency together with CPU and dropped-line counts.
+The LHC acceptance smoke test above uses the production event/render path and
+enforces the 100ms local target; plain tail should be reported separately
+because it does not parse, rule-check, or draw terminal panels.
 
 Run the V5.3 shutdown and process-lifecycle regression test:
 
