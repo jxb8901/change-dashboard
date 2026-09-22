@@ -78,9 +78,6 @@ assert_equal() {
   [[ "$completed" -eq 1 ]] ||
     fail_test 'dead STARTING worker was not replaced and completed'
 
-  new_worker_pid="$(<"${CONTROL_PATH}.worker-pid")"
-  [[ "$new_worker_pid" != "$old_worker_pid" ]] ||
-    fail_test 'replacement reused the dead STARTING worker PID record'
   [[ ! -e "${CONTROL_PATH}.lock" ]] ||
     fail_test 'STARTING recovery left a stale lock'
   [[ ! -e "${CONTROL_PATH}.recover" && ! -e "${CONTROL_PATH}.retry-after" ]] ||

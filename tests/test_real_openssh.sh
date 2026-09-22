@@ -31,6 +31,7 @@ SSH_WRAPPER_DIR="$TEST_TEMP_DIR/bin"
 SSH_WRAPPER="$SSH_WRAPPER_DIR/ssh"
 REAL_OPENSSH_SKIP_FILE="$TEST_TEMP_DIR/skip"
 REAL_OPENSSH_TIMEOUT_SECONDS="${REAL_OPENSSH_TIMEOUT_SECONDS:-90}"
+WAIT_FOR_PANEL_TIMEOUT_SECONDS="${WAIT_FOR_PANEL_TIMEOUT_SECONDS:-10}"
 CURRENT_STAGE="setup"
 
 stage() {
@@ -201,14 +202,54 @@ assert_equal 'ssh-ready' "$SSH_READY" 'real OpenSSH authentication'
 POLLING_COMMAND="printf 'polling %s\\n' \"\$SSH_CONNECTION\" >> '$REMOTE_CONNECTION_LOG'; printf 'polling-ok\\n'"
 STREAM_COMMAND="printf 'stream %s\\n' \"\$SSH_CONNECTION\" >> '$REMOTE_CONNECTION_LOG'; i=1; while true; do printf 'stream-%s\\n' \"\$i\"; i=\$((i + 1)); sleep 0.1; done"
 
+print_panel_wait_diagnostics() {
+  local panel_index="$1" control_path state job
+
+  control_path="${SSH_CONTROL_PATHS[0]:-}"
+  state='unknown'
+  if [[ -n "$control_path" ]]; then
+    read_ssh_master_state "$control_path"
+    state="$FUNCTION_RESULT"
+  fi
+  printf 'WAIT_DIAGNOSTICS: panel=%s active=%s next_run=%s master_state=%s control_path=%s\n' \
+    "$panel_index" \
+    "${PANEL_COMMAND_ACTIVE[$panel_index]:-}" \
+    "${PANEL_NEXT_RUN_SECONDS[$panel_index]:-}" \
+    "$state" \
+    "$control_path" >&2
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    printf 'WAIT_DIAGNOSTICS: job=%s panel=%s state=%s collected=%s pid=%s status_file=%s\n' \
+      "$job" \
+      "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" \
+      "${PANEL_COMMAND_STATES[$job]:-}" \
+      "${PANEL_COMMAND_COLLECTED[$job]:-}" \
+      "${PANEL_COMMAND_PIDS[$job]:-}" \
+      "${PANEL_COMMAND_STATUS_FILES[$job]:-}" >&2
+  done
+  if [[ -n "$control_path" ]]; then
+    for suffix in state worker-pid worker-identity master-pid master-identity recover retry-after; do
+      if [[ -e "${control_path}.${suffix}" ]]; then
+        printf 'WAIT_DIAGNOSTICS: control_file=%s.%s value=' "$control_path" "$suffix" >&2
+        sed -n '1p' "${control_path}.${suffix}" >&2 || true
+      fi
+    done
+  fi
+}
+
 wait_for_panel() {
-  local panel_index="$1"
-  for ((attempt = 0; attempt < 180; attempt++)); do
+  local panel_index="$1" deadline attempt=0
+  deadline=$((SECONDS + WAIT_FOR_PANEL_TIMEOUT_SECONDS))
+  while true; do
+    stage "panel $panel_index scheduler iteration $attempt"
     run_panel_commands || fail_test "SSH scheduler failed for panel $panel_index"
     [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-1}" -eq 0 ]] && return 0
+    if (( SECONDS >= deadline )); then
+      print_panel_wait_diagnostics "$panel_index"
+      fail_test "panel $panel_index did not finish within ${WAIT_FOR_PANEL_TIMEOUT_SECONDS}s"
+    fi
+    attempt=$((attempt + 1))
     sleep 0.05
   done
-  fail_test "panel $panel_index did not finish"
 }
 
 master_pid_from_check() {
