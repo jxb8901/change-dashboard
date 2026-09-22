@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.5: Propagate util-linux PTY child status and add staged,
+#   bounded diagnostics for real OpenSSH CI lifecycle failures.
 # - 2026-09-22 V5.8.4: Make the cross-platform Ctrl-C regression harness and
 #   bounded CI/real-OpenSSH validation portable and fail-fast.
 # - 2026-09-22 V5.8.3: Publish unified regression/CI coverage and a separate

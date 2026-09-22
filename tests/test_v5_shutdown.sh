@@ -32,7 +32,9 @@ run_script_command() {
   # util-linux script requires -c/--command. Detect the implementation from
   # its help text so the same PTY regression exercises both CI platforms.
   if script --help 2>&1 | grep -q -- '--command'; then
-    exec script -q -c "$command_line" "$typescript"
+    # util-linux otherwise reports the wrapper's success even when the child
+    # exits because of Ctrl-C; -e propagates the child status.
+    exec script -q -e -c "$command_line" "$typescript"
   else
     exec script -q "$typescript" /bin/bash -c "$command_line"
   fi
