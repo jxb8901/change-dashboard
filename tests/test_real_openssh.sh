@@ -355,12 +355,17 @@ unique_connection_count() {
   assert_equal "LOCAL polling-ok" "${PANEL_OUTPUTS[0]}" 'polling output after master death recovery'
 
   stage "explicit shutdown"
+  CONTROL_STATE_FILE="${CONTROL_PATH}.state"
   cleanup_panel_commands
   if master_pid_from_check; then
     fail_test 'explicit LHC shutdown left a real ControlMaster running'
   fi
-  [[ "${SSH_CONTROL_STATES[0]:-}" == CLOSED ]] ||
-    fail_test 'explicit LHC shutdown did not close the real master state'
+  [[ ! -e "$CONTROL_PATH" && ! -e "$CONTROL_STATE_FILE" ]] ||
+    fail_test 'explicit LHC shutdown left the control socket or state file'
+  [[ "${#SSH_CONTROL_TARGETS[@]}" -eq 0 &&
+     "${#SSH_CONTROL_PATHS[@]}" -eq 0 &&
+     "${#SSH_CONTROL_STATES[@]}" -eq 0 ]] ||
+    fail_test 'explicit LHC shutdown did not clear SSH control metadata'
 )
 
 if [[ -e "$REAL_OPENSSH_SKIP_FILE" ]]; then

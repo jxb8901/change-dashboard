@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-23 V5.8.9: Remove unused scheduler metadata arrays, make the
+#   real-OpenSSH shutdown assertions match post-cleanup state, and move CI to
+#   the supported macOS runner for Bash 3.2 compatibility evidence.
 # - 2026-09-22 V5.8.8: Preserve immutable scheduler job IDs across snapshot
 #   cleanup, recycle sparse slots safely, and prevent live stream event queues
 #   from colliding with later snapshot jobs.
@@ -171,11 +174,9 @@ declare -a PANEL_COMMAND_STATUS_FILES=()
 declare -a PANEL_COMMAND_COLLECTED=()
 declare -a PANEL_COMMAND_PANEL_INDEXES=()
 declare -a PANEL_COMMAND_ALIASES=()
-declare -a PANEL_COMMAND_TARGETS=()
 declare -a PANEL_COMMAND_INPUT_FILES=()
 declare -a PANEL_COMMAND_ERROR_FILES=()
 declare -a PANEL_COMMAND_EXIT_STATUSES=()
-declare -a PANEL_COMMAND_CONTROL_PATHS=()
 declare -a PANEL_COMMAND_STREAMS=()
 declare -a PANEL_COMMAND_FIFO_FILES=()
 declare -a PANEL_COMMAND_STREAM_CAPACITIES=()
@@ -713,11 +714,9 @@ cleanup_panel_commands() {
   PANEL_COMMAND_COLLECTED=()
   PANEL_COMMAND_PANEL_INDEXES=()
   PANEL_COMMAND_ALIASES=()
-  PANEL_COMMAND_TARGETS=()
   PANEL_COMMAND_INPUT_FILES=()
   PANEL_COMMAND_ERROR_FILES=()
   PANEL_COMMAND_EXIT_STATUSES=()
-  PANEL_COMMAND_CONTROL_PATHS=()
   PANEL_COMMAND_STREAMS=()
   PANEL_COMMAND_FIFO_FILES=()
   PANEL_COMMAND_STREAM_CAPACITIES=()
@@ -2786,11 +2785,9 @@ run_panel_commands() {
     PANEL_COMMAND_COLLECTED=()
     PANEL_COMMAND_PANEL_INDEXES=()
     PANEL_COMMAND_ALIASES=()
-    PANEL_COMMAND_TARGETS=()
     PANEL_COMMAND_INPUT_FILES=()
     PANEL_COMMAND_ERROR_FILES=()
     PANEL_COMMAND_EXIT_STATUSES=()
-    PANEL_COMMAND_CONTROL_PATHS=()
     PANEL_COMMAND_STREAMS=()
     PANEL_COMMAND_FIFO_FILES=()
     PANEL_COMMAND_STREAM_CAPACITIES=()
@@ -2968,11 +2965,9 @@ release_completed_panel_jobs() {
       "PANEL_COMMAND_COLLECTED[$job]" \
       "PANEL_COMMAND_PANEL_INDEXES[$job]" \
       "PANEL_COMMAND_ALIASES[$job]" \
-      "PANEL_COMMAND_TARGETS[$job]" \
       "PANEL_COMMAND_INPUT_FILES[$job]" \
       "PANEL_COMMAND_ERROR_FILES[$job]" \
       "PANEL_COMMAND_EXIT_STATUSES[$job]" \
-      "PANEL_COMMAND_CONTROL_PATHS[$job]" \
       "PANEL_COMMAND_STREAMS[$job]" \
       "PANEL_COMMAND_FIFO_FILES[$job]" \
       "PANEL_COMMAND_STREAM_CAPACITIES[$job]" \
@@ -3506,11 +3501,9 @@ start_panel_command_job() {
   PANEL_COMMAND_COLLECTOR_PID_FILES[$job]="$collector_pid_file"
   PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]="$collector_identity_file"
   PANEL_COMMAND_ALIASES[$job]="$alias"
-  PANEL_COMMAND_TARGETS[$job]="$target"
   PANEL_COMMAND_OUTPUT_FILES[$job]="$output_file"
   PANEL_COMMAND_STATUS_FILES[$job]="$status_file"
   PANEL_COMMAND_ERROR_FILES[$job]="$error_file"
-  PANEL_COMMAND_CONTROL_PATHS[$job]=""
   PANEL_COMMAND_STREAMS[$job]="$stream_mode"
   PANEL_COMMAND_FIFO_FILES[$job]=""
   PANEL_COMMAND_STREAM_CAPACITIES[$job]="$stream_capacity"
@@ -3540,7 +3533,6 @@ start_panel_command_job() {
     if [[ "$stream_mode" == "0" ]]; then
       get_ssh_control_path "$target"
       control_path="$FUNCTION_RESULT"
-      PANEL_COMMAND_CONTROL_PATHS[$job]="$control_path"
       queue_ssh_polling_master "$control_path"
     fi
   fi
