@@ -13,6 +13,7 @@ done
 
 TEST_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lhc-real-ssh.XXXXXX")" || exit 1
 SSHD_PID=""
+WATCHDOG_PID=""
 CLIENT_HOME="$TEST_TEMP_DIR/home"
 SSH_DIR="$CLIENT_HOME/.ssh"
 HOST_ALIAS="lhc-issue10"
@@ -29,8 +30,27 @@ CONTROL_DIR="$TEST_TEMP_DIR/control"
 SSH_WRAPPER_DIR="$TEST_TEMP_DIR/bin"
 SSH_WRAPPER="$SSH_WRAPPER_DIR/ssh"
 REAL_OPENSSH_SKIP_FILE="$TEST_TEMP_DIR/skip"
+REAL_OPENSSH_TIMEOUT_SECONDS="${REAL_OPENSSH_TIMEOUT_SECONDS:-90}"
+
+start_watchdog() {
+  (
+    sleep "$REAL_OPENSSH_TIMEOUT_SECONDS"
+    printf '%s\n' "real OpenSSH test exceeded ${REAL_OPENSSH_TIMEOUT_SECONDS}s" >&2
+    kill -TERM "$$" 2>/dev/null || true
+  ) &
+  WATCHDOG_PID=$!
+}
+
+stop_watchdog() {
+  if [[ -n "$WATCHDOG_PID" ]]; then
+    kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=""
+  fi
+}
 
 cleanup_test_temp() {
+  stop_watchdog
   if [[ -n "$SSHD_PID" ]]; then
     kill -TERM "$SSHD_PID" 2>/dev/null || true
     wait "$SSHD_PID" 2>/dev/null || true
@@ -39,6 +59,7 @@ cleanup_test_temp() {
   [[ "${KEEP_TEST_TEMP_DIR:-0}" == 1 ]] || rm -rf "$TEST_TEMP_DIR"
 }
 trap cleanup_test_temp EXIT
+start_watchdog
 
 fail_test() {
   printf 'FAIL: %s\n' "$*" >&2

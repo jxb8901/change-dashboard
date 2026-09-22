@@ -25,6 +25,19 @@ assert_file_contains() {
   grep -Fq -- "$expected" "$file" || fail_test "$description: missing [$expected]"
 }
 
+run_script_command() {
+  local typescript="$1" command_line="$2"
+
+  # BSD/macOS script accepts the command after the typescript path, while
+  # util-linux script requires -c/--command. Detect the implementation from
+  # its help text so the same PTY regression exercises both CI platforms.
+  if script --help 2>&1 | grep -q -- '--command'; then
+    exec script -q -c "$command_line" "$typescript"
+  else
+    exec script -q "$typescript" /bin/bash -c "$command_line"
+  fi
+}
+
 assert_pids_gone() {
   local pid_file="$1" description="$2" pid_record pid remaining_pid alive attempt
 
@@ -188,7 +201,8 @@ if command -v script >/dev/null 2>&1 && command -v perl >/dev/null 2>&1 && (( PR
   TTY_PID_FILE="$TEST_TEMP_DIR/tty.pids"
   export LHC_TEST_PID_FILE="$TTY_PID_FILE"
   set +e
-  script -q "$TTY_TYPESCRIPT" /bin/bash -c "stty rows 20 cols 80; exec /usr/bin/perl -e '\$SIG{INT}=\"DEFAULT\"; exec @ARGV' -- '$TEST_ROOT/bin/lhc' '$CTRL_C_CONFIG'" \
+  TTY_COMMAND="stty rows 20 cols 80; exec /usr/bin/perl -e '\$SIG{INT}=\"DEFAULT\"; exec @ARGV' -- '$TEST_ROOT/bin/lhc' '$CTRL_C_CONFIG'"
+  run_script_command "$TTY_TYPESCRIPT" "$TTY_COMMAND" \
     >"$TTY_OUTPUT" 2>"$TTY_OUTPUT.err" &
   TTY_SCRIPT_PID=$!
   TTY_DASHBOARD_PID=""
@@ -227,7 +241,9 @@ if command -v script >/dev/null 2>&1 && command -v perl >/dev/null 2>&1 && (( PR
   # from the discovered lhc descendant because Linux script(1) may add both a
   # shell layer and a different process-group leader.
   TTY_DASHBOARD_PGID="$(ps -p "$TTY_DASHBOARD_PID" -o pgid= | awk '{print $1}')"
-  if [[ "$TTY_DASHBOARD_PGID" =~ ^[1-9][0-9]*$ ]]; then
+  TTY_TEST_PGID="$(ps -p "$$" -o pgid= | awk '{print $1}')"
+  if [[ "$TTY_DASHBOARD_PGID" =~ ^[1-9][0-9]*$ &&
+        "$TTY_DASHBOARD_PGID" != "$TTY_TEST_PGID" ]]; then
     kill -INT -"$TTY_DASHBOARD_PGID" 2>/dev/null || true
   else
     kill -INT "$TTY_DASHBOARD_PID" 2>/dev/null || true

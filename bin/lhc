@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.4: Make the cross-platform Ctrl-C regression harness and
+#   bounded CI/real-OpenSSH validation portable and fail-fast.
 # - 2026-09-22 V5.8.3: Publish unified regression/CI coverage and a separate
 #   real-OpenSSH integration scenario for master and stream lifecycle behavior.
 # - 2026-09-22 V5.8.2: Recompute active stream ring capacities after terminal
