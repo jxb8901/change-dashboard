@@ -153,6 +153,62 @@ run_rate_case 50 50
     fail_test "stream grow did not expand the ring for new lines: [${PANEL_COMMAND_LAST_OUTPUTS[0]}]"
 )
 
+(
+  source "$TEST_ROOT/bin/lhc"
+  REFRESH_INTERVAL=0
+  PANEL_TITLES[0]='Repeated snapshot'
+  PANEL_COMMANDS[0]='printf "snapshot-%s\\n" "$$"'
+  PANEL_STREAM[0]=0
+  PANEL_X[0]=1; PANEL_Y[0]=1; PANEL_WIDTHS[0]=40; PANEL_HEIGHTS[0]=6
+  PANEL_TITLES[1]='Continuous stream'
+  PANEL_COMMANDS[1]='printf "stream-start\\n"; while true; do sleep 1; done'
+  PANEL_STREAM[1]=1
+  PANEL_X[1]=1; PANEL_Y[1]=8; PANEL_WIDTHS[1]=40; PANEL_HEIGHTS[1]=6
+
+  validate_config || fail_test 'stable job-slot configuration was rejected'
+  TERMINAL_ROWS=20; TERMINAL_COLS=80; resolve_panel_dimensions
+  initialize_loading_dashboard
+  render_dashboard() { :; }
+  PANEL_COMMAND_TEMP_DIR="$TEST_TEMP_DIR/stable-job-slots"
+  mkdir -p "$PANEL_COMMAND_TEMP_DIR"
+
+  wait_for_snapshot() {
+    local attempt
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      run_panel_commands || fail_test 'stable job-slot scheduler tick failed'
+      [[ "${PANEL_COMMAND_ACTIVE[0]:-1}" -eq 0 ]] && return 0
+      sleep 0.01
+    done
+    fail_test 'snapshot panel did not complete while stream remained active'
+  }
+
+  run_panel_commands || fail_test 'stable job-slot initial scheduler tick failed'
+  wait_for_snapshot
+  [[ "${PANEL_COMMAND_JOB_COUNT}" == 2 ]] ||
+    fail_test "stable job IDs were renumbered: high-water count ${PANEL_COMMAND_JOB_COUNT}"
+  [[ "${PANEL_COMMAND_PANEL_INDEXES[1]:-}" == 1 &&
+    "${PANEL_COMMAND_STREAMS[1]:-0}" == 1 ]] ||
+    fail_test 'continuous stream job lost its immutable slot after snapshot completion'
+
+  free_snapshot_slot=0
+  for free_job in "${!PANEL_COMMAND_FREE_JOBS[@]}"; do
+    [[ "$free_job" == 0 && "${PANEL_COMMAND_FREE_JOBS[$free_job]:-0}" == 1 ]] &&
+      free_snapshot_slot=1
+  done
+  [[ "$free_snapshot_slot" -eq 1 ]] || fail_test 'completed snapshot slot was not recyclable'
+
+  for iteration in 1 2 3 4 5; do
+    PANEL_NEXT_RUN_SECONDS[0]=0
+    wait_for_snapshot
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[1]:-}" == 1 &&
+      "${PANEL_COMMAND_STREAMS[1]:-0}" == 1 ]] ||
+      fail_test "snapshot iteration $iteration collided with the live stream job"
+  done
+  get_stream_job_output 1
+  [[ "$FUNCTION_RESULT" == *stream-* ]] || fail_test 'live stream lost its event output'
+  cleanup_panel_commands
+)
+
 SCHEDULER_TEMP_DIR="$TEST_TEMP_DIR/scheduler"
 mkdir -p "$SCHEDULER_TEMP_DIR"
 SCHEDULER_COUNT_FILE="$SCHEDULER_TEMP_DIR/count"

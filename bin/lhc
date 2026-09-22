@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.8: Preserve immutable scheduler job IDs across snapshot
+#   cleanup, recycle sparse slots safely, and prevent live stream event queues
+#   from colliding with later snapshot jobs.
 # - 2026-09-22 V5.8.7: Keep cleanup responsive during the wrapper identity
 #   publication window while preserving owner-ancestry checks.
 # - 2026-09-22 V5.8.6: Bound SSH control-socket probes with owned helper
@@ -186,7 +189,7 @@ declare -a PANEL_COMMAND_STATES=()
 declare -a PANEL_COMMAND_START_SECONDS=()
 declare -a PANEL_COMMAND_TIMEOUT_FILES=()
 declare -a PANEL_NEXT_RUN_SECONDS=()
-declare -a PANEL_COMMAND_START_JOBS=()
+declare -a PANEL_COMMAND_FREE_JOBS=()
 PANEL_COMMAND_SCHEDULER_INITIALIZED=0
 declare -a SSH_CONTROL_TARGETS=()
 declare -a SSH_CONTROL_PATHS=()
@@ -728,7 +731,7 @@ cleanup_panel_commands() {
   PANEL_COMMAND_ACTIVE=()
   PANEL_COMMAND_STATES=()
   PANEL_NEXT_RUN_SECONDS=()
-  PANEL_COMMAND_START_JOBS=()
+  PANEL_COMMAND_FREE_JOBS=()
   SSH_CONTROL_TARGETS=()
   SSH_CONTROL_PATHS=()
   SSH_CONTROL_STATES=()
@@ -2801,7 +2804,7 @@ run_panel_commands() {
     PANEL_COMMAND_ACTIVE=()
     PANEL_COMMAND_STATES=()
     PANEL_NEXT_RUN_SECONDS=()
-    PANEL_COMMAND_START_JOBS=()
+    PANEL_COMMAND_FREE_JOBS=()
     PANEL_COMMAND_JOB_COUNT=0
     for index in "${PANEL_ORDER[@]}"; do
       PANEL_COMMAND_ACTIVE[$index]=0
@@ -2832,7 +2835,6 @@ run_panel_commands() {
     PANEL_COMMAND_COUNTS[$index]=0
     PANEL_COMMAND_COMPLETED_COUNTS[$index]=0
     PANEL_COMMAND_ACTIVE[$index]=1
-    PANEL_COMMAND_START_JOBS[$index]="$PANEL_COMMAND_JOB_COUNT"
     started_panels[${#started_panels[@]}]="$index"
     if has_array_index PANEL_SSH_ALIASES "$index"; then
       for alias in ${PANEL_SSH_ALIASES[$index]}; do
@@ -2869,8 +2871,8 @@ run_panel_commands() {
   # scheduler tick; the dashboard loop calls it again shortly afterward.
   for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 1 ]] && continue
-    status_file="${PANEL_COMMAND_STATUS_FILES[$job]}"
-    [[ -s "$status_file" ]] || continue
+    status_file="${PANEL_COMMAND_STATUS_FILES[$job]:-}"
+    [[ -n "$status_file" && -s "$status_file" ]] || continue
 
     PANEL_COMMAND_STATES[$job]="EXITED"
     wait "${PANEL_COMMAND_PIDS[$job]}" 2>/dev/null || true
@@ -2896,7 +2898,7 @@ run_panel_commands() {
     PANEL_COMMAND_ACTIVE[$panel_index]=0
     PANEL_NEXT_RUN_SECONDS[$panel_index]=$((SECONDS + REFRESH_INTERVAL))
     cleanup_panel_result_files "$panel_index"
-    compact_completed_panel_jobs "$panel_index"
+    release_completed_panel_jobs "$panel_index"
     render_dashboard "$panel_index"
   done
 
@@ -2929,103 +2931,67 @@ cleanup_panel_result_files() {
   done
 }
 
-compact_completed_panel_jobs() {
-  local panel_index="$1" job new_job=0
-  local -a new_pids=() new_wrapper_starts=() new_child_pid_files=()
-  local -a new_child_identity_files=() new_collector_pid_files=()
-  local -a new_collector_identity_files=() new_output_files=()
-  local -a new_status_files=() new_collected=() new_panel_indexes=()
-  local -a new_aliases=() new_targets=() new_input_files=() new_error_files=()
-  local -a new_exit_statuses=() new_control_paths=() new_streams=()
-  local -a new_fifo_files=() new_last_outputs=() new_last_statuses=()
-  local -a new_stream_capacities=() new_stream_changed=()
-  local -a new_start_seconds=() new_timeout_files=()
-  local -a new_states=()
+allocate_panel_command_job() {
+  local free_job
 
-  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
-    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] && continue
-    new_pids[$new_job]="${PANEL_COMMAND_PIDS[$job]:-}"
-    new_wrapper_starts[$new_job]="${PANEL_COMMAND_WRAPPER_STARTS[$job]:-}"
-    new_child_pid_files[$new_job]="${PANEL_COMMAND_CHILD_PID_FILES[$job]:-}"
-    new_child_identity_files[$new_job]="${PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]:-}"
-    new_collector_pid_files[$new_job]="${PANEL_COMMAND_COLLECTOR_PID_FILES[$job]:-}"
-    new_collector_identity_files[$new_job]="${PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]:-}"
-    new_output_files[$new_job]="${PANEL_COMMAND_OUTPUT_FILES[$job]:-}"
-    new_status_files[$new_job]="${PANEL_COMMAND_STATUS_FILES[$job]:-}"
-    new_collected[$new_job]="${PANEL_COMMAND_COLLECTED[$job]:-}"
-    new_panel_indexes[$new_job]="${PANEL_COMMAND_PANEL_INDEXES[$job]:-}"
-    new_aliases[$new_job]="${PANEL_COMMAND_ALIASES[$job]:-}"
-    new_targets[$new_job]="${PANEL_COMMAND_TARGETS[$job]:-}"
-    new_input_files[$new_job]="${PANEL_COMMAND_INPUT_FILES[$job]:-}"
-    new_error_files[$new_job]="${PANEL_COMMAND_ERROR_FILES[$job]:-}"
-    new_exit_statuses[$new_job]="${PANEL_COMMAND_EXIT_STATUSES[$job]:-}"
-    new_control_paths[$new_job]="${PANEL_COMMAND_CONTROL_PATHS[$job]:-}"
-    new_streams[$new_job]="${PANEL_COMMAND_STREAMS[$job]:-}"
-    new_fifo_files[$new_job]="${PANEL_COMMAND_FIFO_FILES[$job]:-}"
-    new_stream_capacities[$new_job]="${PANEL_COMMAND_STREAM_CAPACITIES[$job]:-}"
-    new_stream_changed[$new_job]="${PANEL_COMMAND_STREAM_CHANGED[$job]:-0}"
-    new_last_outputs[$new_job]="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
-    new_last_statuses[$new_job]="${PANEL_COMMAND_LAST_STATUSES[$job]:-}"
-    new_start_seconds[$new_job]="${PANEL_COMMAND_START_SECONDS[$job]:-}"
-    new_timeout_files[$new_job]="${PANEL_COMMAND_TIMEOUT_FILES[$job]:-}"
-    new_states[$new_job]="${PANEL_COMMAND_STATES[$job]:-}"
-    new_job=$((new_job + 1))
+  # Keep reusable slots as a sparse set keyed by the immutable job ID. A
+  # compacted list would itself become unstable when a lower slot is reused
+  # while another free slot remains available.
+  for free_job in "${!PANEL_COMMAND_FREE_JOBS[@]}"; do
+    [[ "${PANEL_COMMAND_FREE_JOBS[$free_job]:-0}" == 1 ]] || continue
+    unset "PANEL_COMMAND_FREE_JOBS[$free_job]"
+    FUNCTION_RESULT="$free_job"
+    return 0
   done
 
-  if (( new_job == 0 )); then
-    PANEL_COMMAND_PIDS=()
-    PANEL_COMMAND_WRAPPER_STARTS=()
-    PANEL_COMMAND_CHILD_PID_FILES=()
-    PANEL_COMMAND_CHILD_IDENTITY_FILES=()
-    PANEL_COMMAND_COLLECTOR_PID_FILES=()
-    PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=()
-    PANEL_COMMAND_OUTPUT_FILES=()
-    PANEL_COMMAND_STATUS_FILES=()
-    PANEL_COMMAND_COLLECTED=()
-    PANEL_COMMAND_PANEL_INDEXES=()
-    PANEL_COMMAND_ALIASES=()
-    PANEL_COMMAND_TARGETS=()
-    PANEL_COMMAND_INPUT_FILES=()
-    PANEL_COMMAND_ERROR_FILES=()
-    PANEL_COMMAND_EXIT_STATUSES=()
-    PANEL_COMMAND_CONTROL_PATHS=()
-    PANEL_COMMAND_STREAMS=()
-    PANEL_COMMAND_FIFO_FILES=()
-    PANEL_COMMAND_STREAM_CAPACITIES=()
-    PANEL_COMMAND_STREAM_CHANGED=()
-    PANEL_COMMAND_LAST_OUTPUTS=()
-    PANEL_COMMAND_LAST_STATUSES=()
-    PANEL_COMMAND_START_SECONDS=()
-    PANEL_COMMAND_TIMEOUT_FILES=()
-    PANEL_COMMAND_STATES=()
-  else
-    PANEL_COMMAND_PIDS=("${new_pids[@]}")
-    PANEL_COMMAND_WRAPPER_STARTS=("${new_wrapper_starts[@]}")
-    PANEL_COMMAND_CHILD_PID_FILES=("${new_child_pid_files[@]}")
-    PANEL_COMMAND_CHILD_IDENTITY_FILES=("${new_child_identity_files[@]}")
-    PANEL_COMMAND_COLLECTOR_PID_FILES=("${new_collector_pid_files[@]}")
-    PANEL_COMMAND_COLLECTOR_IDENTITY_FILES=("${new_collector_identity_files[@]}")
-    PANEL_COMMAND_OUTPUT_FILES=("${new_output_files[@]}")
-    PANEL_COMMAND_STATUS_FILES=("${new_status_files[@]}")
-    PANEL_COMMAND_COLLECTED=("${new_collected[@]}")
-    PANEL_COMMAND_PANEL_INDEXES=("${new_panel_indexes[@]}")
-    PANEL_COMMAND_ALIASES=("${new_aliases[@]}")
-    PANEL_COMMAND_TARGETS=("${new_targets[@]}")
-    PANEL_COMMAND_INPUT_FILES=("${new_input_files[@]}")
-    PANEL_COMMAND_ERROR_FILES=("${new_error_files[@]}")
-    PANEL_COMMAND_EXIT_STATUSES=("${new_exit_statuses[@]}")
-    PANEL_COMMAND_CONTROL_PATHS=("${new_control_paths[@]}")
-    PANEL_COMMAND_STREAMS=("${new_streams[@]}")
-    PANEL_COMMAND_FIFO_FILES=("${new_fifo_files[@]}")
-    PANEL_COMMAND_STREAM_CAPACITIES=("${new_stream_capacities[@]}")
-    PANEL_COMMAND_STREAM_CHANGED=("${new_stream_changed[@]}")
-    PANEL_COMMAND_LAST_OUTPUTS=("${new_last_outputs[@]}")
-    PANEL_COMMAND_LAST_STATUSES=("${new_last_statuses[@]}")
-    PANEL_COMMAND_START_SECONDS=("${new_start_seconds[@]}")
-    PANEL_COMMAND_TIMEOUT_FILES=("${new_timeout_files[@]}")
-    PANEL_COMMAND_STATES=("${new_states[@]}")
+  FUNCTION_RESULT="$PANEL_COMMAND_JOB_COUNT"
+  PANEL_COMMAND_JOB_COUNT=$((PANEL_COMMAND_JOB_COUNT + 1))
+}
+
+release_completed_panel_jobs() {
+  local panel_index="$1" job
+
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+    [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    [[ "${PANEL_COMMAND_STATES[$job]:-}" == "REAPED" ]] || continue
+    [[ "${PANEL_COMMAND_COLLECTED[$job]:-0}" -eq 1 ]] || continue
+
+    unset \
+      "PANEL_COMMAND_PIDS[$job]" \
+      "PANEL_COMMAND_WRAPPER_STARTS[$job]" \
+      "PANEL_COMMAND_CHILD_PID_FILES[$job]" \
+      "PANEL_COMMAND_CHILD_IDENTITY_FILES[$job]" \
+      "PANEL_COMMAND_COLLECTOR_PID_FILES[$job]" \
+      "PANEL_COMMAND_COLLECTOR_IDENTITY_FILES[$job]" \
+      "PANEL_COMMAND_OUTPUT_FILES[$job]" \
+      "PANEL_COMMAND_STATUS_FILES[$job]" \
+      "PANEL_COMMAND_COLLECTED[$job]" \
+      "PANEL_COMMAND_PANEL_INDEXES[$job]" \
+      "PANEL_COMMAND_ALIASES[$job]" \
+      "PANEL_COMMAND_TARGETS[$job]" \
+      "PANEL_COMMAND_INPUT_FILES[$job]" \
+      "PANEL_COMMAND_ERROR_FILES[$job]" \
+      "PANEL_COMMAND_EXIT_STATUSES[$job]" \
+      "PANEL_COMMAND_CONTROL_PATHS[$job]" \
+      "PANEL_COMMAND_STREAMS[$job]" \
+      "PANEL_COMMAND_FIFO_FILES[$job]" \
+      "PANEL_COMMAND_STREAM_CAPACITIES[$job]" \
+      "PANEL_COMMAND_STREAM_CHANGED[$job]" \
+      "PANEL_COMMAND_LAST_OUTPUTS[$job]" \
+      "PANEL_COMMAND_LAST_STATUSES[$job]" \
+      "PANEL_COMMAND_START_SECONDS[$job]" \
+      "PANEL_COMMAND_TIMEOUT_FILES[$job]" \
+      "PANEL_COMMAND_STATES[$job]"
+    PANEL_COMMAND_FREE_JOBS[$job]=1
+  done
+
+  # With no live jobs there is no immutable ID that must survive into the
+  # next scheduler generation. Reset the empty namespace so snapshot-only
+  # dashboards do not retain a growing high-water mark.
+  if (( ${#PANEL_COMMAND_PIDS[@]} == 0 )); then
+    PANEL_COMMAND_JOB_COUNT=0
+    PANEL_COMMAND_FREE_JOBS=()
   fi
-  PANEL_COMMAND_JOB_COUNT=$new_job
 }
 
 get_panel_timeout_seconds() {
@@ -3107,11 +3073,13 @@ timeout_running_panel_commands() {
 }
 
 rollback_panel_start() {
-  local panel_index="$1" job start_job count=0
+  local panel_index="$1" job count=0 state
 
-  start_job="${PANEL_COMMAND_START_JOBS[$panel_index]:-0}"
-  for ((job = start_job; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+  for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
     [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+    state="${PANEL_COMMAND_STATES[$job]:-}"
+    [[ "$state" == "STARTING" || "$state" == "RUNNING" ||
+      "$state" == "TIMING_OUT" ]] || continue
     count=$((count + 1))
     signal_owned_job_processes "$job" TERM 1 2>/dev/null || true
   done
@@ -3498,17 +3466,10 @@ run_ssh_polling_command() {
 
 start_panel_command_job() {
   local panel_index="$1" alias="$2" target="$3"
-  local job="$PANEL_COMMAND_JOB_COUNT"
-  local output_file="$PANEL_COMMAND_TEMP_DIR/output.$job"
-  local status_file="$PANEL_COMMAND_TEMP_DIR/status.$job"
-  local input_file="$PANEL_COMMAND_TEMP_DIR/input.$job"
-  local error_file="$PANEL_COMMAND_TEMP_DIR/error.$job"
-  local fifo_file="$PANEL_COMMAND_TEMP_DIR/fifo.$job"
-  local child_pid_file="$PANEL_COMMAND_TEMP_DIR/child.$job"
-  local child_identity_file="$PANEL_COMMAND_TEMP_DIR/child-identity.$job"
-  local collector_pid_file="$PANEL_COMMAND_TEMP_DIR/collector.$job"
-  local collector_identity_file="$PANEL_COMMAND_TEMP_DIR/collector-identity.$job"
-  local timeout_file="$PANEL_COMMAND_TEMP_DIR/timeout.$job"
+  local job
+  local output_file status_file input_file error_file fifo_file
+  local child_pid_file child_identity_file collector_pid_file
+  local collector_identity_file timeout_file
   local control_path=""
   local stream_mode="${PANEL_STREAM[$panel_index]:-0}"
   local stream_capacity=""
@@ -3516,14 +3477,28 @@ start_panel_command_job() {
   if [[ "$stream_mode" == "1" ]]; then
     get_stream_capacity "$panel_index"
     stream_capacity="$FUNCTION_RESULT"
+  fi
+
+  allocate_panel_command_job
+  job="$FUNCTION_RESULT"
+  output_file="$PANEL_COMMAND_TEMP_DIR/output.$job"
+  status_file="$PANEL_COMMAND_TEMP_DIR/status.$job"
+  input_file="$PANEL_COMMAND_TEMP_DIR/input.$job"
+  error_file="$PANEL_COMMAND_TEMP_DIR/error.$job"
+  fifo_file="$PANEL_COMMAND_TEMP_DIR/fifo.$job"
+  child_pid_file="$PANEL_COMMAND_TEMP_DIR/child.$job"
+  child_identity_file="$PANEL_COMMAND_TEMP_DIR/child-identity.$job"
+  collector_pid_file="$PANEL_COMMAND_TEMP_DIR/collector.$job"
+  collector_identity_file="$PANEL_COMMAND_TEMP_DIR/collector-identity.$job"
+  timeout_file="$PANEL_COMMAND_TEMP_DIR/timeout.$job"
+  if [[ "$stream_mode" == "1" ]]; then
     if ! mkfifo "$fifo_file"; then
+      PANEL_COMMAND_FREE_JOBS[$job]=1
       error "unable to create stream FIFO for panel $panel_index"
       return 1
     fi
     : >"$output_file"
   fi
-
-  PANEL_COMMAND_JOB_COUNT=$((PANEL_COMMAND_JOB_COUNT + 1))
   PANEL_COMMAND_PANEL_INDEXES[$job]="$panel_index"
   PANEL_COMMAND_WRAPPER_STARTS[$job]=""
   PANEL_COMMAND_CHILD_PID_FILES[$job]="$child_pid_file"
