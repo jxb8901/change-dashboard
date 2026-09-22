@@ -220,12 +220,31 @@ PANEL_HEIGHTS[0]=8
 bash tests/test_v11_stream_event_loop.sh
 ```
 
-測試會經過真正的本機 stream/render path，要求單次 sample 低於 100ms，
-並檢查 ring buffer 及固定 polling interval 沒有重新出現。若要作較完整
-比較，使用相同的 timestamp producer，分別經 plain `tail -f`、`tail -F`
-及 LHC raw stream panel，在 10、50、100 lines/second 取樣，報告 p50、
-p95、max、CPU 及 dropped lines。Plain tail 只是 transport baseline，不
-包括 LHC 的 parsing、rules 及 terminal rendering。
+測試會在 10 及 50 lines/second 各收集 50 個真正的本機 stream/render
+sample，要求 p95 低於 100ms，檢查 bounded visible-ring 的尾段及順序，
+驗證沒有 stream event 時 scheduler deadline 仍會觸發，並測試 burst event
+channel shutdown cleanup。要重現 tail 與 LHC 的比較，執行：
+
+```bash
+LHC_BENCHMARK_COUNT=50 bash tests/benchmark_stream_event_loop.sh
+```
+
+Benchmark 使用同一個 timestamp producer，分別測試 plain `tail -f`、plain
+`tail -F` 及 LHC raw stream panel，輸出 p50/p95/max latency、user/sys CPU
+time、peak CPU、peak process count 及 dropped lines。2026-09-22 macOS
+一次 50-sample 結果如下：
+
+| 路徑 | rate | p50 / p95 / max | user / sys | peak CPU | peak processes | dropped |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tail -f` | 10 | 0.1 / 0.1 / 0.1 ms | 0.00 / 0.00 s | 0.3% | 4 | 0 |
+| `tail -F` | 10 | 0.1 / 0.2 / 0.3 ms | 0.00 / 0.00 s | 0.3% | 4 | 0 |
+| LHC | 10 | 28.8 / 30.9 / 35.8 ms | 0.84 / 0.74 s | 0.4% | 10 | 0 |
+| `tail -f` | 50 | 0.0 / 0.1 / 0.2 ms | 0.00 / 0.00 s | 0.4% | 4 | 0 |
+| `tail -F` | 50 | 0.1 / 0.1 / 2.6 ms | 0.00 / 0.00 s | 0.2% | 4 | 0 |
+| LHC | 50 | 27.0 / 33.3 / 35.0 ms | 0.79 / 0.70 s | 0.3% | 11 | 0 |
+
+Plain tail 只是 transport baseline，不包括 LHC parsing、rules 及 terminal
+rendering；CPU 及 process 數字會隨機器而變。
 
 Raw panel 若設定 `PANEL_WARN_RULES`、`PANEL_ERROR_RULES` 或 `PANEL_INFO_RULES`，rule 必須使用 `MESSAGE:~keyword` 或 `MESSAGE:!~keyword`。Table/transpose rule 仍必須先有 `PANEL_TABLE_COLUMNS`；layout 必須是 `table` 或 `transpose`，width 必須符合該 layout，但可只省略最右字段的 width。
 
@@ -408,6 +427,8 @@ bash tests/test_v7_scheduler_timeout.sh
 bash tests/test_v8_dirty_snapshot.sh
 bash tests/test_v9_ssh_starting_recovery.sh
 bash tests/test_v10_output_sanitization.sh
+bash tests/test_v11_stream_event_loop.sh
+LHC_BENCHMARK_COUNT=50 bash tests/benchmark_stream_event_loop.sh
 ```
 
 測試使用 fake SSH，不代表實際部署主機、憑證、host key 或遠端命令已驗證；正式使用前仍須以實際 SSH 目標測試。

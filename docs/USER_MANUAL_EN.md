@@ -240,13 +240,32 @@ Run the Issue #7 regression check from the repository root:
 bash tests/test_v11_stream_event_loop.sh
 ```
 
-It measures a real local stream-to-render sample, requires less than 100ms for
-that sample, verifies the bounded ring, and checks that the fixed polling
-interval is absent. For a broader comparison, run the same timestamped producer
-through plain `tail -f` and `tail -F`, then through an LHC raw stream panel at
-10, 50, and 100 lines/second. Report p50, p95, max, CPU, and dropped lines;
-plain tail is only a transport baseline and does not include LHC parsing,
-rules, or terminal rendering.
+It measures 50 real local stream-to-render samples at both 10 and 50
+lines/second, requires p95 below 100ms, verifies the bounded visible-ring
+suffix and ordering, checks scheduler deadlines while no stream event arrives,
+and exercises burst event-channel shutdown cleanup. For a reproducible
+tail-versus-LHC comparison, run:
+
+```bash
+LHC_BENCHMARK_COUNT=50 bash tests/benchmark_stream_event_loop.sh
+```
+
+The harness uses the same timestamp producer for plain `tail -f`, plain
+`tail -F`, and an LHC raw stream panel. It reports p50/p95/max latency,
+user/sys CPU time, peak CPU, peak process count, and dropped lines. A
+representative 50-sample macOS run on 2026-09-22 produced these results:
+
+| path | rate | p50 / p95 / max | user / sys | peak CPU | peak processes | dropped |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tail -f` | 10 | 0.1 / 0.1 / 0.1 ms | 0.00 / 0.00 s | 0.3% | 4 | 0 |
+| `tail -F` | 10 | 0.1 / 0.2 / 0.3 ms | 0.00 / 0.00 s | 0.3% | 4 | 0 |
+| LHC | 10 | 28.8 / 30.9 / 35.8 ms | 0.84 / 0.74 s | 0.4% | 10 | 0 |
+| `tail -f` | 50 | 0.0 / 0.1 / 0.2 ms | 0.00 / 0.00 s | 0.4% | 4 | 0 |
+| `tail -F` | 50 | 0.1 / 0.1 / 2.6 ms | 0.00 / 0.00 s | 0.2% | 4 | 0 |
+| LHC | 50 | 27.0 / 33.3 / 35.0 ms | 0.79 / 0.70 s | 0.3% | 11 | 0 |
+
+Plain tail is only a transport baseline and does not include LHC parsing,
+rules, or terminal rendering; CPU and process values are machine-dependent.
 
 If `PANEL_WARN_RULES`, `PANEL_ERROR_RULES`, or `PANEL_INFO_RULES` is set on a raw panel, rules must use `MESSAGE:~keyword` or `MESSAGE:!~keyword`. Table/transpose rules still require `PANEL_TABLE_COLUMNS[i]`. The layout must be `table` or `transpose`; widths must match the layout, except that only the final width may be omitted.
 
@@ -437,6 +456,8 @@ bash tests/test_v7_scheduler_timeout.sh
 bash tests/test_v8_dirty_snapshot.sh
 bash tests/test_v9_ssh_starting_recovery.sh
 bash tests/test_v10_output_sanitization.sh
+bash tests/test_v11_stream_event_loop.sh
+LHC_BENCHMARK_COUNT=50 bash tests/benchmark_stream_event_loop.sh
 ```
 
 The test uses fake SSH. It does not prove that production hosts, credentials, host keys, or remote commands work; verify those with real SSH targets before deployment.

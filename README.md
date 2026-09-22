@@ -54,7 +54,7 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.8 includes a blocking stream event channel, in-memory bounded stream rings,
+V5.8.1 includes a blocking stream event channel, in-memory bounded stream rings,
 and asynchronous per-target SSH polling-master lifecycle and reliable stream
 shutdown/process handling on top of the V5.2 multi-server SSH execution,
 partial refresh, continuous raw/table
@@ -146,13 +146,30 @@ guards against reintroducing the fixed polling interval:
 bash tests/test_v11_stream_event_loop.sh
 ```
 
-For a repeatable latency comparison, use the same timestamp-producing command
-as the source for both a plain `tail -f`/`tail -F` baseline and an LHC stream
-panel. Record source-to-first-render samples at 10, 50, and 100 lines/second;
-report p50, p95, and max latency together with CPU and dropped-line counts.
-The LHC acceptance smoke test above uses the production event/render path and
-enforces the 100ms local target; plain tail should be reported separately
-because it does not parse, rule-check, or draw terminal panels.
+For a repeatable latency comparison, run the benchmark harness. It uses the
+same timestamp producer for plain `tail -f`, plain `tail -F`, and an LHC raw
+stream panel, and reports p50/p95/max latency, user/sys CPU time, peak CPU,
+peak process count, and dropped lines:
+
+```bash
+LHC_BENCHMARK_COUNT=50 bash tests/benchmark_stream_event_loop.sh
+```
+
+Representative 50-sample output from a macOS run on 2026-09-22 was:
+
+| path | rate | p50 / p95 / max | user / sys | peak CPU | peak processes | dropped |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tail -f` | 10 | 0.1 / 0.1 / 0.1 ms | 0.00 / 0.00 s | 0.3% | 4 | 0 |
+| `tail -F` | 10 | 0.1 / 0.2 / 0.3 ms | 0.00 / 0.00 s | 0.3% | 4 | 0 |
+| LHC | 10 | 28.8 / 30.9 / 35.8 ms | 0.84 / 0.74 s | 0.4% | 10 | 0 |
+| `tail -f` | 50 | 0.0 / 0.1 / 0.2 ms | 0.00 / 0.00 s | 0.4% | 4 | 0 |
+| `tail -F` | 50 | 0.1 / 0.1 / 2.6 ms | 0.00 / 0.00 s | 0.2% | 4 | 0 |
+| LHC | 50 | 27.0 / 33.3 / 35.0 ms | 0.79 / 0.70 s | 0.3% | 11 | 0 |
+
+The LHC acceptance regression below uses the production event/render path,
+collects 50 samples at both 10 and 50 lines/second, and enforces p95 <100ms.
+Plain tail is a transport baseline and does not parse, rule-check, or draw
+terminal panels; benchmark CPU and process values are machine-dependent.
 
 Run the V5.3 shutdown and process-lifecycle regression test:
 

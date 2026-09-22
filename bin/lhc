@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.1: Add sustained 10/50 lps event-loop regression and a
+#   repeatable tail-vs-LHC benchmark covering p95 latency, CPU/process overhead,
+#   dropped lines, scheduler deadlines, and event-channel shutdown cleanup.
 # - 2026-09-22 V5.8: Replace fixed stream polling with a blocking event
 #   channel, publish line deltas through coalesced per-job queues, maintain
 #   stream rings in memory, and wake the main loop only for stream events or
@@ -2428,7 +2431,10 @@ stream_collect() {
       fi
     fi
   done <"$fifo"
-  [[ -n "$refresh_marker" ]] && rm -f "$refresh_marker"
+  if [[ -n "$refresh_marker" ]]; then
+    rm -f "$refresh_marker"
+  fi
+  return 0
 }
 
 append_stream_event_line() {
@@ -2598,7 +2604,8 @@ aggregate_ssh_stream_output() {
 acknowledge_stream_refresh_marker() {
   local fifo_file="$1"
 
-  [[ -n "$fifo_file" ]] && rm -f "${fifo_file}.refresh"
+  [[ -n "$fifo_file" ]] || return 0
+  rm -f "${fifo_file}.refresh"
 }
 
 read_stream_snapshot() {
@@ -3954,13 +3961,20 @@ worst_status() {
 
 wait_for_quit_or_timeout() {
   local timeout="$1"
-  local key
+  local key deadline remaining
 
-  if IFS= read -rsn1 -t "$timeout" key; then
-    [[ "$key" == "q" ]]
-    return
-  fi
-  return 1
+  deadline=$((SECONDS + timeout))
+
+  while true; do
+    if IFS= read -rsn1 -t "$timeout" key; then
+      [[ "$key" == "q" ]]
+      return
+    fi
+    (( SECONDS >= deadline )) && return 1
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || return 1
+    timeout="$remaining"
+  done
 }
 
 get_dashboard_wait_seconds() {

@@ -13,15 +13,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check Bash syntax
-        run: bash -n bin/lhc tests/fixtures/ssh tests/test_*.sh
+        run: bash -n bin/lhc tests/fixtures/ssh tests/fixtures/lhc_event_loop_case.sh tests/benchmark_stream_event_loop.sh tests/test_*.sh
 
       - name: Run regression tests
         run: |
           bash tests/test_cli_options.sh
           bash tests/test_v4_ssh.sh
           bash tests/test_v5_features.sh
+          bash tests/test_v5_stream.sh
+          bash tests/test_v5_shutdown.sh
           bash tests/test_v6_ssh_lifecycle.sh
           bash tests/test_v7_scheduler_timeout.sh
           bash tests/test_v8_dirty_snapshot.sh
           bash tests/test_v9_ssh_starting_recovery.sh
           bash tests/test_v10_output_sanitization.sh
+          bash tests/test_v11_stream_event_loop.sh
