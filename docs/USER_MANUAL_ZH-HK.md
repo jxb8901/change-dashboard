@@ -147,6 +147,8 @@ transpose stream panel 仍不支援。命令退出後保留最後 buffer，並�
 line-buffering 設定。Stream notification 只會重建及 diff 發生變化的
 panel，不會因每一行新輸出而重新計算其他 panel；初始畫面、普通 panel
 完成及 terminal resize 仍會重建整個 dashboard。
+Terminal resize 時，LHC 會立即重新計算所有活動 stream job 的容量，在
+記憶體中 trim 現有 event-mode ring，之後的新輸出會使用新的容量限制。
 
 ```bash
 PANEL_TITLES[0]="Deployment"

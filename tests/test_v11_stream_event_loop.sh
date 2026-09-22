@@ -104,6 +104,55 @@ run_rate_case 50 50
     fail_test "event ring lost or reordered lines: [$FUNCTION_RESULT]"
 )
 
+(
+  source "$TEST_ROOT/bin/lhc"
+  PANEL_ORDER=(0)
+  PANEL_STREAM[0]=1
+  PANEL_COMMAND_ACTIVE[0]=1
+  PANEL_COMMAND_JOB_COUNT=1
+  PANEL_COMMAND_PANEL_INDEXES[0]=0
+  PANEL_COMMAND_STREAMS[0]=1
+  PANEL_COMMAND_STREAM_CAPACITIES[0]=6
+  PANEL_COMMAND_STREAM_CHANGED[0]=0
+  PANEL_COMMAND_LAST_OUTPUTS[0]=$'line-1\nline-2\nline-3\nline-4\nline-5\nline-6'
+  STREAM_EVENT_CHANNEL_ACTIVE=1
+  TERMINAL_ROWS=20
+  TERMINAL_COLS=80
+  RESIZED_HEIGHT=8
+
+  read_terminal_size() { :; }
+  resolve_panel_dimensions() { PANEL_EFFECTIVE_HEIGHTS[0]="$RESIZED_HEIGHT"; }
+  calculate_required_terminal_size() {
+    REQUIRED_COLS=1
+    REQUIRED_TERMINAL_ROWS=1
+  }
+  validate_effective_panel_layout() { return 0; }
+  render_dashboard() { :; }
+
+  process_terminal_resize || fail_test 'initial stream resize was rejected'
+  [[ "${PANEL_COMMAND_STREAM_CAPACITIES[0]}" == 6 ]] ||
+    fail_test 'initial stream capacity was not recorded'
+
+  RESIZED_HEIGHT=5
+  process_terminal_resize || fail_test 'stream shrink resize was rejected'
+  [[ "${PANEL_COMMAND_STREAM_CAPACITIES[0]}" == 3 ]] ||
+    fail_test 'stream shrink did not update the job capacity'
+  [[ "${PANEL_COMMAND_LAST_OUTPUTS[0]}" == $'line-4\nline-5\nline-6' ]] ||
+    fail_test "stream shrink did not trim the existing ring: [${PANEL_COMMAND_LAST_OUTPUTS[0]}]"
+
+  append_stream_event_line 0 line-7
+  [[ "${PANEL_COMMAND_LAST_OUTPUTS[0]}" == $'line-5\nline-6\nline-7' ]] ||
+    fail_test "stream shrink did not persist for new lines: [${PANEL_COMMAND_LAST_OUTPUTS[0]}]"
+
+  RESIZED_HEIGHT=8
+  process_terminal_resize || fail_test 'stream grow resize was rejected'
+  [[ "${PANEL_COMMAND_STREAM_CAPACITIES[0]}" == 6 ]] ||
+    fail_test 'stream grow did not update the job capacity'
+  append_stream_event_line 0 line-8
+  [[ "${PANEL_COMMAND_LAST_OUTPUTS[0]}" == $'line-5\nline-6\nline-7\nline-8' ]] ||
+    fail_test "stream grow did not expand the ring for new lines: [${PANEL_COMMAND_LAST_OUTPUTS[0]}]"
+)
+
 SCHEDULER_TEMP_DIR="$TEST_TEMP_DIR/scheduler"
 mkdir -p "$SCHEDULER_TEMP_DIR"
 SCHEDULER_COUNT_FILE="$SCHEDULER_TEMP_DIR/count"

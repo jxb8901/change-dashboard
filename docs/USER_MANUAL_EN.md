@@ -165,6 +165,9 @@ line-buffering option such as `stdbuf -oL`. Stream notifications use a
 panel-local frame rebuild and diff, so unrelated panels are not recalculated
 for each new stream line; the full dashboard is rebuilt for the initial draw,
 ordinary panel completion, and terminal resize.
+When the terminal is resized, LHC recomputes the capacity of every active
+stream job, trims the existing event-mode ring in memory immediately, and uses
+the new capacity for subsequent lines.
 
 ```bash
 PANEL_TITLES[0]="Deployment"

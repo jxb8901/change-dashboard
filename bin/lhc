@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Author: Jeffrey + ChatGPT
 # Changelog:
+# - 2026-09-22 V5.8.2: Recompute active stream ring capacities after terminal
+#   resize, trim existing event-mode rings in memory, and cover shrink/grow
+#   behavior with a resize regression.
 # - 2026-09-22 V5.8.1: Add sustained 10/50 lps event-loop regression and a
 #   repeatable tail-vs-LHC benchmark covering p95 latency, CPU/process overhead,
 #   dropped lines, scheduler deadlines, and event-channel shutdown cleanup.
@@ -2385,6 +2388,45 @@ limit_stream_output() {
   fi
 }
 
+trim_stream_job_output() {
+  local job="$1" capacity="$2"
+  local content="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}" count remainder
+
+  [[ -n "$content" ]] || {
+    PANEL_COMMAND_LAST_OUTPUTS[$job]=""
+    return 0
+  }
+
+  count=1
+  remainder="$content"
+  while [[ "$remainder" == *$'\n'* ]]; do
+    count=$((count + 1))
+    remainder="${remainder#*$'\n'}"
+  done
+  while (( count > capacity )); do
+    content="${content#*$'\n'}"
+    count=$((count - 1))
+  done
+  PANEL_COMMAND_LAST_OUTPUTS[$job]="$content"
+}
+
+refresh_active_stream_capacities() {
+  local panel_index job capacity
+
+  for panel_index in "${PANEL_ORDER[@]}"; do
+    [[ "${PANEL_COMMAND_ACTIVE[$panel_index]:-0}" -eq 1 ]] || continue
+    [[ "${PANEL_STREAM[$panel_index]:-0}" -eq 1 ]] || continue
+    get_stream_capacity "$panel_index"
+    capacity="$FUNCTION_RESULT"
+    for ((job = 0; job < PANEL_COMMAND_JOB_COUNT; job++)); do
+      [[ "${PANEL_COMMAND_PANEL_INDEXES[$job]:-}" == "$panel_index" ]] || continue
+      [[ "${PANEL_COMMAND_STREAMS[$job]:-0}" -eq 1 ]] || continue
+      PANEL_COMMAND_STREAM_CAPACITIES[$job]="$capacity"
+      trim_stream_job_output "$job" "$capacity"
+    done
+  done
+}
+
 stream_collect() {
   local fifo="$1"
   local snapshot_file="$2"
@@ -2439,7 +2481,7 @@ stream_collect() {
 
 append_stream_event_line() {
   local job="$1" line="$2"
-  local capacity content count remainder
+  local capacity content
 
   capacity="${PANEL_COMMAND_STREAM_CAPACITIES[$job]:-1}"
   content="${PANEL_COMMAND_LAST_OUTPUTS[$job]:-}"
@@ -2447,20 +2489,10 @@ append_stream_event_line() {
     content="$content"$'\n'
   fi
   content="$content$line"
-
+  PANEL_COMMAND_LAST_OUTPUTS[$job]="$content"
   # Keep the visible ring in memory. The panel heights are bounded, so this
   # removes at most one old line per iteration without a fork or file I/O.
-  count=1
-  remainder="$content"
-  while [[ "$remainder" == *$'\n'* ]]; do
-    count=$((count + 1))
-    remainder="${remainder#*$'\n'}"
-  done
-  while (( count > capacity )); do
-    content="${content#*$'\n'}"
-    count=$((count - 1))
-  done
-  PANEL_COMMAND_LAST_OUTPUTS[$job]="$content"
+  trim_stream_job_output "$job" "$capacity"
   PANEL_COMMAND_STREAM_CHANGED[$job]=1
 }
 
@@ -4076,6 +4108,8 @@ process_terminal_resize() {
   if (( DASHBOARD_PAUSED == 1 )); then
     DASHBOARD_PAUSED=0
   fi
+
+  refresh_active_stream_capacities
 
   # Resize changes the visible stream window. Trim the already aggregated
   # output immediately so a smaller panel continues to show its newest lines.

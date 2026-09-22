@@ -54,7 +54,7 @@ less example/v4-ssh.conf
 
 ## Current Status
 
-V5.8.1 includes a blocking stream event channel, in-memory bounded stream rings,
+V5.8.2 includes a blocking stream event channel, in-memory bounded stream rings,
 and asynchronous per-target SSH polling-master lifecycle and reliable stream
 shutdown/process handling on top of the V5.2 multi-server SSH execution,
 partial refresh, continuous raw/table
@@ -68,6 +68,9 @@ stream wakeup channel; when no event is pending it waits for the next scheduler
 deadline instead of waking on a fixed 50ms poll. A burst updates the affected
 panel from its in-memory ring without rewriting and rereading a full snapshot
 for every line. Local and dedicated SSH streams use the same path.
+After a terminal resize, active stream capacities are recomputed immediately;
+existing event-mode rings are trimmed in memory and subsequent lines use the
+new visible bound.
 
 During shutdown LHC gives active local/SSH commands and stream collectors a
 short TERM grace period, escalates to KILL when necessary, reaps wrappers
